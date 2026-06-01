@@ -1,0 +1,6 @@
+{
+  "agent_config_path": "C:\\Users\\George Ore\\Documents\\InternManagment\\demo_output\\20260527-194930\\config\\agent.config.json",
+  "storage_root_path": "C:\\Users\\George Ore\\Documents\\InternManagment\\demo_output\\20260527-194930\\storage",
+  "state_db_path": "C:\\Users\\George Ore\\Documents\\InternManagment\\demo_output\\20260527-194930\\data\\agent_state.sqlite3",
+  "default_timezone": "America/Los_Angeles"
+}

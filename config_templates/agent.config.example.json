@@ -1,0 +1,57 @@
+{
+  "timezone": "America/Los_Angeles",
+  "admin_discord_user_id": "123456789012345678",
+  "admins": [
+    {
+      "name": "George",
+      "discord_user_id": "123456789012345678",
+      "clickup_user_id": "198031927",
+      "clickup_user_email": "george@cislune.com"
+    }
+  ],
+  "roster_file_name": "roster.csv",
+  "dashboard_file_name": "dashboard/dashboard.md",
+  "schedule": {
+    "workdays": [0, 1, 2, 3, 4],
+    "clock_in_hour": 9,
+    "clock_in_cutoff_hour": 13,
+    "workday_rollover_time": "03:30",
+    "follow_up_interval_minutes": 30,
+    "inactivity_minutes": 10,
+    "stuck_alert_after_hours": 4,
+    "task_onboarding_interval_minutes": 5,
+    "auto_clock_out_after_hours": 6
+  },
+  "clickup": {
+    "workspace_id": "123456",
+    "default_list_id": null,
+    "mission_board_list_id": null,
+    "comment_updates": true,
+    "attach_images_to_tasks": false,
+    "auto_status_updates": true,
+    "create_time_entries": true,
+    "custom_fields": {
+      "last_check_in_at": "",
+      "status_summary": "",
+      "blockers": ""
+    }
+  },
+  "admin_console": {
+    "enable_ai_fallback": false,
+    "menu_timeout_minutes": 10
+  },
+  "prompts": {
+    "clock_in": "Good morning. Have you clocked in yet?",
+    "clock_in_reminder": "Checking back in. Have you clocked in yet?",
+    "plan_question": "Tell me what you are planning on accomplishing today.",
+    "start_photo_question": "Send me a picture of your project before you start.",
+    "risk_question": "What might slow you down today, if anything?",
+    "follow_up_questions": [
+      "How is the project going? Are you stuck?",
+      "What progress have you made since the last check-in?",
+      "Are you still on track, or do you need help?"
+    ],
+    "clock_out_prompt": "Before you clock out, send me a picture of what you finished and a paragraph covering what you did, where you got stuck or need help, what you plan to do next, and whether your current path still makes sense.",
+    "lunch_break_check_in": "Are you done with lunch break yet?"
+  }
+}

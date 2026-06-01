@@ -1,0 +1,6 @@
+{
+  "agent_config_path": "config/agent.config.json",
+  "storage_root_path": "storage",
+  "state_db_path": "data/agent_state.sqlite3",
+  "default_timezone": "America/Los_Angeles"
+}

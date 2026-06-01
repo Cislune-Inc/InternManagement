@@ -1,0 +1,2 @@
+"""Intern management automation agent."""
+
