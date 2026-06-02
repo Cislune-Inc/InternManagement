@@ -182,3 +182,4 @@ Examples:
 - `run advanced.interpret text="how many people clocked in today"`
 
 The full grouped command catalog and scenario flowchart live in [docs/admin_console.md](</C:/Users/George Ore/Documents/InternManagment/docs/admin_console.md>).
+The current equal-peer multi-admin test matrix and conflict guide live in [docs/multi_admin_scenarios.md](</C:/Users/George Ore/Documents/InternManagment/docs/multi_admin_scenarios.md>).

@@ -8,7 +8,7 @@ import discord
 from agent.admin_commands import AdminCommandRouter, UserDailySnapshot, _AdminMenuView, _pick_highest_priority_task, _split_message
 from agent.admin_console import build_admin_console_registry, parse_admin_input, render_reference_markdown
 from agent.interface_intelligence import AdminCommandMatch
-from agent.models import SessionState, UserProfile
+from agent.models import AdminProfile, SessionState, UserProfile
 
 
 def _build_snapshot(**session_overrides) -> UserDailySnapshot:
@@ -40,6 +40,7 @@ def _build_runtime() -> SimpleNamespace:
     config = SimpleNamespace(
         admin_discord_user_id=999,
         admin_console=SimpleNamespace(enable_ai_fallback=False, menu_timeout_minutes=10),
+        admins=[AdminProfile(name="George", discord_user_id=999)],
         timezone="America/Los_Angeles",
         schedule=SimpleNamespace(stuck_alert_after_hours=4),
         prompts=SimpleNamespace(clock_in_reminder="Checking back in. Have you clocked in yet?"),
@@ -129,6 +130,41 @@ def test_registry_integrity_has_unique_commands_and_valid_groups() -> None:
     assert "advanced" in registry.groups_by_id
     assert registry.groups_by_id["advanced"].advanced is True
     assert "debug" in registry.groups_by_id
+
+
+def test_router_accepts_multiple_admin_users_for_read_only_visibility_commands() -> None:
+    runtime = _build_runtime()
+    runtime.config.admins = [
+        AdminProfile(name="George", discord_user_id=999),
+        AdminProfile(name="Erik", discord_user_id=1000),
+    ]
+    runtime.is_admin_user = lambda user_id: user_id in {999, 1000}
+    router = AdminCommandRouter(runtime)
+    sent: list[str] = []
+
+    async def fake_send(_client, content: str, *, view=None) -> None:
+        assert view is None
+        sent.append(content)
+
+    async def fake_collect():
+        return [_build_snapshot(clocked_in_at="2026-05-28T09:00:00")]
+
+    router._send_admin_text = fake_send  # type: ignore[method-assign]
+    router._collect_snapshots = fake_collect  # type: ignore[method-assign]
+
+    handled_primary = asyncio.run(
+        router.handle_message(SimpleNamespace(), SimpleNamespace(author=SimpleNamespace(id=999), content="run review.pending_tasks"))
+    )
+    handled_second = asyncio.run(
+        router.handle_message(SimpleNamespace(), SimpleNamespace(author=SimpleNamespace(id=1000), content="run review.pending_tasks"))
+    )
+
+    assert handled_primary is True
+    assert handled_second is True
+    assert sent == [
+        "No intern tasks are waiting on admin review right now.",
+        "No intern tasks are waiting on admin review right now.",
+    ]
 
 
 def test_parse_admin_input_supports_help_and_run_grammar() -> None:
@@ -375,6 +411,45 @@ def test_pending_review_listing_command() -> None:
     handled = asyncio.run(router.handle_message(SimpleNamespace(), message))
     assert handled is True
     assert any("Pending task reviews:" in item for item in sent)
+
+
+def test_pending_review_listing_is_identical_for_both_admins() -> None:
+    runtime = _build_runtime()
+    runtime.config.admins = [
+        AdminProfile(name="George", discord_user_id=999),
+        AdminProfile(name="Erik", discord_user_id=1000),
+    ]
+    runtime.is_admin_user = lambda user_id: user_id in {999, 1000}
+    router = AdminCommandRouter(runtime)
+    outputs: list[str] = []
+
+    async def fake_send(_client, content: str, *, view=None) -> None:
+        assert view is None
+        outputs.append(content)
+
+    async def fake_collect():
+        snapshot = _build_snapshot(clocked_in_at="2026-05-28T09:00:00", stage="awaiting_admin_review")
+        snapshot.session.metadata["pending_admin_review"] = {"task_name": "formalize project tree"}
+        snapshot.user = UserProfile(
+            user_key="alex",
+            display_name="Alex",
+            discord_user_id=1,
+            discord_username="alex",
+            storage_folder_name="Alex",
+        )
+        return [snapshot]
+
+    router._send_admin_text = fake_send  # type: ignore[method-assign]
+    router._collect_snapshots = fake_collect  # type: ignore[method-assign]
+
+    first = SimpleNamespace(author=SimpleNamespace(id=999), content="run review.pending_tasks")
+    second = SimpleNamespace(author=SimpleNamespace(id=1000), content="run review.pending_tasks")
+    assert asyncio.run(router.handle_message(SimpleNamespace(), first)) is True
+    assert asyncio.run(router.handle_message(SimpleNamespace(), second)) is True
+    assert outputs == [
+        "Pending task reviews:\n- Alex: formalize project tree",
+        "Pending task reviews:\n- Alex: formalize project tree",
+    ]
 
 
 def test_pending_unblocker_listing_command() -> None:

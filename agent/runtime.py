@@ -688,6 +688,23 @@ class InternManagementRuntime:
         await self._start_task_selection_resume(client, user, session, now, reason="I marked you clocked back in, but I still need to confirm which task you are resuming.")
         return True
 
+    async def _maybe_resume_after_auto_clock_out_activity(
+        self,
+        client: discord.Client,
+        user: UserProfile,
+        session: SessionState,
+        inbound: MessageRecord,
+        signals,
+        now: datetime,
+    ) -> bool:
+        if session.stage != "clocked_out" or not session.metadata.get("auto_clock_out_at"):
+            return False
+        if getattr(signals, "clocked_in", False) or getattr(signals, "clocking_out", False):
+            return False
+        if not inbound.content.strip() and not inbound.attachments:
+            return False
+        return await self._maybe_resume_same_day_work(client, user, session, now)
+
     async def _begin_daily_clock_in_intake(
         self,
         client: discord.Client,
@@ -903,6 +920,9 @@ class InternManagementRuntime:
             return
         if getattr(signals, "clocked_in", False):
             if await self._maybe_resume_same_day_work(client, user, session, now):
+                return
+        if await self._maybe_resume_after_auto_clock_out_activity(client, user, session, inbound, signals, now):
+            if session.stage != "active":
                 return
         if getattr(signals, "starting_lunch", False):
             if await self._maybe_start_lunch_break(client, user, session, now):
@@ -2051,6 +2071,8 @@ class InternManagementRuntime:
         session.clocked_out_at = None
         session.awaiting_clock_out_photo = False
         session.awaiting_clock_out_summary = False
+        if not session.intake_completed_at:
+            session.intake_completed_at = now.isoformat()
         session.last_follow_up_at = now.isoformat()
         await self._activate_clickup_task(user, session, now, task_id, task_name)
         session.metadata["last_task_onboarding_completed_at"] = now.isoformat()
@@ -3915,6 +3937,13 @@ class InternManagementRuntime:
 
     def _normalize_session_state(self, session: SessionState) -> bool:
         changed = self._ensure_work_segments_consistency(session)
+        if not session.intake_completed_at:
+            last_task_onboarding_completed_at = str(
+                session.metadata.get("last_task_onboarding_completed_at") or ""
+            ).strip()
+            if last_task_onboarding_completed_at:
+                session.intake_completed_at = last_task_onboarding_completed_at
+                changed = True
         prompt = session.metadata.get(_CLICKUP_PROMPT_KEY)
         tracking = session.metadata.get("clickup_time_tracking")
         has_open_tracking = isinstance(tracking, dict) and not tracking.get("closed_at")
