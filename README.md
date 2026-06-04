@@ -143,6 +143,7 @@ List the active `user_key` values available for the live demo:
 - The operational config is read from the local `agent.config.json` file.
 - Unknown Discord users are ignored unless they exist in the roster.
 - OpenAI-backed advice is optional. If `OPENAI_API_KEY` is absent, the bot falls back to a heuristic advisor.
+- If your preferred OpenAI model is not available to the org tied to your API key, set `BACKUP_OPENAI_MODEL` in `.env` and the agent will retry that model before disabling the OpenAI-assisted feature.
 - Only one `agent.main` process should run at a time. The app now enforces a lock file in `data/agent.lock`.
 - The roster identifies a person, not a pinned task. Use `clickup_user_id` or `clickup_user_email` so the bot can inspect that person's assigned tasks and choose the most relevant active task for the day.
 - The roster can now include an optional `timezone` column per user. If it is blank, the bot falls back to the main `timezone` in `agent.config.json`.
@@ -157,8 +158,8 @@ List the active `user_key` values available for the live demo:
 - Manual clock-out also parks the current active ClickUp task on `hold`. Task closure should happen through the finish-task admin review flow instead of ordinary clock-out.
 - Daily image metadata is written to `images_manifest.json`, and transcripts include any generated descriptions/tags for saved images.
 - The admin console is grouped and deterministic by default. Normal admin control uses `help`, `menu`, `flow`, and `run <command-id> ...`.
-- `admin_console.enable_ai_fallback` defaults to `false`. If you turn it on, unmatched admin text can get an AI-generated command suggestion instead of a plain parse error.
-- You can optionally set `OPENAI_INTERFACE_MODEL` in `.env` to control the model used for intern signal interpretation and the explicit `advanced.interpret` admin command. It defaults to `gpt-4.1-mini`.
+- `admin_console.enable_ai_fallback` defaults to `true`. When the admin sends text that does not parse as a deterministic command, the bot first tries to suggest the closest existing command and then falls back to a direct AI answer from current runtime data.
+- You can optionally set `OPENAI_INTERFACE_MODEL` in `.env` to control the model used for intern signal interpretation and command-suggestion routing. It defaults to `gpt-4.1-mini`, and `BACKUP_OPENAI_MODEL` is used as a retry target if the primary model errors.
 
 ## Admin Console
 

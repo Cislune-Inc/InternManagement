@@ -47,6 +47,15 @@ _INCOMPLETE_HINTS = (
 _CLICKUP_PROMPT_KEY = "clickup_prompt"
 _STATE_MACHINE_CHANGES_FILENAME = "state_machine_changes.jsonl"
 _LUNCH_CONFIRMATION_REQUESTED_AT_KEY = "lunch_confirmation_requested_at"
+_TASK_ONBOARDING_METADATA_FIELDS = {
+    "plan": "task_onboarding_plan",
+    "tangible_result": "task_onboarding_tangible_result",
+    "necessity": "task_onboarding_necessity",
+    "effectiveness": "task_onboarding_effectiveness",
+    "estimated_duration": "task_onboarding_estimated_duration",
+    "reconsider_threshold": "task_onboarding_reconsider_threshold",
+    "fallback_plan": "task_onboarding_fallback_plan",
+}
 
 
 class InternManagementRuntime:
@@ -61,6 +70,7 @@ class InternManagementRuntime:
         self.advisor: Advisor = build_advisor(
             os.environ.get("OPENAI_API_KEY"),
             os.environ.get("OPENAI_MODEL"),
+            os.environ.get("BACKUP_OPENAI_MODEL"),
         )
         self.image_intelligence = ImageIntelligence()
         self.interface_intelligence = InterfaceIntelligence()
@@ -278,13 +288,15 @@ class InternManagementRuntime:
             "draft": {},
         }
         session.metadata["last_task_onboarding_prompt_at"] = now.isoformat()
+        session.latest_plan = None
+        session.latest_feedback = None
         await self._send_dm(
             client,
             user,
             session,
             (
                 f"Admin wants you to switch to `{target_task_name}`.\n\n"
-                "Before you continue, tell me your plan for this task."
+                + self._task_onboarding_question(session.metadata[_CLICKUP_PROMPT_KEY], "plan")
             ),
             now,
         )
@@ -468,14 +480,15 @@ class InternManagementRuntime:
             },
         }
         session.metadata["last_task_onboarding_prompt_at"] = now.isoformat()
+        session.latest_plan = None
+        session.latest_feedback = None
         await self._send_dm(
             client,
             user,
             session,
             (
                 f"Admin reviewed `{task_name}` and wants more work before it can be closed.\n\n"
-                f"Feedback:\n{admin_message}\n\n"
-                "Tell me your revised plan for this task."
+                + self._task_onboarding_question(session.metadata[_CLICKUP_PROMPT_KEY], "plan")
             ),
             now,
         )
@@ -1693,43 +1706,144 @@ class InternManagementRuntime:
             prompt["task_name"] = str(task.get("name") or "Unnamed task")
             prompt["step"] = "plan"
             session.stage = "awaiting_plan"
+            session.latest_plan = None
+            session.latest_feedback = None
             await self._send_dm(
                 client,
                 user,
                 session,
                 (
                     f"Got it. You are onboarding onto `{prompt['task_name']}`.\n\n"
-                    "Tell me your plan for this task."
+                    + self._task_onboarding_question(prompt, "plan")
                 ),
                 now,
             )
             return True
         if step == "plan":
             if not text:
-                await self._send_dm(client, user, session, "I still need your plan for this task.", now)
+                await self._send_dm(client, user, session, self._task_onboarding_missing_text(prompt, step), now)
                 return True
-            draft = prompt.setdefault("draft", {})
-            if not isinstance(draft, dict):
-                draft = {}
-                prompt["draft"] = draft
+            draft = self._task_onboarding_draft(prompt)
             draft["plan"] = text
-            session.latest_plan = text
-            feedback = await self._task_onboarding_feedback(user, prompt, text)
-            prompt["step"] = "risk"
-            session.stage = "awaiting_risk"
+            prompt["step"] = "tangible_result"
+            session.stage = "awaiting_plan"
             await self._send_dm(
                 client,
                 user,
                 session,
-                f"{feedback}\n\nWhat do you think the blockers or risks are for this task?",
+                self._task_onboarding_question(prompt, "tangible_result"),
+                now,
+            )
+            return True
+        if step == "tangible_result":
+            if not text:
+                await self._send_dm(client, user, session, self._task_onboarding_missing_text(prompt, step), now)
+                return True
+            draft = self._task_onboarding_draft(prompt)
+            draft["tangible_result"] = text
+            prompt["step"] = "necessity"
+            session.stage = "awaiting_plan"
+            await self._send_dm(
+                client,
+                user,
+                session,
+                self._task_onboarding_question(prompt, "necessity"),
+                now,
+            )
+            return True
+        if step == "necessity":
+            if not text:
+                await self._send_dm(client, user, session, self._task_onboarding_missing_text(prompt, step), now)
+                return True
+            draft = self._task_onboarding_draft(prompt)
+            draft["necessity"] = text
+            prompt["step"] = "effectiveness"
+            session.stage = "awaiting_plan"
+            await self._send_dm(
+                client,
+                user,
+                session,
+                self._task_onboarding_question(prompt, "effectiveness"),
+                now,
+            )
+            return True
+        if step == "effectiveness":
+            if not text:
+                await self._send_dm(client, user, session, self._task_onboarding_missing_text(prompt, step), now)
+                return True
+            draft = self._task_onboarding_draft(prompt)
+            draft["effectiveness"] = text
+            prompt["step"] = "estimated_duration"
+            session.stage = "awaiting_plan"
+            await self._send_dm(
+                client,
+                user,
+                session,
+                self._task_onboarding_question(prompt, "estimated_duration"),
+                now,
+            )
+            return True
+        if step == "estimated_duration":
+            if not text:
+                await self._send_dm(client, user, session, self._task_onboarding_missing_text(prompt, step), now)
+                return True
+            draft = self._task_onboarding_draft(prompt)
+            draft["estimated_duration"] = text
+            prompt["step"] = "reconsider_threshold"
+            session.stage = "awaiting_plan"
+            await self._send_dm(
+                client,
+                user,
+                session,
+                self._task_onboarding_question(prompt, "reconsider_threshold"),
+                now,
+            )
+            return True
+        if step == "reconsider_threshold":
+            if not text:
+                await self._send_dm(client, user, session, self._task_onboarding_missing_text(prompt, step), now)
+                return True
+            draft = self._task_onboarding_draft(prompt)
+            draft["reconsider_threshold"] = text
+            prompt["step"] = "fallback_plan"
+            session.stage = "awaiting_plan"
+            await self._send_dm(
+                client,
+                user,
+                session,
+                self._task_onboarding_question(prompt, "fallback_plan"),
+                now,
+            )
+            return True
+        if step == "fallback_plan":
+            if not text:
+                await self._send_dm(client, user, session, self._task_onboarding_missing_text(prompt, step), now)
+                return True
+            draft = self._task_onboarding_draft(prompt)
+            draft["fallback_plan"] = text
+            plan_summary = self._task_onboarding_summary(prompt)
+            if plan_summary:
+                session.latest_plan = plan_summary
+            feedback = await self._task_onboarding_feedback(user, prompt, plan_summary or text)
+            session.latest_feedback = feedback
+            prompt["step"] = "photo"
+            session.stage = "awaiting_start_photo"
+            session.awaiting_start_photo = True
+            photo_prompt = (
+                self.config.prompts.start_photo_question
+                if source in {"daily_clock_in", "clock_in_recovery"}
+                else "Send me a fresh picture of the project before you continue on this task."
+            )
+            await self._send_dm(
+                client,
+                user,
+                session,
+                f"{feedback}\n\n{photo_prompt}",
                 now,
             )
             return True
         if step == "risk":
-            draft = prompt.setdefault("draft", {})
-            if not isinstance(draft, dict):
-                draft = {}
-                prompt["draft"] = draft
+            draft = self._task_onboarding_draft(prompt)
             draft["risk"] = text
             session.latest_blocker = text or None
             prompt["step"] = "photo"
@@ -1981,6 +2095,7 @@ class InternManagementRuntime:
     ) -> str:
         task_name = str(prompt.get("task_name") or "")
         task_id = str(prompt.get("task_id") or "")
+        draft = self._task_onboarding_draft(prompt)
         context = ""
         if self.clickup and task_id:
             try:
@@ -1995,6 +2110,9 @@ class InternManagementRuntime:
                 )
                 if description:
                     context += f"\nDescription:\n{description[:1200]}"
+        admin_feedback = str(draft.get("admin_feedback") or "").strip()
+        if admin_feedback:
+            context += f"\nAdmin feedback:\n{admin_feedback[:1200]}"
         return await self.advisor.plan_feedback(user, plan_text, context)
 
     async def _task_selection_prompt(
@@ -2053,6 +2171,7 @@ class InternManagementRuntime:
     ) -> None:
         task_id = str(prompt.get("task_id") or "")
         task_name = str(prompt.get("task_name") or "")
+        self._apply_task_onboarding_metadata(session, prompt)
         if task_id:
             session.metadata["active_clickup_task_id"] = task_id
         if task_name:
@@ -3073,7 +3192,19 @@ class InternManagementRuntime:
         step = str(prompt.get("step") or "select_task")
         task_name = str(prompt.get("task_name") or "")
         if step == "plan" and task_name:
-            return f"I still need your plan for `{task_name}` before I can switch the active task."
+            return self._task_onboarding_missing_text(prompt, step)
+        if step == "tangible_result" and task_name:
+            return self._task_onboarding_missing_text(prompt, step)
+        if step == "necessity" and task_name:
+            return self._task_onboarding_missing_text(prompt, step)
+        if step == "effectiveness" and task_name:
+            return self._task_onboarding_missing_text(prompt, step)
+        if step == "estimated_duration" and task_name:
+            return self._task_onboarding_missing_text(prompt, step)
+        if step == "reconsider_threshold" and task_name:
+            return self._task_onboarding_missing_text(prompt, step)
+        if step == "fallback_plan" and task_name:
+            return self._task_onboarding_missing_text(prompt, step)
         if step == "risk" and task_name:
             return f"I still need the predicted blockers or risks for `{task_name}`."
         if step == "photo" and task_name:
@@ -3094,6 +3225,83 @@ class InternManagementRuntime:
                 else None
             ),
         )
+
+    def _task_onboarding_draft(self, prompt: dict[str, Any]) -> dict[str, Any]:
+        draft = prompt.get("draft")
+        if not isinstance(draft, dict):
+            draft = {}
+            prompt["draft"] = draft
+        return draft
+
+    def _task_onboarding_question(self, prompt: dict[str, Any], step: str) -> str:
+        task_name = str(prompt.get("task_name") or "this task")
+        draft = self._task_onboarding_draft(prompt)
+        admin_feedback = str(draft.get("admin_feedback") or "").strip()
+        if step == "plan":
+            question = f"What is your plan for `{task_name}`?"
+            if admin_feedback:
+                return f"Admin feedback to account for:\n{admin_feedback}\n\n{question}"
+            return question
+        if step == "tangible_result":
+            return "What tangible result will show this task produced something real? Be specific about what you expect to point to."
+        if step == "necessity":
+            return f"Why is `{task_name}` necessary to do now?"
+        if step == "effectiveness":
+            return "Why do you believe this plan is the most effective way to get that result?"
+        if step == "estimated_duration":
+            return "How long do you expect this task to take? A rough answer like `45 minutes`, `2 hours`, or `half a day` is fine."
+        if step == "reconsider_threshold":
+            return "How long will you give this approach before you decide you are stuck or not producing good results?"
+        if step == "fallback_plan":
+            return "If you hit that point, what alternative plan, help request, or task switch would you consider next?"
+        return "Tell me the next detail I still need for this task onboarding."
+
+    def _task_onboarding_missing_text(self, prompt: dict[str, Any], step: str) -> str:
+        task_name = str(prompt.get("task_name") or "this task")
+        if step == "plan":
+            return f"I still need your plan for `{task_name}` before I can activate it."
+        if step == "tangible_result":
+            return f"I still need the tangible result you expect from `{task_name}`."
+        if step == "necessity":
+            return f"I still need why `{task_name}` is necessary to do now."
+        if step == "effectiveness":
+            return f"I still need why you think this plan will be effective for `{task_name}`."
+        if step == "estimated_duration":
+            return f"I still need your rough time estimate for `{task_name}`."
+        if step == "reconsider_threshold":
+            return "I still need to know how long you will give this approach before you reconsider."
+        if step == "fallback_plan":
+            return "I still need the alternative plan or next move you would consider if this approach stops working."
+        return "I still need your task onboarding reply."
+
+    def _task_onboarding_summary(self, prompt: dict[str, Any]) -> str:
+        draft = self._task_onboarding_draft(prompt)
+        fields = [
+            ("Plan", draft.get("plan")),
+            ("Tangible result", draft.get("tangible_result")),
+            ("Necessary because", draft.get("necessity")),
+            ("Why this should work", draft.get("effectiveness")),
+            ("Expected duration", draft.get("estimated_duration")),
+            ("Reconsider after", draft.get("reconsider_threshold")),
+            ("Alternative if it is not working", draft.get("fallback_plan")),
+        ]
+        lines = [f"{label}: {str(value).strip()}" for label, value in fields if str(value or "").strip()]
+        return "\n".join(lines)
+
+    def _apply_task_onboarding_metadata(self, session: SessionState, prompt: dict[str, Any]) -> None:
+        draft = self._task_onboarding_draft(prompt)
+        for draft_key, metadata_key in _TASK_ONBOARDING_METADATA_FIELDS.items():
+            value = str(draft.get(draft_key) or "").strip()
+            if value:
+                session.metadata[metadata_key] = value
+            else:
+                session.metadata.pop(metadata_key, None)
+        summary = self._task_onboarding_summary(prompt)
+        if summary:
+            session.metadata["last_task_onboarding_summary"] = summary
+            session.latest_plan = summary
+        else:
+            session.metadata.pop("last_task_onboarding_summary", None)
 
     async def _activate_clickup_task(
         self,
@@ -3504,6 +3712,16 @@ class InternManagementRuntime:
         next_task_suggestions = next_task_suggestions if isinstance(next_task_suggestions, list) else []
         candidate_task_ids = session.metadata.get("clickup_candidate_task_ids")
         candidate_task_ids = candidate_task_ids if isinstance(candidate_task_ids, list) else []
+        task_onboarding = {
+            "plan": str(session.metadata.get("task_onboarding_plan") or "") or None,
+            "tangible_result": str(session.metadata.get("task_onboarding_tangible_result") or "") or None,
+            "necessity": str(session.metadata.get("task_onboarding_necessity") or "") or None,
+            "effectiveness": str(session.metadata.get("task_onboarding_effectiveness") or "") or None,
+            "estimated_duration": str(session.metadata.get("task_onboarding_estimated_duration") or "") or None,
+            "reconsider_threshold": str(session.metadata.get("task_onboarding_reconsider_threshold") or "") or None,
+            "fallback_plan": str(session.metadata.get("task_onboarding_fallback_plan") or "") or None,
+            "summary": str(session.metadata.get("last_task_onboarding_summary") or "") or None,
+        }
         last_review_resolution = session.metadata.get("last_admin_review_resolution")
         last_review_resolution = last_review_resolution if isinstance(last_review_resolution, dict) else {}
         last_unblocker_resolution = session.metadata.get("last_admin_unblocker_resolution")
@@ -3551,6 +3769,7 @@ class InternManagementRuntime:
                 "blocker": session.latest_blocker,
                 "feedback": session.latest_feedback,
             },
+            "task_onboarding": task_onboarding,
             "active_task": {
                 "task_id": self._active_task_id(session),
                 "task_name": str(session.metadata.get("active_clickup_task_name") or "") or None,
@@ -3575,6 +3794,14 @@ class InternManagementRuntime:
                 "draft_title": str(prompt_draft.get("title") or "") or None,
                 "draft_priority": str(prompt_draft.get("priority") or "") or None,
                 "draft_assignee_label": str(prompt_draft.get("assignee_label") or "") or None,
+                "draft_plan": str(prompt_draft.get("plan") or "") or None,
+                "draft_tangible_result": str(prompt_draft.get("tangible_result") or "") or None,
+                "draft_necessity": str(prompt_draft.get("necessity") or "") or None,
+                "draft_effectiveness": str(prompt_draft.get("effectiveness") or "") or None,
+                "draft_estimated_duration": str(prompt_draft.get("estimated_duration") or "") or None,
+                "draft_reconsider_threshold": str(prompt_draft.get("reconsider_threshold") or "") or None,
+                "draft_fallback_plan": str(prompt_draft.get("fallback_plan") or "") or None,
+                "draft_admin_feedback": str(prompt_draft.get("admin_feedback") or "") or None,
             },
             "review": {
                 "pending": bool(review),

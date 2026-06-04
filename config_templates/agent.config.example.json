@@ -37,7 +37,7 @@
     }
   },
   "admin_console": {
-    "enable_ai_fallback": false,
+    "enable_ai_fallback": true,
     "menu_timeout_minutes": 10
   },
   "prompts": {

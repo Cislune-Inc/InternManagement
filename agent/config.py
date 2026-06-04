@@ -113,7 +113,7 @@ def parse_agent_config(payload: dict[str, Any], fallback_timezone: str) -> Agent
             ),
         ),
         admin_console=AdminConsoleConfig(
-            enable_ai_fallback=bool(admin_console.get("enable_ai_fallback", False)),
+            enable_ai_fallback=bool(admin_console.get("enable_ai_fallback", True)),
             menu_timeout_minutes=int(admin_console.get("menu_timeout_minutes", 10)),
         ),
         admins=admins,

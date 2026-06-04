@@ -582,7 +582,7 @@ def build_admin_console_registry() -> AdminConsoleRegistry:
         AdminCommandDefinition(
             command_id="advanced.interpret",
             label="Interpret free-form text",
-            help_text="Use the AI router explicitly to translate free-form admin language into a deterministic command suggestion.",
+            help_text="Use AI to suggest the closest deterministic command or answer the request directly from current runtime data.",
             group_id="advanced",
             read_only=True,
             advanced=True,

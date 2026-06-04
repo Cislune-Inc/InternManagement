@@ -29,6 +29,7 @@ from .admin_console import (
 )
 from .clickup_client import ClickUpClient
 from .models import MessageRecord, SessionState, UserProfile
+from .openai_models import ModelFallbackChain
 from .time_utils import resolve_timezone
 
 if TYPE_CHECKING:
@@ -120,9 +121,32 @@ class UserDailySnapshot:
 class AdminAnalyst:
     def __init__(self) -> None:
         api_key = os.environ.get("OPENAI_API_KEY")
-        self.model = os.environ.get("OPENAI_MODEL") or "gpt-5-mini"
+        self.models = ModelFallbackChain(
+            "admin analyst",
+            os.environ.get("OPENAI_MODEL") or "gpt-5-mini",
+            os.environ.get("BACKUP_OPENAI_MODEL"),
+            "gpt-4.1-mini",
+        )
+        self.model = self.models.active_model or "gpt-4.1-mini"
         self.client = AsyncOpenAI(api_key=api_key) if api_key else None
         self.enabled = self.client is not None
+
+    async def _create_response(self, *, input: Any):
+        if not self.client:
+            raise RuntimeError("OpenAI client is not configured.")
+        last_exc: Exception | None = None
+        for model in self.models.candidate_models():
+            try:
+                response = await self.client.responses.create(model=model, input=input)
+            except Exception as exc:
+                last_exc = exc
+                continue
+            self.models.record_success(model)
+            self.model = model
+            return response
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("No admin analyst model is configured.")
 
     async def answer(self, question: str, context: str, fallback: str) -> str:
         if not self.enabled or not self.client:
@@ -135,7 +159,7 @@ class AdminAnalyst:
             f"Available data:\n{context}"
         )
         try:
-            response = await self.client.responses.create(model=self.model, input=prompt)
+            response = await self._create_response(input=prompt)
             text = response.output_text.strip()
             return text or fallback
         except Exception:
@@ -146,8 +170,7 @@ class AdminAnalyst:
         if not self.enabled or not self.client:
             return fallback
         try:
-            response = await self.client.responses.create(
-                model=self.model,
+            response = await self._create_response(
                 input=[
                     {
                         "role": "user",
@@ -642,12 +665,12 @@ class AdminCommandRouter:
             return False
         if not config.admin_console.enable_ai_fallback:
             return False
-        suggestion = await self._suggest_interpretation(text)
-        if not suggestion:
+        response = await self._admin_ai_fallback_response(text)
+        if not response:
             return False
         self._active_admin_user_id = admin_user_id
         try:
-            await self._send_admin_text(client, suggestion)
+            await self._send_admin_text(client, response)
         finally:
             self._active_admin_user_id = None
         return True
@@ -1382,16 +1405,16 @@ class AdminCommandRouter:
     async def _command_advanced_interpret(
         self,
         _client: discord.Client | None,
-        _snapshots: list[UserDailySnapshot],
+        snapshots: list[UserDailySnapshot],
         args: dict[str, str],
     ) -> str:
         text = (args.get("text") or "").strip()
         if not text:
             return "I need `text=` for `advanced.interpret`."
-        suggestion = await self._suggest_interpretation(text)
-        if not suggestion:
-            return "AI interpretation is unavailable or did not find a strong deterministic command match."
-        return suggestion
+        response = await self._admin_ai_fallback_response(text, snapshots=snapshots)
+        if response:
+            return response
+        return "AI interpretation is unavailable right now, so I could not suggest a command or answer directly."
 
     async def _command_advanced_weekly_completion(
         self,
@@ -1979,6 +2002,16 @@ class AdminCommandRouter:
                     for message in snapshot.messages
                     if message.direction == "inbound" and message.content.strip()
                 ][-3:],
+                "task_onboarding": {
+                    "plan": str(snapshot.session.metadata.get("task_onboarding_plan") or "") or None,
+                    "tangible_result": str(snapshot.session.metadata.get("task_onboarding_tangible_result") or "") or None,
+                    "necessity": str(snapshot.session.metadata.get("task_onboarding_necessity") or "") or None,
+                    "effectiveness": str(snapshot.session.metadata.get("task_onboarding_effectiveness") or "") or None,
+                    "estimated_duration": str(snapshot.session.metadata.get("task_onboarding_estimated_duration") or "") or None,
+                    "reconsider_threshold": str(snapshot.session.metadata.get("task_onboarding_reconsider_threshold") or "") or None,
+                    "fallback_plan": str(snapshot.session.metadata.get("task_onboarding_fallback_plan") or "") or None,
+                    "summary": str(snapshot.session.metadata.get("last_task_onboarding_summary") or "") or None,
+                },
             }
             if self.runtime.clickup:
                 bundle = await self.runtime.clickup.get_context_bundle(snapshot.user, snapshot.session, snapshot.messages)
@@ -2012,9 +2045,51 @@ class AdminCommandRouter:
             payload["users"].append(user_payload)
         return json.dumps(payload, indent=2)
 
+    async def _admin_ai_fallback_response(
+        self,
+        text: str,
+        *,
+        snapshots: list[UserDailySnapshot] | None = None,
+    ) -> str | None:
+        suggestion = await self._suggest_interpretation(text)
+        if suggestion:
+            return suggestion
+        return await self._answer_freeform_admin_request(text, snapshots=snapshots)
+
+    async def _answer_freeform_admin_request(
+        self,
+        text: str,
+        *,
+        snapshots: list[UserDailySnapshot] | None = None,
+    ) -> str | None:
+        if not self.analyst.enabled or not self.analyst.client:
+            return None
+        resolved_snapshots = snapshots if snapshots is not None else await self._collect_snapshots()
+        context = await self._build_analysis_context(resolved_snapshots)
+        fallback = (
+            "I could not map that to a strong existing command, and I could not produce a reliable direct answer.\n\n"
+            + self._grammar_hint()
+        )
+        answer = await self.analyst.answer(
+            (
+                "An admin sent a free-form request after no strong deterministic command match was found.\n"
+                "Answer directly using the provided operational data.\n"
+                "If the data is incomplete, say so clearly.\n"
+                "Do not claim that you ran a command or changed state.\n\n"
+                f"Admin request:\n{text}"
+            ),
+            context,
+            fallback,
+        )
+        if not answer.strip():
+            return None
+        if answer == fallback:
+            return fallback
+        return "Best-effort answer:\n" + answer
+
     async def _suggest_interpretation(self, text: str) -> str | None:
         interpreter = getattr(self.runtime, "interface_intelligence", None)
-        if not interpreter:
+        if not interpreter or not hasattr(interpreter, "resolve_admin_command"):
             return None
         templates: list[str] = []
         for command in self.registry.commands:

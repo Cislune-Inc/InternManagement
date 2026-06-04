@@ -42,8 +42,16 @@ class _FakeClickUp:
     async def get_task(self, task_id: str):
         for task in await self.list_assigned_tasks(None):
             if task["id"] == task_id:
-                return task
-        return {"id": task_id, "name": "unknown", "status": {"status": "to do"}}
+                return {
+                    **task,
+                    "description": "Break the project into clear deliverables and align the folder structure.",
+                }
+        return {
+            "id": task_id,
+            "name": "unknown",
+            "status": {"status": "to do"},
+            "description": "",
+        }
 
 
 def _build_runtime(admins: list[AdminProfile] | None = None) -> InternManagementRuntime:
@@ -90,9 +98,13 @@ def _build_runtime(admins: list[AdminProfile] | None = None) -> InternManagement
     async def fake_dashboard() -> None:
         return None
 
+    async def fake_plan_feedback(_user, _plan_text: str, _context: str) -> str:
+        return "Use the tangible result to keep the scope tight."
+
     runtime._archive_session = fake_archive  # type: ignore[method-assign]
     runtime.write_dashboard = fake_dashboard  # type: ignore[method-assign]
     runtime.refresh_configuration = fake_dashboard  # type: ignore[method-assign]
+    runtime.advisor = SimpleNamespace(plan_feedback=fake_plan_feedback)
     return runtime
 
 
@@ -768,6 +780,215 @@ def test_runtime_task_onboarding_accepts_recommended_reply_for_daily_clock_in() 
     assert any("formalize project tree" in item for item in sent)
 
 
+def test_runtime_task_onboarding_collects_interactive_plan_before_photo() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+    activated: list[tuple[str, str]] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime) -> None:
+        sent.append(content)
+
+    async def fake_activate(_user, _session, _now, task_id: str, task_name: str) -> None:
+        activated.append((task_id, task_name))
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    runtime._activate_clickup_task = fake_activate  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="awaiting_plan")
+    prompt = {
+        "type": "task_onboarding",
+        "step": "plan",
+        "source": "daily_clock_in",
+        "task_id": "868jun6qg",
+        "task_name": "formalize project tree",
+        "draft": {},
+    }
+    session.metadata["clickup_prompt"] = prompt
+    base_time = datetime.fromisoformat("2026-05-28T14:02:00")
+
+    def inbound(message_id: str, content: str = "", attachments: list[AttachmentRecord] | None = None) -> MessageRecord:
+        return MessageRecord(
+            message_id=message_id,
+            direction="inbound",
+            author_id=1,
+            created_at=base_time,
+            content=content,
+            attachments=attachments or [],
+        )
+
+    responses = [
+        ("msg-plan", "I will reorganize the project tree and move the onboarding files into their final folders.", "tangible_result"),
+        ("msg-result", "A cleaned up repo tree with the onboarding docs in the right place and no duplicate folders.", "necessity"),
+        ("msg-necessity", "We need a stable structure before more docs and scripts get added on top of the current mess.", "effectiveness"),
+        ("msg-effectiveness", "This is the fastest path because it removes confusion first and gives me a concrete structure to validate.", "estimated_duration"),
+        ("msg-duration", "About 2 hours.", "reconsider_threshold"),
+        ("msg-threshold", "If I am still reshuffling folders after 45 minutes without a cleaner structure, I should stop and rethink it.", "fallback_plan"),
+    ]
+
+    for message_id, content, expected_step in responses:
+        handled = asyncio.run(
+            runtime._handle_task_onboarding_prompt(
+                SimpleNamespace(),
+                user,
+                session,
+                inbound(message_id, content),
+                base_time,
+                prompt,
+            )
+        )
+        assert handled is True
+        assert prompt["step"] == expected_step
+        assert session.stage == "awaiting_plan"
+
+    handled = asyncio.run(
+        runtime._handle_task_onboarding_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            inbound(
+                "msg-fallback",
+                "I would pause, ask for a quick review of the folder choices, and switch to a smaller cleanup slice if needed.",
+            ),
+            base_time,
+            prompt,
+        )
+    )
+    assert handled is True
+    assert prompt["step"] == "photo"
+    assert session.stage == "awaiting_start_photo"
+    assert session.awaiting_start_photo is True
+    assert session.latest_blocker is None
+    assert session.latest_feedback == "Use the tangible result to keep the scope tight."
+    assert "Tangible result:" in (session.latest_plan or "")
+    assert "Expected duration: About 2 hours." in (session.latest_plan or "")
+    assert sent[-1].startswith("Use the tangible result to keep the scope tight.")
+
+    photo = AttachmentRecord(
+        filename="before.jpg",
+        original_filename="before.jpg",
+        url="demo://before",
+        content_type="image/jpeg",
+        size=123,
+        local_path="C:/tmp/before.jpg",
+    )
+    handled = asyncio.run(
+        runtime._handle_task_onboarding_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            inbound("msg-photo", attachments=[photo]),
+            base_time,
+            prompt,
+        )
+    )
+    assert handled is True
+    assert session.stage == "active"
+    assert "clickup_prompt" not in session.metadata
+    assert session.metadata["task_onboarding_plan"].startswith("I will reorganize the project tree")
+    assert session.metadata["task_onboarding_tangible_result"].startswith("A cleaned up repo tree")
+    assert session.metadata["task_onboarding_estimated_duration"] == "About 2 hours."
+    assert session.metadata["task_onboarding_reconsider_threshold"].startswith("If I am still reshuffling folders")
+    assert session.metadata["task_onboarding_fallback_plan"].startswith("I would pause, ask for a quick review")
+    assert "Alternative if it is not working:" in session.metadata["last_task_onboarding_summary"]
+    assert activated == [("868jun6qg", "formalize project tree")]
+
+
+def test_runtime_task_onboarding_reminder_covers_new_steps() -> None:
+    runtime = _build_runtime()
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="awaiting_plan")
+    tracking = {"active_task_name": None, "timer_running": False}
+
+    duration_reminder = asyncio.run(
+        runtime._task_onboarding_reminder(
+            user,
+            session,
+            tracking,
+            {"type": "task_onboarding", "step": "estimated_duration", "task_name": "formalize project tree"},
+        )
+    )
+    fallback_reminder = asyncio.run(
+        runtime._task_onboarding_reminder(
+            user,
+            session,
+            tracking,
+            {"type": "task_onboarding", "step": "fallback_plan", "task_name": "formalize project tree"},
+        )
+    )
+
+    assert "rough time estimate" in duration_reminder.lower()
+    assert "alternative plan" in fallback_reminder.lower()
+
+
+def test_runtime_initiate_admin_task_switch_starts_interactive_onboarding() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+    persisted: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime) -> None:
+        sent.append(content)
+
+    async def fake_resolve_task_for_user(_user, _task_hint: str, include_mission_board=False, include_workspace=False):
+        return {
+            "id": "868jurjm4",
+            "name": "see if task priority works",
+            "status": {"status": "to do"},
+        }
+
+    async def fake_ensure_task_assigned_to_user(_task, _user) -> bool:
+        return True
+
+    async def fake_persist(_user, _session, *, now, previous_session, trigger, details):
+        persisted.append(trigger)
+        return True
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    runtime._persist_session_state = fake_persist  # type: ignore[method-assign]
+    runtime.clickup = SimpleNamespace(
+        resolve_task_for_user=fake_resolve_task_for_user,
+        ensure_task_assigned_to_user=fake_ensure_task_assigned_to_user,
+    )
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="active")
+
+    result = asyncio.run(
+        runtime.initiate_admin_task_switch(
+            SimpleNamespace(),
+            user,
+            session,
+            "see if task priority works",
+            now=datetime.fromisoformat("2026-05-28T16:00:00"),
+        )
+    )
+
+    assert "Started a task-switch onboarding flow" in result
+    prompt = session.metadata["clickup_prompt"]
+    assert prompt["type"] == "task_onboarding"
+    assert prompt["source"] == "admin_switch"
+    assert prompt["step"] == "plan"
+    assert persisted == ["admin_task_switch"]
+    assert any("Admin wants you to switch" in item for item in sent)
+    assert any("What is your plan for `see if task priority works`?" in item for item in sent)
+
+
 def test_runtime_debug_reset_workday_resets_local_state_and_marks_cutoff() -> None:
     runtime = _build_runtime()
     sent: list[str] = []
@@ -1327,6 +1548,12 @@ def test_runtime_persist_session_state_writes_transition_log_only_on_change() ->
         session_date="2026-05-28",
         stage="active",
         latest_status="Still working on the controller integration.",
+        metadata={
+            "task_onboarding_plan": "Rewire the controller harness.",
+            "task_onboarding_tangible_result": "A working harness that powers on cleanly.",
+            "task_onboarding_estimated_duration": "2 hours",
+            "last_task_onboarding_summary": "Plan: Rewire the controller harness.",
+        },
     )
     logged = asyncio.run(
         runtime._persist_session_state(
@@ -1346,6 +1573,8 @@ def test_runtime_persist_session_state_writes_transition_log_only_on_change() ->
     assert payload["trigger"] == "unit_test"
     assert "latest.status" in payload["changed_fields"]
     assert payload["current"]["latest"]["status"] == "Still working on the controller integration."
+    assert payload["current"]["task_onboarding"]["estimated_duration"] == "2 hours"
+    assert payload["current"]["task_onboarding"]["summary"] == "Plan: Rewire the controller harness."
 
     appended.clear()
     saved.clear()
@@ -1814,6 +2043,8 @@ def test_runtime_resolve_admin_review_rework_starts_same_task_onboarding() -> No
     assert prompt["task_id"] == "868jun6qg"
     assert states == [("868jun6qg", "in_progress")]
     assert any("wants more work" in item for item in sent)
+    assert any("Admin feedback to account for:" in item for item in sent)
+    assert any("What is your plan for `formalize project tree`?" in item for item in sent)
 
 
 def test_runtime_resolve_admin_review_close_starts_next_task_selection() -> None:

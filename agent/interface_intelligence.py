@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from openai import AsyncOpenAI
 
+from .openai_models import ModelFallbackChain
 from .signals import MessageSignals
 
 
@@ -20,9 +21,32 @@ class AdminCommandMatch:
 class InterfaceIntelligence:
     def __init__(self) -> None:
         api_key = os.environ.get("OPENAI_API_KEY")
-        self.model = os.environ.get("OPENAI_INTERFACE_MODEL") or "gpt-4.1-mini"
+        self.models = ModelFallbackChain(
+            "interface intelligence",
+            os.environ.get("OPENAI_INTERFACE_MODEL") or "gpt-4.1-mini",
+            os.environ.get("BACKUP_OPENAI_MODEL"),
+            "gpt-4.1-mini",
+        )
+        self.model = self.models.active_model or "gpt-4.1-mini"
         self.client = AsyncOpenAI(api_key=api_key) if api_key else None
         self.enabled = self.client is not None
+
+    async def _create_response(self, prompt: str):
+        if not self.client:
+            raise RuntimeError("OpenAI client is not configured.")
+        last_exc: Exception | None = None
+        for model in self.models.candidate_models():
+            try:
+                response = await self.client.responses.create(model=model, input=prompt)
+            except Exception as exc:
+                last_exc = exc
+                continue
+            self.models.record_success(model)
+            self.model = model
+            return response
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("No interface intelligence model is configured.")
 
     async def resolve_admin_command(self, user_text: str, command_templates: list[str]) -> AdminCommandMatch | None:
         if not self.enabled or not self.client or not user_text.strip():
@@ -39,7 +63,7 @@ class InterfaceIntelligence:
             + "\n".join(f"- {template}" for template in command_templates)
         )
         try:
-            response = await self.client.responses.create(model=self.model, input=prompt)
+            response = await self._create_response(prompt)
         except Exception:
             self.enabled = False
             return None
@@ -77,7 +101,7 @@ class InterfaceIntelligence:
             f"Message:\n{text}"
         )
         try:
-            response = await self.client.responses.create(model=self.model, input=prompt)
+            response = await self._create_response(prompt)
         except Exception:
             self.enabled = False
             return signals

@@ -6,6 +6,7 @@ from datetime import datetime
 from openai import AsyncOpenAI
 
 from .models import MessageRecord, SessionState, UserProfile
+from .openai_models import ModelFallbackChain
 
 
 logger = logging.getLogger(__name__)
@@ -78,9 +79,25 @@ class HeuristicAdvisor(Advisor):
 
 
 class OpenAIAdvisor(Advisor):
-    def __init__(self, api_key: str, model: str) -> None:
+    def __init__(self, api_key: str, model: str, backup_model: str | None = None) -> None:
         self.client = AsyncOpenAI(api_key=api_key)
-        self.model = model
+        self.models = ModelFallbackChain("advisor", model, backup_model, "gpt-4.1-mini")
+        self.model = self.models.active_model or model
+
+    async def _response_text(self, prompt: str) -> str:
+        last_exc: Exception | None = None
+        for model in self.models.candidate_models():
+            try:
+                response = await self.client.responses.create(model=model, input=prompt)
+            except Exception as exc:
+                last_exc = exc
+                continue
+            self.models.record_success(model)
+            self.model = model
+            return response.output_text.strip()
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("No OpenAI advisor model is configured.")
 
     async def plan_feedback(self, user: UserProfile, plan: str, clickup_context: str) -> str:
         prompt = (
@@ -91,8 +108,7 @@ class OpenAIAdvisor(Advisor):
             f"Plan:\n{plan}\n\n"
             f"ClickUp context:\n{clickup_context or 'No ClickUp context available.'}"
         )
-        response = await self.client.responses.create(model=self.model, input=prompt)
-        return response.output_text.strip()
+        return await self._response_text(prompt)
 
     async def summarize_updates(
         self,
@@ -116,8 +132,7 @@ class OpenAIAdvisor(Advisor):
             f"ClickUp context:\n{clickup_context or 'No ClickUp context available.'}\n\n"
             f"Transcript:\n{transcript}"
         )
-        response = await self.client.responses.create(model=self.model, input=prompt)
-        return response.output_text.strip()
+        return await self._response_text(prompt)
 
 
 class ResilientAdvisor(Advisor):
@@ -158,8 +173,8 @@ class ResilientAdvisor(Advisor):
         )
 
 
-def build_advisor(openai_api_key: str | None, model: str | None) -> Advisor:
+def build_advisor(openai_api_key: str | None, model: str | None, backup_model: str | None) -> Advisor:
     fallback = HeuristicAdvisor()
     if openai_api_key:
-        return ResilientAdvisor(OpenAIAdvisor(openai_api_key, model or "gpt-5-mini"), fallback)
+        return ResilientAdvisor(OpenAIAdvisor(openai_api_key, model or "gpt-5-mini", backup_model), fallback)
     return fallback

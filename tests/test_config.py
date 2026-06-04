@@ -18,7 +18,7 @@ def test_parse_agent_config_defaults() -> None:
     assert config.schedule.auto_clock_out_after_hours == 6
     assert config.schedule.workday_rollover_time == "03:30"
     assert config.admins[0].discord_user_id == 123
-    assert config.admin_console.enable_ai_fallback is False
+    assert config.admin_console.enable_ai_fallback is True
     assert config.admin_console.menu_timeout_minutes == 10
     assert config.clickup.workspace_id == "456"
     assert config.clickup.mission_board_list_id == "789"

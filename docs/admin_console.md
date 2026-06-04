@@ -168,7 +168,7 @@ Reset or replay workflow state safely while you test the bot's behavior.
 Use heavier AI-backed interpretation or deeper analysis commands when you need them.
 
 - `advanced.interpret` - Interpret free-form text (read-only, requires AI, advanced)
-  - Use the AI router explicitly to translate free-form admin language into a deterministic command suggestion.
+  - Use AI to suggest the closest deterministic command or answer the request directly from current runtime data.
   - Example: `run advanced.interpret text="how many people clocked in today"`
 - `advanced.weekly_completion` - Which tasks can finish this week (read-only, advanced)
   - Estimate which current tasks look realistically finishable this week.

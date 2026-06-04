@@ -39,7 +39,7 @@ def _build_snapshot(**session_overrides) -> UserDailySnapshot:
 def _build_runtime() -> SimpleNamespace:
     config = SimpleNamespace(
         admin_discord_user_id=999,
-        admin_console=SimpleNamespace(enable_ai_fallback=False, menu_timeout_minutes=10),
+        admin_console=SimpleNamespace(enable_ai_fallback=True, menu_timeout_minutes=10),
         admins=[AdminProfile(name="George", discord_user_id=999)],
         timezone="America/Los_Angeles",
         schedule=SimpleNamespace(stuck_alert_after_hours=4),
@@ -61,12 +61,23 @@ def _build_runtime() -> SimpleNamespace:
             SessionState(user_key=user.user_key, session_date="2026-05-28"),
             moment or datetime.fromisoformat("2026-05-28T12:00:00-07:00"),
         ),
+        _get_task_tracking_state=_async_tracking_state,
     )
     return runtime
 
 
 async def _async_noop(*_args, **_kwargs):
     return None
+
+
+async def _async_tracking_state(*_args, **_kwargs):
+    return {
+        "timer_running": False,
+        "timer_source": None,
+        "timer_task_id": None,
+        "timer_task_name": None,
+        "timer_note": None,
+    }
 
 
 def test_snapshot_status_properties() -> None:
@@ -474,7 +485,7 @@ def test_pending_unblocker_listing_command() -> None:
     assert any("Pending unblocker-task drafts:" in item for item in sent)
 
 
-def test_advanced_interpret_is_explicit_and_no_auto_fallback_by_default() -> None:
+def test_advanced_interpret_and_invalid_admin_text_suggest_deterministic_commands() -> None:
     runtime = _build_runtime()
     router = AdminCommandRouter(runtime)
     sent: list[str] = []
@@ -513,8 +524,35 @@ def test_advanced_interpret_is_explicit_and_no_auto_fallback_by_default() -> Non
     unmatched = SimpleNamespace(author=SimpleNamespace(id=999), content="how many people clocked in today")
     handled = asyncio.run(router.handle_message(SimpleNamespace(), unmatched))
     assert handled is True
-    assert interpreter_called is False
-    assert any("Use the admin console grammar" in item for item in sent)
+    assert interpreter_called is True
+    assert any("Suggested deterministic command" in item for item in sent)
+
+
+def test_invalid_admin_text_falls_back_to_direct_ai_answer_when_no_command_match_exists() -> None:
+    runtime = _build_runtime()
+    router = AdminCommandRouter(runtime)
+    sent: list[str] = []
+
+    async def fake_send(_client, content: str, *, view=None) -> None:
+        sent.append(content)
+
+    async def fake_resolve(_text: str, _templates: list[str]):
+        return None
+
+    async def fake_answer(text: str, *, snapshots=None):
+        assert text == "what should I focus on right now?"
+        assert snapshots is None
+        return "Best-effort answer:\nAlex is still active and has no recorded blocker."
+
+    router._send_admin_text = fake_send  # type: ignore[method-assign]
+    runtime.interface_intelligence.resolve_admin_command = fake_resolve
+    router._answer_freeform_admin_request = fake_answer  # type: ignore[method-assign]
+
+    unmatched = SimpleNamespace(author=SimpleNamespace(id=999), content="what should I focus on right now?")
+    handled = asyncio.run(router.handle_message(SimpleNamespace(), unmatched))
+
+    assert handled is True
+    assert sent == ["Best-effort answer:\nAlex is still active and has no recorded blocker."]
 
 
 def test_reference_markdown_matches_checked_in_doc() -> None:

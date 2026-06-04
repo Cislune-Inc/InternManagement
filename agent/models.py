@@ -53,7 +53,7 @@ class ClickUpConfig:
 
 @dataclass(slots=True)
 class AdminConsoleConfig:
-    enable_ai_fallback: bool = False
+    enable_ai_fallback: bool = True
     menu_timeout_minutes: int = 10
 
 

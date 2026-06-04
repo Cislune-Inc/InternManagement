@@ -11,6 +11,7 @@ from pathlib import Path
 from openai import AsyncOpenAI
 
 from .models import AttachmentRecord, MessageRecord, SessionState, UserProfile
+from .openai_models import ModelFallbackChain
 
 
 @dataclass(slots=True)
@@ -24,11 +25,15 @@ class ImageInsight:
 class ImageIntelligence:
     def __init__(self) -> None:
         api_key = os.environ.get("OPENAI_API_KEY")
-        preferred_model = os.environ.get("OPENAI_VISION_MODEL") or os.environ.get("OPENAI_MODEL") or "gpt-4.1-mini"
-        fallback_model = "gpt-4.1-mini"
         self.client = AsyncOpenAI(api_key=api_key) if api_key else None
-        self.preferred_model = preferred_model
-        self.fallback_model = fallback_model
+        self.models = ModelFallbackChain(
+            "image intelligence",
+            os.environ.get("OPENAI_VISION_MODEL"),
+            os.environ.get("OPENAI_MODEL"),
+            os.environ.get("BACKUP_OPENAI_MODEL"),
+            "gpt-4.1-mini",
+        )
+        self.preferred_model = self.models.active_model or "gpt-4.1-mini"
         self.enabled = self.client is not None
 
     async def analyze_attachment(
@@ -50,7 +55,7 @@ class ImageIntelligence:
             return fallback
         prompt = self._build_prompt(user, session, inbound_text, recent_messages)
         data_url = f"data:{mime_type};base64,{base64.b64encode(content).decode('ascii')}"
-        for model in self._candidate_models():
+        for model in self.models.candidate_models():
             try:
                 response = await self.client.responses.create(
                     model=model,
@@ -68,6 +73,8 @@ class ImageIntelligence:
                 continue
             parsed = self._parse_response(response.output_text, original_filename)
             if parsed:
+                self.models.record_success(model)
+                self.preferred_model = model
                 parsed.analysis_model = model
                 return parsed
         return fallback
@@ -84,11 +91,6 @@ class ImageIntelligence:
         safe_slug = _safe_slug(insight.slug) or _safe_slug(Path(original_filename).stem) or "image"
         safe_slug = safe_slug[:48].strip("-") or "image"
         return f"{timestamp_prefix}_{index}_{safe_slug}{suffix}"
-
-    def _candidate_models(self) -> list[str]:
-        if self.preferred_model == self.fallback_model:
-            return [self.preferred_model]
-        return [self.preferred_model, self.fallback_model]
 
     def _build_prompt(
         self,

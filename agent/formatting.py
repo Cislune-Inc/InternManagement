@@ -47,6 +47,7 @@ def build_clickup_update(
     summary: str,
     archive_path: str | None,
 ) -> str:
+    onboarding_summary = str(session.metadata.get("last_task_onboarding_summary") or "").strip()
     lines = [
         f"Daily update for {user.display_name} ({session.session_date})",
         "",
@@ -58,8 +59,9 @@ def build_clickup_update(
         lines.append(f"Clocked in: {session.clocked_in_at}")
     if session.clocked_out_at:
         lines.append(f"Clocked out: {session.clocked_out_at}")
-    if session.latest_plan:
-        lines.extend(["", "Plan", session.latest_plan])
+    plan_text = onboarding_summary or session.latest_plan
+    if plan_text:
+        lines.extend(["", "Task onboarding plan" if onboarding_summary else "Plan", plan_text])
     if session.latest_blocker:
         lines.extend(["", "Blockers", session.latest_blocker])
     if session.latest_status:
