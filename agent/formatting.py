@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from .models import MessageRecord, SessionState, UserProfile
+from .time_utils import format_admin_datetime, format_transcript_datetime
 
 
 def build_transcript_markdown(
@@ -21,7 +22,7 @@ def build_transcript_markdown(
         "",
     ]
     for message in messages:
-        timestamp = message.created_at.strftime("%Y-%m-%d %H:%M:%S")
+        timestamp = format_transcript_datetime(message.created_at)
         author = "Agent" if message.direction == "outbound" else user.display_name
         lines.append(f"### {timestamp} - {author}")
         lines.append("")
@@ -56,9 +57,9 @@ def build_clickup_update(
     if active_task_name := session.metadata.get("active_clickup_task_name"):
         lines.append(f"Active ClickUp task: {active_task_name}")
     if session.clocked_in_at:
-        lines.append(f"Clocked in: {session.clocked_in_at}")
+        lines.append(f"Clocked in: {format_admin_datetime(session.clocked_in_at, include_relative=False)}")
     if session.clocked_out_at:
-        lines.append(f"Clocked out: {session.clocked_out_at}")
+        lines.append(f"Clocked out: {format_admin_datetime(session.clocked_out_at, include_relative=False)}")
     plan_text = onboarding_summary or session.latest_plan
     if plan_text:
         lines.extend(["", "Task onboarding plan" if onboarding_summary else "Plan", plan_text])

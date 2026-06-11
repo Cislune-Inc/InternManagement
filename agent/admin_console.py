@@ -388,11 +388,17 @@ def build_admin_console_registry() -> AdminConsoleRegistry:
             confirm_required=True,
             args=(
                 AdminCommandArgument("user", "Roster user key or display name", example="Andrew"),
+                AdminCommandArgument("task", "Optional task name when that intern has multiple pending reviews", required=False, example="formalize project tree"),
+                AdminCommandArgument("task_id", "Optional ClickUp task id when that intern has multiple pending reviews", required=False, example="868jun6qg"),
                 AdminCommandArgument("comments", "Optional admin note recorded with the approval", required=False, example="Looks good."),
             ),
             handler_name="_command_review_close",
             preview_name="_preview_review_close",
-            examples=('run review.close user=Andrew', 'run review.close user=Andrew comments="Looks good. Close it."'),
+            examples=(
+                'run review.close user=Andrew',
+                'run review.close user=Andrew task="formalize project tree"',
+                'run review.close user=Andrew task_id=868jun6qg comments="Looks good. Close it."',
+            ),
             scenarios=("review",),
         ),
         AdminCommandDefinition(
@@ -404,11 +410,16 @@ def build_admin_console_registry() -> AdminConsoleRegistry:
             confirm_required=True,
             args=(
                 AdminCommandArgument("user", "Roster user key or display name", example="Andrew"),
+                AdminCommandArgument("task", "Optional task name when that intern has multiple pending reviews", required=False, example="formalize project tree"),
+                AdminCommandArgument("task_id", "Optional ClickUp task id when that intern has multiple pending reviews", required=False, example="868jun6qg"),
                 AdminCommandArgument("comments", "What the intern should change before closure", example="Fix the wiring alignment first."),
             ),
             handler_name="_command_review_rework",
             preview_name="_preview_review_rework",
-            examples=('run review.rework user=Andrew comments="Fix the wiring alignment first."',),
+            examples=(
+                'run review.rework user=Andrew comments="Fix the wiring alignment first."',
+                'run review.rework user=Andrew task_id=868jun6qg comments="Fix the wiring alignment first."',
+            ),
             scenarios=("review",),
         ),
         AdminCommandDefinition(

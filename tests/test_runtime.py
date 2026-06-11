@@ -1,11 +1,15 @@
+import json
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
 import asyncio
+import requests
 
 from agent.models import AdminProfile, AgentConfig, AttachmentRecord, ClickUpConfig, MessageRecord, PromptConfig, ScheduleConfig, SessionState, UserProfile
-from agent.runtime import InternManagementRuntime
+from agent.advisor import CheckInAssessment
+from agent.runtime import InternManagementRuntime, TaskActivationResult
+from agent.state_store import StateStore
 
 
 class _FakeClickUp:
@@ -20,6 +24,7 @@ class _FakeClickUp:
                 "status": {"status": "to do"},
                 "priority": {"priority": "high"},
                 "date_created": "100",
+                "list": {"id": "list-1"},
             },
             {
                 "id": "868jun6qh",
@@ -27,14 +32,85 @@ class _FakeClickUp:
                 "status": {"status": "to do"},
                 "priority": {"priority": "normal"},
                 "date_created": "200",
+                "list": {"id": "list-1"},
             }
         ]
+
+    async def build_assigned_task_hierarchy(self, user, *, tasks=None, limit=25):
+        del user, limit
+        assigned_tasks = list(tasks) if tasks is not None else await self.list_assigned_tasks(None)
+        tasks_by_id = {
+            str(task.get("id") or ""): task
+            for task in assigned_tasks
+            if str(task.get("id") or "")
+        }
+        root_ids = [task_id for task_id in tasks_by_id]
+        return {
+            "tasks_by_id": tasks_by_id,
+            "assigned_task_ids": root_ids,
+            "root_ids": root_ids,
+            "children_by_parent_id": {},
+        }
+
+    def render_assigned_task_hierarchy(self, hierarchy, *, recommended_task_id=None):
+        tasks_by_id = hierarchy.get("tasks_by_id") or {}
+        root_ids = hierarchy.get("root_ids") or []
+        lines = []
+        for task_id in root_ids:
+            task = tasks_by_id.get(task_id) or {}
+            marker = " [recommended]" if recommended_task_id and task_id == recommended_task_id else ""
+            lines.append(f"\\- {task.get('name')} | id={task_id} [assigned]{marker}")
+        return "\n".join(lines)
+
+    def match_task_hint(self, tasks, task_hint: str):
+        hint = task_hint.strip().lower()
+        for task in tasks:
+            if hint in {str(task.get("id") or "").lower(), str(task.get("name") or "").lower()}:
+                return task
+        for task in tasks:
+            if hint and hint in str(task.get("name") or "").lower():
+                return task
+        return None
+
+    async def resolve_task_for_user(self, user, task_hint: str, *, include_mission_board=False, include_workspace=False):
+        del user, include_mission_board, include_workspace
+        hint = task_hint.strip().lower()
+        for task in await self.list_assigned_tasks(None):
+            if hint in {str(task["id"]).lower(), str(task["name"]).lower()}:
+                return task
+        for task in await self.list_assigned_tasks(None):
+            if hint and hint in str(task["name"]).lower():
+                return task
+        return None
 
     def pick_highest_priority_task(self, tasks):
         return tasks[0] if tasks else None
 
     async def resolve_clickup_user_id(self, user):
         return "87438366"
+
+    async def create_task(
+        self,
+        list_id: str,
+        *,
+        name: str,
+        description: str,
+        assignee_ids=None,
+        priority=None,
+        due_date=None,
+        status=None,
+        tags=None,
+        parent_task_id=None,
+    ):
+        del priority, due_date, status, tags
+        return {
+            "id": "created-task-1",
+            "name": name,
+            "description": description,
+            "assignees": [{"id": int((assignee_ids or ["87438366"])[0])}] if assignee_ids else [],
+            "parent": parent_task_id,
+            "list": {"id": list_id},
+        }
 
     async def comment_on_task(self, task_id: str, comment_text: str):
         return None
@@ -45,12 +121,14 @@ class _FakeClickUp:
                 return {
                     **task,
                     "description": "Break the project into clear deliverables and align the folder structure.",
+                    "list": {"id": "list-1"},
                 }
         return {
             "id": task_id,
             "name": "unknown",
             "status": {"status": "to do"},
             "description": "",
+            "list": {"id": "list-1"},
         }
 
 
@@ -79,7 +157,34 @@ def _build_runtime(admins: list[AdminProfile] | None = None) -> InternManagement
     runtime.clickup = _FakeClickUp()
     runtime.roster_by_key = {}
     runtime._config_loaded_at = None
-    runtime.state_store = SimpleNamespace(save_session=lambda _session: None, list_messages=lambda *_args, **_kwargs: [])
+    saved_sessions: dict[tuple[str, str], SessionState] = {}
+    saved_messages: dict[tuple[str, str], list[MessageRecord]] = {}
+
+    def save_session(_session: SessionState) -> None:
+        saved_sessions[(_session.user_key, _session.session_date)] = _session
+
+    def get_session(user_key: str, session_date: str) -> SessionState:
+        existing = saved_sessions.get((user_key, session_date))
+        if existing is not None:
+            return existing
+        return SessionState(user_key=user_key, session_date=session_date)
+
+    def list_messages(user_key: str, session_date: str) -> list[MessageRecord]:
+        return list(saved_messages.get((user_key, session_date), []))
+
+    def append_message(user_key: str, session_date: str, message: MessageRecord) -> bool:
+        bucket = saved_messages.setdefault((user_key, session_date), [])
+        if any(existing.message_id == message.message_id and existing.direction == message.direction for existing in bucket):
+            return False
+        bucket.append(message)
+        return True
+
+    runtime.state_store = SimpleNamespace(
+        save_session=save_session,
+        get_session=get_session,
+        list_messages=list_messages,
+        append_message=append_message,
+    )
 
     async def fake_ensure_workspace(_user, _session_date: str):
         return SimpleNamespace(daily_dir=Path("tests"))
@@ -101,11 +206,59 @@ def _build_runtime(admins: list[AdminProfile] | None = None) -> InternManagement
     async def fake_plan_feedback(_user, _plan_text: str, _context: str) -> str:
         return "Use the tangible result to keep the scope tight."
 
+    async def fake_assess_check_in_reply(
+        _user,
+        _session,
+        _question_text: str,
+        reply_text: str,
+        _recent_messages,
+        *,
+        previous_status: str | None = None,
+        attachment_count: int = 0,
+    ) -> CheckInAssessment:
+        del previous_status
+        if attachment_count > 0 or "motor" in reply_text.lower() or "wired" in reply_text.lower():
+            return CheckInAssessment(
+                meaningful_progress=True,
+                needs_probe=False,
+                reason="looks concrete",
+                probe_questions=[],
+            )
+        return CheckInAssessment(
+            meaningful_progress=False,
+            needs_probe=True,
+            reason="too vague",
+            probe_questions=[
+                "What specifically changed since the last check-in?",
+                "What exact part did you work on?",
+            ],
+        )
+
     runtime._archive_session = fake_archive  # type: ignore[method-assign]
     runtime.write_dashboard = fake_dashboard  # type: ignore[method-assign]
     runtime.refresh_configuration = fake_dashboard  # type: ignore[method-assign]
-    runtime.advisor = SimpleNamespace(plan_feedback=fake_plan_feedback)
+    runtime.advisor = SimpleNamespace(
+        plan_feedback=fake_plan_feedback,
+        assess_check_in_reply=fake_assess_check_in_reply,
+    )
+    runtime.interface_intelligence = SimpleNamespace(
+        enrich_intern_signals=lambda _text, _stage, signals: asyncio.sleep(0, result=signals)
+    )
     return runtime
+
+
+def _activation_result(task_id: str, task_name: str, *, clickup_status_name: str | None = "in progress") -> TaskActivationResult:
+    return TaskActivationResult(
+        task_id=task_id,
+        task_name=task_name,
+        clickup_status_name=clickup_status_name,
+        tracking_state={
+            "timer_running": True,
+            "timer_task_id": task_id,
+            "timer_task_name": task_name,
+            "timer_note": None,
+        },
+    )
 
 
 def test_runtime_prompts_for_missing_active_task_onboarding() -> None:
@@ -136,6 +289,544 @@ def test_runtime_prompts_for_missing_active_task_onboarding() -> None:
     assert prompt["type"] == "task_onboarding"
     assert prompt["step"] == "select_task"
     assert any("task name or task ID" in item for item in sent)
+
+
+def test_runtime_prompts_for_missing_start_photo_every_onboarding_interval() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime) -> None:
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(
+        user_key="andrew",
+        session_date="2026-05-28",
+        stage="awaiting_start_photo",
+        clocked_in_at="2026-05-28T09:00:00",
+        awaiting_start_photo=True,
+    )
+    session.metadata["clickup_prompt"] = {
+        "type": "task_onboarding",
+        "step": "photo",
+        "task_id": "868jun6qg",
+        "task_name": "formalize project tree",
+    }
+    session.metadata["last_task_onboarding_prompt_at"] = "2026-05-28T09:00:00"
+
+    changed = asyncio.run(
+        runtime._maybe_prompt_task_onboarding(
+            SimpleNamespace(),
+            user,
+            session,
+            datetime.fromisoformat("2026-05-28T09:06:00"),
+        )
+    )
+
+    assert changed is True
+    assert sent == [
+        "I still need the task-start picture for `formalize project tree`. "
+        "The task will not be officially tracked until you upload that starting image."
+    ]
+    assert session.metadata["last_task_onboarding_prompt_at"] == "2026-05-28T09:06:00"
+
+
+def test_runtime_does_not_prompt_for_start_photo_before_interval_elapses() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime) -> None:
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(
+        user_key="andrew",
+        session_date="2026-05-28",
+        stage="awaiting_start_photo",
+        clocked_in_at="2026-05-28T09:00:00",
+        awaiting_start_photo=True,
+    )
+    session.metadata["clickup_prompt"] = {
+        "type": "task_onboarding",
+        "step": "photo",
+        "task_id": "868jun6qg",
+        "task_name": "formalize project tree",
+    }
+    session.metadata["last_task_onboarding_prompt_at"] = "2026-05-28T09:03:00"
+
+    changed = asyncio.run(
+        runtime._maybe_prompt_task_onboarding(
+            SimpleNamespace(),
+            user,
+            session,
+            datetime.fromisoformat("2026-05-28T09:06:00"),
+        )
+    )
+
+    assert changed is False
+    assert sent == []
+
+
+def test_runtime_photo_step_text_reply_repeats_tracking_warning() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime) -> None:
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(
+        user_key="andrew",
+        session_date="2026-05-28",
+        stage="awaiting_start_photo",
+        clocked_in_at="2026-05-28T09:00:00",
+        awaiting_start_photo=True,
+    )
+    prompt = {
+        "type": "task_onboarding",
+        "step": "photo",
+        "source": "daily_clock_in",
+        "task_id": "868jun6qg",
+        "task_name": "formalize project tree",
+        "draft": {},
+    }
+    session.metadata["clickup_prompt"] = prompt
+    inbound = MessageRecord(
+        message_id="msg-photo-missing",
+        direction="inbound",
+        author_id=1,
+        created_at=datetime.fromisoformat("2026-05-28T09:06:00"),
+        content="I already started working on it",
+        attachments=[],
+    )
+
+    handled = asyncio.run(
+        runtime._handle_task_onboarding_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            inbound,
+            datetime.fromisoformat("2026-05-28T09:06:00"),
+            prompt,
+        )
+    )
+
+    assert handled is True
+    assert sent == [
+        "I still need the task-start picture for `formalize project tree`. "
+        "The task will not be officially tracked until you upload that starting image."
+    ]
+
+
+def test_runtime_does_not_prompt_task_onboarding_during_clock_out_artifacts() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime) -> None:
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(
+        user_key="andrew",
+        session_date="2026-05-28",
+        stage="awaiting_clock_out_artifacts",
+        clocked_in_at="2026-05-28T09:00:00",
+    )
+    session.metadata["clickup_prompt"] = {
+        "type": "task_onboarding",
+        "step": "estimated_duration",
+        "task_id": "868jun6qg",
+        "task_name": "formalize project tree",
+    }
+
+    changed = asyncio.run(
+        runtime._maybe_prompt_task_onboarding(
+            SimpleNamespace(),
+            user,
+            session,
+            datetime.fromisoformat("2026-05-28T10:00:00"),
+        )
+    )
+
+    assert changed is False
+    assert sent == []
+
+
+def test_runtime_follow_up_reply_starts_aggregation_without_immediate_probe() -> None:
+    runtime = _build_runtime()
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(
+        user_key="andrew",
+        session_date="2026-05-28",
+        stage="active",
+        clocked_in_at="2026-05-28T09:00:00",
+        intake_completed_at="2026-05-28T09:20:00",
+    )
+    session.metadata["pending_follow_up"] = {
+        "message_id": "follow-1",
+        "question_text": "What progress have you made since the last check-in?",
+        "sent_at": "2026-05-28T10:00:00",
+        "awaiting_reply": True,
+    }
+    inbound = MessageRecord(
+        message_id="msg-dry",
+        direction="inbound",
+        author_id=1,
+        created_at=datetime.fromisoformat("2026-05-28T10:00:15"),
+        content="still working",
+        attachments=[],
+    )
+
+    asyncio.run(
+        runtime.process_inbound_event(
+            SimpleNamespace(),
+            user,
+            session,
+            inbound,
+            inbound.created_at,
+        )
+    )
+
+    aggregate = session.metadata["follow_up_response_aggregation"]
+    assert aggregate["question_text"] == "What progress have you made since the last check-in?"
+    assert aggregate["reply_message_ids"] == ["msg-dry"]
+    assert aggregate["reply_fragments"] == ["still working"]
+    assert "clickup_prompt" not in session.metadata
+
+
+def test_runtime_follow_up_reply_merges_second_message_within_grace_window() -> None:
+    runtime = _build_runtime()
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(
+        user_key="andrew",
+        session_date="2026-05-28",
+        stage="active",
+        clocked_in_at="2026-05-28T09:00:00",
+        intake_completed_at="2026-05-28T09:20:00",
+    )
+    session.metadata["pending_follow_up"] = {
+        "message_id": "follow-1",
+        "question_text": "What progress have you made since the last check-in?",
+        "sent_at": "2026-05-28T10:00:00",
+        "awaiting_reply": True,
+    }
+
+    first = MessageRecord(
+        message_id="msg-1",
+        direction="inbound",
+        author_id=1,
+        created_at=datetime.fromisoformat("2026-05-28T10:00:15"),
+        content="still wiring it",
+        attachments=[],
+    )
+    second = MessageRecord(
+        message_id="msg-2",
+        direction="inbound",
+        author_id=1,
+        created_at=datetime.fromisoformat("2026-05-28T10:00:35"),
+        content="I got the motor spinning and I'm testing CAN now",
+        attachments=[],
+    )
+
+    asyncio.run(runtime.process_inbound_event(SimpleNamespace(), user, session, first, first.created_at))
+    asyncio.run(runtime.process_inbound_event(SimpleNamespace(), user, session, second, second.created_at))
+
+    aggregate = session.metadata["follow_up_response_aggregation"]
+    assert aggregate["reply_message_ids"] == ["msg-1", "msg-2"]
+    assert "motor spinning" in session.latest_status
+
+
+def test_runtime_follow_up_probe_starts_after_one_minute_of_silence() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+    admin_notices: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None):
+        del view
+        sent.append(content)
+        return MessageRecord(
+            message_id=f"bot-{len(sent)}",
+            direction="outbound",
+            author_id=0,
+            created_at=_now,
+            content=content,
+            attachments=[],
+        )
+
+    async def fake_admin_notice(_client, content: str, *, target_admins=None, files=None, user=None, session=None, view_factory=None):
+        del files, user, session
+        admin_notices.append(content)
+        if view_factory and target_admins:
+            for admin in target_admins:
+                assert view_factory(admin) is not None
+        return [admin.name for admin in (target_admins or runtime.admin_profiles())]
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    runtime._send_admin_notice = fake_admin_notice  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(
+        user_key="andrew",
+        session_date="2026-05-28",
+        stage="active",
+        clocked_in_at="2026-05-28T09:00:00",
+        intake_completed_at="2026-05-28T09:20:00",
+    )
+    session.metadata["pending_follow_up"] = {
+        "message_id": "follow-1",
+        "question_text": "What progress have you made since the last check-in?",
+        "sent_at": "2026-05-28T10:00:00",
+        "awaiting_reply": True,
+    }
+    session.metadata["follow_up_response_aggregation"] = {
+        "follow_up_message_id": "follow-1",
+        "question_text": "What progress have you made since the last check-in?",
+        "first_reply_message_id": "msg-dry",
+        "reply_message_ids": ["msg-dry"],
+        "reply_fragments": ["still working"],
+        "attachment_count": 0,
+        "first_reply_at": "2026-05-28T10:00:15",
+        "last_reply_at": "2026-05-28T10:00:15",
+        "grace_window_open": True,
+        "previous_status": "Still wiring the controller.",
+    }
+
+    changed = asyncio.run(
+        runtime._maybe_assess_pending_follow_up_probe(
+            SimpleNamespace(),
+            user,
+            session,
+            datetime.fromisoformat("2026-05-28T10:01:20"),
+        )
+    )
+
+    assert changed is True
+    prompt = session.metadata["clickup_prompt"]
+    assert prompt["type"] == "progress_probe"
+    assert "follow_up_response_aggregation" not in session.metadata
+    assert any("I still cannot tell what progress was made" in item for item in sent)
+    assert any("Would you like to see their response to the progress probe?" in item for item in admin_notices)
+
+
+def test_runtime_follow_up_probe_accepts_concrete_combined_reply() -> None:
+    runtime = _build_runtime()
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(
+        user_key="andrew",
+        session_date="2026-05-28",
+        stage="active",
+        clocked_in_at="2026-05-28T09:00:00",
+        intake_completed_at="2026-05-28T09:20:00",
+    )
+    session.metadata["pending_follow_up"] = {
+        "message_id": "follow-1",
+        "question_text": "What progress have you made since the last check-in?",
+        "sent_at": "2026-05-28T10:00:00",
+        "awaiting_reply": True,
+    }
+    session.metadata["follow_up_response_aggregation"] = {
+        "follow_up_message_id": "follow-1",
+        "question_text": "What progress have you made since the last check-in?",
+        "first_reply_message_id": "msg-1",
+        "reply_message_ids": ["msg-1", "msg-2"],
+        "reply_fragments": ["still wiring it", "I got the motor spinning and I'm testing CAN now"],
+        "attachment_count": 0,
+        "first_reply_at": "2026-05-28T10:00:15",
+        "last_reply_at": "2026-05-28T10:00:35",
+        "grace_window_open": True,
+        "previous_status": "Still wiring the controller.",
+    }
+
+    changed = asyncio.run(
+        runtime._maybe_assess_pending_follow_up_probe(
+            SimpleNamespace(),
+            user,
+            session,
+            datetime.fromisoformat("2026-05-28T10:01:40"),
+        )
+    )
+
+    assert changed is True
+    assert "follow_up_response_aggregation" not in session.metadata
+    assert "clickup_prompt" not in session.metadata
+    assert "motor spinning" in (session.latest_status or "")
+
+
+def test_runtime_progress_probe_admin_opt_in_subscribes_and_sends_exchange() -> None:
+    runtime = _build_runtime(admins=[AdminProfile(name="George", discord_user_id=999)])
+    sent_to_admins: list[tuple[list[str], str]] = []
+    persisted: list[str] = []
+
+    async def fake_admin_notice(_client, content: str, *, target_admins=None, files=None, user=None, session=None, view_factory=None):
+        del files, user, session, view_factory
+        sent_to_admins.append(([admin.name for admin in (target_admins or [])], content))
+        return [admin.name for admin in (target_admins or [])]
+
+    async def fake_persist(_user, _session, *, now, previous_session, trigger, details=None):
+        del now, previous_session, details
+        persisted.append(trigger)
+        runtime.state_store.save_session(_session)
+        return False
+
+    runtime._send_admin_notice = fake_admin_notice  # type: ignore[method-assign]
+    runtime._persist_session_state = fake_persist  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    runtime.roster_by_key[user.user_key] = user
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="active")
+    session.metadata["clickup_prompt"] = {
+        "type": "progress_probe",
+        "probe_id": "probe:msg-dry",
+        "question_text": "What progress have you made since the last check-in?",
+        "original_reply_message_ids": ["msg-dry"],
+        "original_reply_text": "still working",
+        "probe_round": 1,
+        "probe_exchange": [
+            {"role": "bot", "content": "What specifically changed since the last check-in?", "message_id": "bot-1"}
+        ],
+        "subscribed_admin_ids": [],
+        "last_activity_at": "2026-05-28T10:01:20",
+    }
+    runtime.state_store.save_session(session)
+
+    class _FakeResponse:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        def is_done(self) -> bool:
+            return False
+
+        async def edit_message(self, *, content=None, view=None):
+            del view
+            self.messages.append(content or "")
+
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=999),
+        created_at=datetime.fromisoformat("2026-05-28T10:02:00"),
+        client=SimpleNamespace(),
+        response=_FakeResponse(),
+        followup=SimpleNamespace(send=lambda *_args, **_kwargs: asyncio.sleep(0)),
+    )
+
+    asyncio.run(
+        runtime.handle_progress_probe_admin_interaction(
+            interaction,
+            user.user_key,
+            session.session_date,
+            "probe:msg-dry",
+        )
+    )
+
+    prompt = session.metadata["clickup_prompt"]
+    assert prompt["subscribed_admin_ids"] == [999]
+    assert prompt["last_activity_at"] == "2026-05-28T10:02:00-07:00"
+    assert persisted == ["progress_probe_admin_subscription"]
+    assert sent_to_admins[0][0] == ["George"]
+    assert "Original aggregated reply" in sent_to_admins[0][1]
+    assert interaction.response.messages[-1] == "Subscribed. I will forward later probe replies here."
+
+
+def test_runtime_progress_probe_times_out_after_thirty_minutes() -> None:
+    runtime = _build_runtime(admins=[AdminProfile(name="George", discord_user_id=999)])
+    admin_notices: list[str] = []
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="active")
+    session.metadata["clickup_prompt"] = {
+        "type": "progress_probe",
+        "probe_id": "probe:msg-dry",
+        "question_text": "What progress have you made since the last check-in?",
+        "original_reply_message_ids": ["msg-dry"],
+        "original_reply_text": "still working",
+        "probe_round": 1,
+        "probe_exchange": [
+            {"role": "bot", "content": "What specifically changed since the last check-in?", "message_id": "bot-1"}
+        ],
+        "subscribed_admin_ids": [999],
+        "last_activity_at": "2026-05-28T10:01:20",
+    }
+
+    async def fake_admin_notice(_client, content: str, *, target_admins=None, files=None, user=None, session=None, view_factory=None):
+        del target_admins, files, user, session, view_factory
+        admin_notices.append(content)
+        return ["George"]
+
+    runtime._send_admin_notice = fake_admin_notice  # type: ignore[method-assign]
+
+    changed = asyncio.run(
+        runtime._maybe_timeout_progress_probe(
+            SimpleNamespace(),
+            user,
+            session,
+            datetime.fromisoformat("2026-05-28T10:32:00"),
+        )
+    )
+
+    assert changed is True
+    assert "clickup_prompt" not in session.metadata
+    assert session.metadata["progress_probe_history"][-1]["closure_reason"] == "timed_out"
+    assert admin_notices == ["Probe closed: no reply to the progress probe for 30 minutes."]
 
 
 def test_runtime_clock_in_confirmation_recovers_missing_clock_in_and_starts_task_selection_sequence() -> None:
@@ -288,8 +979,9 @@ def test_finish_task_onboarding_sets_intake_completed_at_when_missing() -> None:
     runtime = _build_runtime()
     activated: list[tuple[str, str]] = []
 
-    async def fake_activate(_user, _session, _now, task_id: str, task_name: str) -> None:
+    async def fake_activate(_user, _session, _now, task_id: str, task_name: str) -> TaskActivationResult:
         activated.append((task_id, task_name))
+        return _activation_result(task_id, task_name)
 
     runtime._activate_clickup_task = fake_activate  # type: ignore[method-assign]
     user = UserProfile(
@@ -554,6 +1246,117 @@ def test_runtime_ambiguous_lunch_mention_prompts_for_confirmation() -> None:
     assert any("reply `yes` or `no`" in item.lower() for item in sent)
 
 
+def test_runtime_ambiguous_lunch_mention_during_task_selection_skips_onboarding_spam() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    async def fake_persist(*_args, **_kwargs) -> bool:
+        return True
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    runtime._persist_session_state = fake_persist  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(
+        user_key="andrew",
+        session_date="2026-05-28",
+        stage="awaiting_task_selection",
+        clocked_in_at="2026-05-28T09:00:00",
+    )
+    session.metadata["clickup_prompt"] = {
+        "type": "task_onboarding",
+        "step": "select_task",
+        "source": "missing_active_task",
+        "draft": {},
+    }
+    inbound = MessageRecord(
+        message_id="msg-lunch-task-selection",
+        direction="inbound",
+        author_id=1,
+        created_at=datetime.fromisoformat("2026-05-28T12:15:00"),
+        content="lunch",
+        attachments=[],
+    )
+    asyncio.run(
+        runtime.process_inbound_event(
+            SimpleNamespace(),
+            user,
+            session,
+            inbound,
+            datetime.fromisoformat("2026-05-28T12:15:00"),
+        )
+    )
+    assert session.stage == "awaiting_task_selection"
+    assert session.metadata["lunch_confirmation_requested_at"] == "2026-05-28T12:15:00"
+    assert session.metadata["clickup_prompt"]["type"] == "task_onboarding"
+    assert sent == ["You mentioned lunch. Do you want me to start a lunch break right now? Reply `yes` or `no`."]
+
+
+def test_runtime_explicit_lunch_start_during_task_selection_enters_lunch_state() -> None:
+    runtime = _build_runtime()
+    runtime.clickup = None
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    async def fake_persist(*_args, **_kwargs) -> bool:
+        return True
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    runtime._persist_session_state = fake_persist  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(
+        user_key="andrew",
+        session_date="2026-05-28",
+        stage="awaiting_task_selection",
+        clocked_in_at="2026-05-28T09:00:00",
+    )
+    session.metadata["clickup_prompt"] = {
+        "type": "task_onboarding",
+        "step": "select_task",
+        "source": "missing_active_task",
+        "draft": {},
+    }
+    inbound = MessageRecord(
+        message_id="msg-lunch-start-task-selection",
+        direction="inbound",
+        author_id=1,
+        created_at=datetime.fromisoformat("2026-05-28T12:16:00"),
+        content="I am going to lunch now.",
+        attachments=[],
+    )
+    asyncio.run(
+        runtime.process_inbound_event(
+            SimpleNamespace(),
+            user,
+            session,
+            inbound,
+            datetime.fromisoformat("2026-05-28T12:16:00"),
+        )
+    )
+    assert session.stage == "on_lunch_break"
+    assert session.metadata["lunch_resume_stage"] == "awaiting_task_selection"
+    assert session.metadata["clickup_prompt"]["type"] == "task_onboarding"
+    assert any("marked you on lunch break" in item.lower() for item in sent)
+
+
 def test_runtime_lunch_confirmation_yes_starts_lunch_break() -> None:
     runtime = _build_runtime()
     runtime.clickup = None
@@ -599,6 +1402,59 @@ def test_runtime_lunch_confirmation_yes_starts_lunch_break() -> None:
     assert any("marked you on lunch break" in item.lower() for item in sent)
 
 
+def test_runtime_lunch_confirmation_yes_from_task_selection_preserves_onboarding_prompt() -> None:
+    runtime = _build_runtime()
+    runtime.clickup = None
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(
+        user_key="andrew",
+        session_date="2026-05-28",
+        stage="awaiting_task_selection",
+        clocked_in_at="2026-05-28T09:00:00",
+    )
+    session.metadata["clickup_prompt"] = {
+        "type": "task_onboarding",
+        "step": "select_task",
+        "source": "missing_active_task",
+        "draft": {},
+    }
+    session.metadata["lunch_confirmation_requested_at"] = "2026-05-28T12:15:00"
+    asyncio.run(
+        runtime._route_message(
+            SimpleNamespace(),
+            user,
+            session,
+            MessageRecord(
+                message_id="msg-lunch-yes-task-selection",
+                direction="inbound",
+                author_id=1,
+                created_at=datetime.fromisoformat("2026-05-28T12:16:00"),
+                content="yes",
+                attachments=[],
+            ),
+            SimpleNamespace(clocking_out=False, starting_lunch=False, ending_lunch=False),
+            datetime.fromisoformat("2026-05-28T12:16:00"),
+        )
+    )
+    assert session.stage == "on_lunch_break"
+    assert session.metadata["lunch_resume_stage"] == "awaiting_task_selection"
+    assert session.metadata["clickup_prompt"]["type"] == "task_onboarding"
+    assert "lunch_confirmation_requested_at" not in session.metadata
+
+
 def test_runtime_lunch_confirmation_no_keeps_user_active() -> None:
     runtime = _build_runtime()
     sent: list[str] = []
@@ -641,6 +1497,57 @@ def test_runtime_lunch_confirmation_no_keeps_user_active() -> None:
     assert session.stage == "active"
     assert "lunch_confirmation_requested_at" not in session.metadata
     assert any("keep you on your current work" in item.lower() for item in sent)
+
+
+def test_runtime_lunch_confirmation_no_from_task_selection_keeps_onboarding_prompt() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(
+        user_key="andrew",
+        session_date="2026-05-28",
+        stage="awaiting_task_selection",
+        clocked_in_at="2026-05-28T09:00:00",
+    )
+    session.metadata["clickup_prompt"] = {
+        "type": "task_onboarding",
+        "step": "select_task",
+        "source": "missing_active_task",
+        "draft": {},
+    }
+    session.metadata["lunch_confirmation_requested_at"] = "2026-05-28T12:15:00"
+    asyncio.run(
+        runtime._route_message(
+            SimpleNamespace(),
+            user,
+            session,
+            MessageRecord(
+                message_id="msg-lunch-no-task-selection",
+                direction="inbound",
+                author_id=1,
+                created_at=datetime.fromisoformat("2026-05-28T12:16:00"),
+                content="no",
+                attachments=[],
+            ),
+            SimpleNamespace(clocking_out=False, starting_lunch=False, ending_lunch=False),
+            datetime.fromisoformat("2026-05-28T12:16:00"),
+        )
+    )
+    assert session.stage == "awaiting_task_selection"
+    assert session.metadata["clickup_prompt"]["type"] == "task_onboarding"
+    assert "lunch_confirmation_requested_at" not in session.metadata
 
 
 def test_runtime_end_lunch_break_resumes_task_timer() -> None:
@@ -731,11 +1638,59 @@ def test_runtime_end_lunch_break_without_task_falls_back_to_task_selection() -> 
     assert any("active clickup task" in item.lower() for item in sent)
 
 
+def test_runtime_end_lunch_break_resumes_existing_task_onboarding_step() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(
+        user_key="andrew",
+        session_date="2026-05-28",
+        stage="on_lunch_break",
+        clocked_in_at="2026-05-28T09:00:00",
+    )
+    session.metadata["clickup_prompt"] = {
+        "type": "task_onboarding",
+        "step": "plan",
+        "task_id": "868jun6qg",
+        "task_name": "formalize project tree",
+        "source": "missing_active_task",
+        "draft": {},
+    }
+    session.metadata["lunch_resume_stage"] = "awaiting_plan"
+    session.metadata["lunch_resume_task_id"] = "868jun6qg"
+    session.metadata["lunch_resume_task_name"] = "formalize project tree"
+    asyncio.run(
+        runtime._end_lunch_break(
+            SimpleNamespace(),
+            user,
+            session,
+            datetime.fromisoformat("2026-05-28T12:30:00"),
+        )
+    )
+    assert session.stage == "awaiting_plan"
+    assert session.metadata["clickup_prompt"]["step"] == "plan"
+    assert any("let's pick up where we left off" in item.lower() for item in sent)
+    assert any("i still need your plan" in item.lower() for item in sent)
+
+
 def test_runtime_task_onboarding_accepts_recommended_reply_for_daily_clock_in() -> None:
     runtime = _build_runtime()
     sent: list[str] = []
 
-    async def fake_send(_client, _user, _session, content: str, _now: datetime) -> None:
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
         sent.append(content)
 
     runtime._send_dm = fake_send  # type: ignore[method-assign]
@@ -774,10 +1729,670 @@ def test_runtime_task_onboarding_accepts_recommended_reply_for_daily_clock_in() 
         )
     )
     assert handled is True
+    assert prompt["candidate_task_id"] == "868jun6qg"
+    assert prompt["candidate_task_name"] == "formalize project tree"
+    assert prompt["step"] == "confirm_task"
+    assert session.stage == "awaiting_task_selection"
+    assert any("formalize project tree" in item for item in sent)
+
+
+def test_runtime_task_onboarding_confirmation_yes_advances_to_plan() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="awaiting_task_selection")
+    prompt = {
+        "type": "task_onboarding",
+        "step": "confirm_task",
+        "source": "daily_clock_in",
+        "candidate_task_id": "868jun6qg",
+        "candidate_task_name": "formalize project tree",
+        "draft": {},
+    }
+    inbound = MessageRecord(
+        message_id="msg-confirm",
+        direction="inbound",
+        author_id=1,
+        created_at=datetime.fromisoformat("2026-05-28T14:01:30"),
+        content="yes",
+        attachments=[],
+    )
+    handled = asyncio.run(
+        runtime._handle_task_onboarding_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            inbound,
+            datetime.fromisoformat("2026-05-28T14:01:30"),
+            prompt,
+        )
+    )
+    assert handled is True
     assert prompt["task_id"] == "868jun6qg"
+    assert prompt["task_name"] == "formalize project tree"
     assert prompt["step"] == "plan"
     assert session.stage == "awaiting_plan"
-    assert any("formalize project tree" in item for item in sent)
+    assert any("What is your plan for `formalize project tree`?" in item for item in sent)
+
+
+def test_runtime_task_onboarding_confirmation_no_returns_to_task_selection() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="awaiting_task_selection")
+    prompt = {
+        "type": "task_onboarding",
+        "step": "confirm_task",
+        "source": "daily_clock_in",
+        "candidate_task_id": "868jun6qg",
+        "candidate_task_name": "formalize project tree",
+        "draft": {},
+    }
+    inbound = MessageRecord(
+        message_id="msg-confirm-no",
+        direction="inbound",
+        author_id=1,
+        created_at=datetime.fromisoformat("2026-05-28T14:01:30"),
+        content="no",
+        attachments=[],
+    )
+    handled = asyncio.run(
+        runtime._handle_task_onboarding_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            inbound,
+            datetime.fromisoformat("2026-05-28T14:01:30"),
+            prompt,
+        )
+    )
+    assert handled is True
+    assert prompt["step"] == "select_task"
+    assert "candidate_task_id" not in prompt
+    assert session.stage == "awaiting_task_selection"
+    assert any("Assigned task tree:" in item for item in sent)
+
+
+def test_runtime_task_onboarding_confirmation_re_resolves_corrected_task() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="awaiting_task_selection")
+    prompt = {
+        "type": "task_onboarding",
+        "step": "confirm_task",
+        "source": "daily_clock_in",
+        "candidate_task_id": "868jun6qg",
+        "candidate_task_name": "formalize project tree",
+        "draft": {},
+    }
+    inbound = MessageRecord(
+        message_id="msg-confirm-other",
+        direction="inbound",
+        author_id=1,
+        created_at=datetime.fromisoformat("2026-05-28T14:01:30"),
+        content="secondary cleanup",
+        attachments=[],
+    )
+    handled = asyncio.run(
+        runtime._handle_task_onboarding_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            inbound,
+            datetime.fromisoformat("2026-05-28T14:01:30"),
+            prompt,
+        )
+    )
+    assert handled is True
+    assert prompt["step"] == "confirm_task"
+    assert prompt["candidate_task_id"] == "868jun6qh"
+    assert prompt["candidate_task_name"] == "secondary cleanup"
+    assert session.stage == "awaiting_task_selection"
+    assert any("secondary cleanup" in item.lower() for item in sent)
+
+
+def test_runtime_task_selection_prompt_renders_hierarchy_tree_and_create_escape_hatch() -> None:
+    runtime = _build_runtime()
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+
+    async def fake_build_hierarchy(_user, *, tasks=None, limit=25):
+        del _user, tasks, limit
+        return {
+            "tasks_by_id": {
+                "parent-1": {"id": "parent-1", "name": "Robot Build"},
+                "task-1": {"id": "task-1", "name": "Harness Validation"},
+            },
+            "assigned_task_ids": ["task-1"],
+            "root_ids": ["parent-1"],
+            "children_by_parent_id": {"parent-1": ["task-1"]},
+        }
+
+    def fake_render_hierarchy(_hierarchy, *, recommended_task_id=None):
+        del _hierarchy, recommended_task_id
+        return "\\- Robot Build | id=parent-1\n   \\- Harness Validation | id=task-1 [assigned]"
+
+    runtime.clickup.build_assigned_task_hierarchy = fake_build_hierarchy  # type: ignore[method-assign]
+    runtime.clickup.render_assigned_task_hierarchy = fake_render_hierarchy  # type: ignore[method-assign]
+
+    prompt = asyncio.run(runtime._task_selection_prompt(user))
+
+    assert "Assigned task tree:" in prompt
+    assert "Robot Build" in prompt
+    assert "Harness Validation" in prompt
+    assert "reply `create task` if none of these fit" in prompt
+    assert "Reply with the name or ID of an `[assigned]` task" in prompt
+
+
+def test_runtime_task_onboarding_create_task_request_starts_creation_flow() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="awaiting_task_selection")
+    prompt = {
+        "type": "task_onboarding",
+        "step": "select_task",
+        "source": "daily_clock_in",
+        "reason": "Pick a task.",
+        "draft": {},
+    }
+    session.metadata["clickup_prompt"] = prompt
+    inbound = MessageRecord(
+        message_id="msg-create-task",
+        direction="inbound",
+        author_id=1,
+        created_at=datetime.fromisoformat("2026-05-28T14:01:45"),
+        content="create task",
+        attachments=[],
+    )
+
+    handled = asyncio.run(
+        runtime._handle_task_onboarding_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            inbound,
+            inbound.created_at,
+            prompt,
+        )
+    )
+
+    assert handled is True
+    new_prompt = session.metadata["clickup_prompt"]
+    assert new_prompt["type"] == "task_creation"
+    assert new_prompt["step"] == "placement"
+    assert new_prompt["source"] == "daily_clock_in"
+    assert isinstance(new_prompt["placement_candidates"], list)
+    assert session.stage == "awaiting_task_selection"
+    assert any("let's create a new task" in item.lower() for item in sent)
+
+
+def test_runtime_task_creation_under_parent_creates_subtask_and_starts_plan() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+    admin_messages: list[str] = []
+    create_calls: list[dict[str, object]] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    async def fake_admin_notice(_client, content: str, **_kwargs):
+        admin_messages.append(content)
+        return ["George"]
+
+    async def fake_create_task(
+        list_id: str,
+        *,
+        name: str,
+        description: str,
+        assignee_ids=None,
+        priority=None,
+        due_date=None,
+        status=None,
+        tags=None,
+        parent_task_id=None,
+    ):
+        create_calls.append(
+            {
+                "list_id": list_id,
+                "name": name,
+                "description": description,
+                "assignee_ids": assignee_ids,
+                "priority": priority,
+                "due_date": due_date,
+                "status": status,
+                "tags": tags,
+                "parent_task_id": parent_task_id,
+            }
+        )
+        return {"id": "created-subtask-1", "name": name}
+
+    async def fake_resolve_clickup_user_id(_user):
+        return "87438366"
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    runtime._send_admin_notice = fake_admin_notice  # type: ignore[method-assign]
+    runtime.clickup.create_task = fake_create_task  # type: ignore[method-assign]
+    runtime.clickup.resolve_clickup_user_id = fake_resolve_clickup_user_id  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="awaiting_task_selection")
+    prompt = {
+        "type": "task_creation",
+        "source": "daily_clock_in",
+        "step": "placement",
+        "tree_text": "\\- Robot Build | id=parent-1",
+        "placement_candidates": [
+            {"id": "parent-1", "name": "Robot Build", "list_id": "list-42", "parent_task_id": ""},
+        ],
+        "draft": {},
+    }
+    session.metadata["clickup_prompt"] = prompt
+    base_time = datetime.fromisoformat("2026-05-28T14:05:00")
+
+    async def run_steps() -> None:
+        await runtime._handle_task_creation_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            MessageRecord("msg-parent", "inbound", 1, base_time, "parent-1", []),
+            base_time,
+            prompt,
+        )
+        await runtime._handle_task_creation_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            MessageRecord("msg-title", "inbound", 1, base_time, "Motor Bracket Drill Template", []),
+            base_time,
+            prompt,
+        )
+        await runtime._handle_task_creation_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            MessageRecord(
+                "msg-desc",
+                "inbound",
+                1,
+                base_time,
+                "Need a template so we can drill the bracket consistently.",
+                [],
+            ),
+            base_time,
+            prompt,
+        )
+
+    asyncio.run(run_steps())
+
+    assert create_calls == [
+        {
+            "list_id": "list-42",
+            "name": "Motor Bracket Drill Template",
+            "description": "Need a template so we can drill the bracket consistently.",
+            "assignee_ids": ["87438366"],
+            "priority": None,
+            "due_date": None,
+            "status": None,
+            "tags": None,
+            "parent_task_id": "parent-1",
+        }
+    ]
+    new_prompt = session.metadata["clickup_prompt"]
+    assert new_prompt["type"] == "task_onboarding"
+    assert new_prompt["step"] == "plan"
+    assert new_prompt["task_id"] == "created-subtask-1"
+    assert new_prompt["task_name"] == "Motor Bracket Drill Template"
+    assert session.stage == "awaiting_plan"
+    assert any("created a new clickup task" in item.lower() for item in admin_messages)
+    assert any("Placed under `Robot Build`" in item for item in admin_messages)
+    assert any("What is your plan for `Motor Bracket Drill Template`?" in item for item in sent)
+
+
+def test_runtime_task_creation_top_level_uses_mission_board_and_starts_plan() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+    create_calls: list[dict[str, object]] = []
+    runtime.config.clickup.mission_board_list_id = "mission-board"
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    async def fake_admin_notice(_client, _content: str, **_kwargs):
+        return ["George"]
+
+    async def fake_create_task(list_id: str, **kwargs):
+        create_calls.append({"list_id": list_id, **kwargs})
+        return {"id": "created-top-level-1", "name": kwargs["name"]}
+
+    async def fake_resolve_clickup_user_id(_user):
+        return "87438366"
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    runtime._send_admin_notice = fake_admin_notice  # type: ignore[method-assign]
+    runtime.clickup.create_task = fake_create_task  # type: ignore[method-assign]
+    runtime.clickup.resolve_clickup_user_id = fake_resolve_clickup_user_id  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="awaiting_task_selection")
+    prompt = {
+        "type": "task_creation",
+        "source": "daily_clock_in",
+        "step": "placement",
+        "tree_text": "",
+        "placement_candidates": [],
+        "draft": {},
+    }
+    session.metadata["clickup_prompt"] = prompt
+    base_time = datetime.fromisoformat("2026-05-28T14:10:00")
+
+    async def run_steps() -> None:
+        await runtime._handle_task_creation_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            MessageRecord("msg-top", "inbound", 1, base_time, "top level", []),
+            base_time,
+            prompt,
+        )
+        await runtime._handle_task_creation_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            MessageRecord("msg-title", "inbound", 1, base_time, "Investigate Loose Battery Mount", []),
+            base_time,
+            prompt,
+        )
+        await runtime._handle_task_creation_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            MessageRecord(
+                "msg-desc",
+                "inbound",
+                1,
+                base_time,
+                "Need to inspect the mount and document what hardware is missing.",
+                [],
+            ),
+            base_time,
+            prompt,
+        )
+
+    asyncio.run(run_steps())
+
+    assert create_calls[0]["list_id"] == "mission-board"
+    assert create_calls[0]["parent_task_id"] is None
+    assert session.metadata["clickup_prompt"]["step"] == "plan"
+    assert session.metadata["clickup_prompt"]["task_id"] == "created-top-level-1"
+    assert session.stage == "awaiting_plan"
+    assert any("at the top level in Mission Board" in item for item in sent)
+
+
+def test_runtime_task_creation_top_level_without_mission_board_prompts_again() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="awaiting_task_selection")
+    prompt = {
+        "type": "task_creation",
+        "source": "daily_clock_in",
+        "step": "placement",
+        "tree_text": "",
+        "placement_candidates": [],
+        "draft": {},
+    }
+
+    handled = asyncio.run(
+        runtime._handle_task_creation_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            MessageRecord("msg-top", "inbound", 1, datetime.fromisoformat("2026-05-28T14:12:00"), "top level", []),
+            datetime.fromisoformat("2026-05-28T14:12:00"),
+            prompt,
+        )
+    )
+
+    assert handled is True
+    assert prompt["step"] == "placement"
+    assert any("Mission Board is not configured" in item for item in sent)
+
+
+def test_runtime_task_creation_go_back_from_placement_returns_to_task_selection() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="awaiting_task_selection")
+    session.metadata["pending_intern_task_switch"] = {
+        "source": "intern_switch",
+        "previous_stage": "active",
+        "previous_task_id": "868jun6qg",
+        "previous_task_name": "formalize project tree",
+        "previous_selection_reason": "Confirmed by intern during task onboarding.",
+    }
+    prompt = {
+        "type": "task_creation",
+        "source": "intern_switch",
+        "step": "placement",
+        "tree_text": "\\- Robot Build | id=parent-1",
+        "placement_candidates": [
+            {"id": "parent-1", "name": "Robot Build", "list_id": "list-42", "parent_task_id": ""},
+        ],
+        "draft": {},
+    }
+    session.metadata["clickup_prompt"] = prompt
+
+    handled = asyncio.run(
+        runtime._handle_task_creation_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            MessageRecord("msg-go-back", "inbound", 1, datetime.fromisoformat("2026-05-28T14:12:30"), "go back", []),
+            datetime.fromisoformat("2026-05-28T14:12:30"),
+            prompt,
+        )
+    )
+
+    assert handled is True
+    new_prompt = session.metadata["clickup_prompt"]
+    assert new_prompt["type"] == "task_onboarding"
+    assert new_prompt["step"] == "select_task"
+    assert new_prompt["source"] == "intern_switch"
+    assert session.stage == "awaiting_task_selection"
+    assert session.metadata["pending_intern_task_switch"]["previous_task_id"] == "868jun6qg"
+    assert any("go back to your task tree" in item.lower() for item in sent)
+    assert any("Assigned task tree:" in item for item in sent)
+
+
+def test_runtime_task_creation_go_back_from_title_returns_to_placement() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="awaiting_task_selection")
+    prompt = {
+        "type": "task_creation",
+        "source": "daily_clock_in",
+        "step": "title",
+        "tree_text": "\\- Robot Build | id=parent-1",
+        "placement_candidates": [
+            {"id": "parent-1", "name": "Robot Build", "list_id": "list-42", "parent_task_id": ""},
+        ],
+        "draft": {
+            "parent_task_id": "parent-1",
+            "parent_task_name": "Robot Build",
+            "list_id": "list-42",
+            "title": "Bad title",
+        },
+    }
+
+    handled = asyncio.run(
+        runtime._handle_task_creation_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            MessageRecord("msg-go-back-title", "inbound", 1, datetime.fromisoformat("2026-05-28T14:13:00"), "go back", []),
+            datetime.fromisoformat("2026-05-28T14:13:00"),
+            prompt,
+        )
+    )
+
+    assert handled is True
+    assert prompt["step"] == "placement"
+    assert "title" not in prompt["draft"]
+    assert sent[-1].startswith("Okay, let's create a new task.")
+
+
+def test_runtime_task_creation_go_back_from_description_returns_to_title() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="awaiting_task_selection")
+    prompt = {
+        "type": "task_creation",
+        "source": "daily_clock_in",
+        "step": "description",
+        "tree_text": "\\- Robot Build | id=parent-1",
+        "placement_candidates": [
+            {"id": "parent-1", "name": "Robot Build", "list_id": "list-42", "parent_task_id": ""},
+        ],
+        "draft": {
+            "parent_task_id": "parent-1",
+            "parent_task_name": "Robot Build",
+            "list_id": "list-42",
+            "title": "Motor Bracket Drill Template",
+        },
+    }
+
+    handled = asyncio.run(
+        runtime._handle_task_creation_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            MessageRecord("msg-go-back-description", "inbound", 1, datetime.fromisoformat("2026-05-28T14:13:30"), "go back", []),
+            datetime.fromisoformat("2026-05-28T14:13:30"),
+            prompt,
+        )
+    )
+
+    assert handled is True
+    assert prompt["step"] == "title"
+    assert "title" not in prompt["draft"]
+    assert sent[-1] == "Okay, let's go back. What should the new task be called?"
 
 
 def test_runtime_task_onboarding_collects_interactive_plan_before_photo() -> None:
@@ -788,8 +2403,9 @@ def test_runtime_task_onboarding_collects_interactive_plan_before_photo() -> Non
     async def fake_send(_client, _user, _session, content: str, _now: datetime) -> None:
         sent.append(content)
 
-    async def fake_activate(_user, _session, _now, task_id: str, task_name: str) -> None:
+    async def fake_activate(_user, _session, _now, task_id: str, task_name: str) -> TaskActivationResult:
         activated.append((task_id, task_name))
+        return _activation_result(task_id, task_name)
 
     runtime._send_dm = fake_send  # type: ignore[method-assign]
     runtime._activate_clickup_task = fake_activate  # type: ignore[method-assign]
@@ -897,6 +2513,494 @@ def test_runtime_task_onboarding_collects_interactive_plan_before_photo() -> Non
     assert session.metadata["task_onboarding_fallback_plan"].startswith("I would pause, ask for a quick review")
     assert "Alternative if it is not working:" in session.metadata["last_task_onboarding_summary"]
     assert activated == [("868jun6qg", "formalize project tree")]
+    assert sent[-1] == "Perfect. `formalize project tree` is active in ClickUp and task tracking is running."
+
+
+def test_runtime_task_onboarding_midstream_switch_task_restarts_on_corrected_task() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="awaiting_plan")
+    session.latest_plan = "Old plan"
+    session.latest_feedback = "Old feedback"
+    prompt = {
+        "type": "task_onboarding",
+        "step": "tangible_result",
+        "source": "daily_clock_in",
+        "task_id": "868jun6qg",
+        "task_name": "formalize project tree",
+        "draft": {"plan": "Old draft plan"},
+    }
+    inbound = MessageRecord(
+        message_id="msg-switch-task",
+        direction="inbound",
+        author_id=1,
+        created_at=datetime.fromisoformat("2026-05-28T14:02:30"),
+        content="Actually switch task to secondary cleanup",
+        attachments=[],
+    )
+    handled = asyncio.run(
+        runtime._handle_task_onboarding_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            inbound,
+            datetime.fromisoformat("2026-05-28T14:02:30"),
+            prompt,
+        )
+    )
+    assert handled is True
+    assert prompt["step"] == "plan"
+    assert prompt["task_id"] == "868jun6qh"
+    assert prompt["task_name"] == "secondary cleanup"
+    assert prompt["draft"] == {}
+    assert session.stage == "awaiting_plan"
+    assert session.latest_plan is None
+    assert session.latest_feedback is None
+    assert any("restarting onboarding on `secondary cleanup`" in item.lower() for item in sent)
+
+
+def test_runtime_task_onboarding_wrong_task_without_hint_returns_to_selection() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="awaiting_plan")
+    prompt = {
+        "type": "task_onboarding",
+        "step": "plan",
+        "source": "daily_clock_in",
+        "task_id": "868jun6qg",
+        "task_name": "formalize project tree",
+        "draft": {"plan": "Old draft plan"},
+    }
+    inbound = MessageRecord(
+        message_id="msg-wrong-task",
+        direction="inbound",
+        author_id=1,
+        created_at=datetime.fromisoformat("2026-05-28T14:02:30"),
+        content="wrong task",
+        attachments=[],
+    )
+    handled = asyncio.run(
+        runtime._handle_task_onboarding_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            inbound,
+            datetime.fromisoformat("2026-05-28T14:02:30"),
+            prompt,
+        )
+    )
+    assert handled is True
+    assert prompt["step"] == "select_task"
+    assert "task_id" not in prompt
+    assert prompt["draft"] == {}
+    assert session.stage == "awaiting_task_selection"
+    assert any("Assigned task tree:" in item for item in sent)
+
+
+def test_runtime_task_onboarding_fallback_plan_mentions_switch_without_triggering_correction() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    async def fake_feedback(_user, _prompt, _text: str) -> str:
+        return "Keep the scope narrow."
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    runtime._task_onboarding_feedback = fake_feedback  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="awaiting_plan")
+    prompt = {
+        "type": "task_onboarding",
+        "step": "fallback_plan",
+        "source": "daily_clock_in",
+        "task_id": "868jun6qg",
+        "task_name": "formalize project tree",
+        "draft": {
+            "plan": "Plan",
+            "tangible_result": "Result",
+            "necessity": "Need",
+            "effectiveness": "Effective",
+            "estimated_duration": "2 hours",
+            "reconsider_threshold": "45 minutes",
+        },
+    }
+    inbound = MessageRecord(
+        message_id="msg-fallback-switch-later",
+        direction="inbound",
+        author_id=1,
+        created_at=datetime.fromisoformat("2026-05-28T14:02:30"),
+        content="If this stalls, I would ask for help and switch to a smaller cleanup slice later.",
+        attachments=[],
+    )
+    handled = asyncio.run(
+        runtime._handle_task_onboarding_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            inbound,
+            datetime.fromisoformat("2026-05-28T14:02:30"),
+            prompt,
+        )
+    )
+    assert handled is True
+    assert prompt["step"] == "photo"
+    assert prompt["task_id"] == "868jun6qg"
+    assert session.stage == "awaiting_start_photo"
+
+
+def test_runtime_task_onboarding_photo_step_can_switch_to_corrected_task() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="awaiting_start_photo")
+    session.awaiting_start_photo = True
+    prompt = {
+        "type": "task_onboarding",
+        "step": "photo",
+        "source": "daily_clock_in",
+        "task_id": "868jun6qg",
+        "task_name": "formalize project tree",
+        "draft": {
+            "plan": "Plan",
+        },
+    }
+    inbound = MessageRecord(
+        message_id="msg-photo-switch",
+        direction="inbound",
+        author_id=1,
+        created_at=datetime.fromisoformat("2026-05-28T14:05:00"),
+        content="use secondary cleanup instead",
+        attachments=[],
+    )
+    handled = asyncio.run(
+        runtime._handle_task_onboarding_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            inbound,
+            datetime.fromisoformat("2026-05-28T14:05:00"),
+            prompt,
+        )
+    )
+    assert handled is True
+    assert prompt["step"] == "plan"
+    assert prompt["task_id"] == "868jun6qh"
+    assert prompt["task_name"] == "secondary cleanup"
+    assert session.stage == "awaiting_plan"
+    assert session.awaiting_start_photo is False
+
+
+def test_runtime_task_onboarding_photo_step_switch_request_returns_to_selection() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="awaiting_start_photo")
+    session.awaiting_start_photo = True
+    session.latest_plan = "Old plan"
+    session.latest_feedback = "Old feedback"
+    prompt = {
+        "type": "task_onboarding",
+        "step": "photo",
+        "source": "daily_clock_in",
+        "task_id": "868jun6qg",
+        "task_name": "formalize project tree",
+        "draft": {"plan": "Plan"},
+    }
+    session.metadata["clickup_prompt"] = prompt
+
+    handled = asyncio.run(
+        runtime._handle_task_onboarding_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            MessageRecord(
+                "msg-photo-switch-bare",
+                "inbound",
+                1,
+                datetime.fromisoformat("2026-05-28T14:05:30"),
+                "I need to switch my task",
+                [],
+            ),
+            datetime.fromisoformat("2026-05-28T14:05:30"),
+            prompt,
+        )
+    )
+
+    assert handled is True
+    assert prompt["step"] == "select_task"
+    assert "task_id" not in prompt
+    assert session.stage == "awaiting_task_selection"
+    assert session.awaiting_start_photo is False
+    assert session.latest_plan is None
+    assert session.latest_feedback is None
+    assert any("switch tasks before this one officially starts" in item.lower() for item in sent)
+    assert any("Assigned task tree:" in item for item in sent)
+
+
+def test_runtime_task_onboarding_photo_step_url_requires_attachment() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="awaiting_start_photo")
+    session.awaiting_start_photo = True
+    prompt = {
+        "type": "task_onboarding",
+        "step": "photo",
+        "source": "daily_clock_in",
+        "task_id": "868jun6qg",
+        "task_name": "formalize project tree",
+        "draft": {},
+    }
+    session.metadata["clickup_prompt"] = prompt
+
+    handled = asyncio.run(
+        runtime._handle_task_onboarding_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            MessageRecord(
+                "msg-photo-url",
+                "inbound",
+                1,
+                datetime.fromisoformat("2026-05-28T14:06:00"),
+                "https://cdn.discordapp.com/example.png",
+                [],
+            ),
+            datetime.fromisoformat("2026-05-28T14:06:00"),
+            prompt,
+        )
+    )
+
+    assert handled is True
+    assert session.stage == "awaiting_start_photo"
+    assert session.awaiting_start_photo is True
+    assert sent == [
+        "I need the image uploaded as an attachment here. A link by itself does not count as the task-start photo."
+    ]
+
+
+def test_runtime_task_onboarding_deleted_task_404_returns_to_selection() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    async def fake_finish(_user, _session, _prompt: dict[str, object], _now: datetime) -> TaskActivationResult:
+        raise requests.HTTPError(
+            "404 Client Error: Not Found",
+            response=SimpleNamespace(status_code=404),
+        )
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    runtime._finish_task_onboarding = fake_finish  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="awaiting_start_photo")
+    session.awaiting_start_photo = True
+    session.latest_plan = "Plan"
+    session.latest_feedback = "Feedback"
+    session.metadata["clickup_prompt"] = {
+        "type": "task_onboarding",
+        "step": "photo",
+        "source": "daily_clock_in",
+        "task_id": "868jzp5f5",
+        "task_name": "go back",
+        "draft": {"plan": "Plan"},
+    }
+    session.metadata["active_clickup_task_id"] = "868jzp5f5"
+    session.metadata["active_clickup_task_name"] = "go back"
+    session.metadata["progress_photo_paths"] = ["C:/tmp/previous.jpg"]
+    prompt = session.metadata["clickup_prompt"]
+    photo = AttachmentRecord(
+        filename="before.jpg",
+        original_filename="before.jpg",
+        url="demo://before",
+        content_type="image/jpeg",
+        size=123,
+        local_path="C:/tmp/before.jpg",
+    )
+
+    handled = asyncio.run(
+        runtime._handle_task_onboarding_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            MessageRecord(
+                "msg-photo-404",
+                "inbound",
+                1,
+                datetime.fromisoformat("2026-05-28T14:06:30"),
+                "",
+                [photo],
+            ),
+            datetime.fromisoformat("2026-05-28T14:06:30"),
+            prompt,
+        )
+    )
+
+    assert handled is True
+    new_prompt = session.metadata["clickup_prompt"]
+    assert new_prompt["type"] == "task_onboarding"
+    assert new_prompt["step"] == "select_task"
+    assert session.stage == "awaiting_task_selection"
+    assert session.awaiting_start_photo is False
+    assert session.latest_plan is None
+    assert session.latest_feedback is None
+    assert "active_clickup_task_id" not in session.metadata
+    assert "active_clickup_task_name" not in session.metadata
+    assert session.metadata["progress_photo_paths"] == ["C:/tmp/previous.jpg"]
+    assert any("That ClickUp task no longer exists" in item for item in sent)
+    assert any("Assigned task tree:" in item for item in sent)
+
+
+def test_runtime_task_onboarding_completion_message_does_not_claim_clickup_status_without_confirmation() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    async def fake_finish(_user, _session, prompt: dict[str, object], _now: datetime) -> TaskActivationResult:
+        return TaskActivationResult(
+            task_id=str(prompt.get("task_id") or ""),
+            task_name=str(prompt.get("task_name") or ""),
+            clickup_status_name=None,
+            tracking_state={
+                "timer_running": True,
+                "timer_task_id": str(prompt.get("task_id") or ""),
+                "timer_task_name": str(prompt.get("task_name") or ""),
+                "timer_note": None,
+            },
+        )
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    runtime._finish_task_onboarding = fake_finish  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="awaiting_start_photo")
+    prompt = {
+        "type": "task_onboarding",
+        "step": "photo",
+        "source": "daily_clock_in",
+        "task_id": "868jun6qg",
+        "task_name": "formalize project tree",
+        "draft": {},
+    }
+    session.metadata["clickup_prompt"] = prompt
+    photo = AttachmentRecord(
+        filename="before.jpg",
+        original_filename="before.jpg",
+        url="demo://before",
+        content_type="image/jpeg",
+        size=123,
+        local_path="C:/tmp/before.jpg",
+    )
+    inbound = MessageRecord(
+        message_id="msg-photo",
+        direction="inbound",
+        author_id=1,
+        created_at=datetime.fromisoformat("2026-05-28T14:02:00"),
+        content="",
+        attachments=[photo],
+    )
+    handled = asyncio.run(
+        runtime._handle_task_onboarding_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            inbound,
+            datetime.fromisoformat("2026-05-28T14:02:00"),
+            prompt,
+        )
+    )
+    assert handled is True
+    assert sent[-1] == (
+        "Perfect. I started task tracking for `formalize project tree`, but I could not confirm that ClickUp moved it to `in progress`."
+    )
 
 
 def test_runtime_task_onboarding_reminder_covers_new_steps() -> None:
@@ -1053,7 +3157,8 @@ def test_runtime_initiates_admin_review_when_task_finishes() -> None:
     async def fake_send(_client, _user, _session, content: str, _now: datetime) -> None:
         sent.append(content)
 
-    async def fake_admin_notice(_client, user, _session, _now: datetime) -> None:
+    async def fake_admin_notice(_client, user, _session, _now: datetime, *, review=None) -> None:
+        assert isinstance(review, dict)
         admin_notices.append(user.display_name)
 
     async def fake_pause(_user, _session, _now, *, set_hold: bool, end_reason: str):
@@ -1100,15 +3205,18 @@ def test_runtime_initiates_admin_review_when_task_finishes() -> None:
         )
     )
     assert session.stage == "awaiting_admin_review"
-    review = session.metadata["pending_admin_review"]
+    reviews = session.metadata["pending_admin_reviews"]
+    assert len(reviews) == 1
+    review = reviews[0]
     assert review["task_id"] == "868jun6qg"
     assert review["completion_photo_paths"] == [str(image_path)]
+    assert "pending_admin_review" not in session.metadata
     assert admin_notices == ["Andrew"]
     assert any("waiting on admin review" in item for item in sent)
     image_path.unlink(missing_ok=True)
 
 
-def test_runtime_completion_without_photo_requests_review_image() -> None:
+def test_runtime_completion_without_photo_requests_finish_confirmation() -> None:
     runtime = _build_runtime()
     sent: list[str] = []
 
@@ -1145,11 +3253,10 @@ def test_runtime_completion_without_photo_requests_review_image() -> None:
         )
     )
     prompt = session.metadata["clickup_prompt"]
-    assert prompt["type"] == "task_review_submission"
-    assert prompt["summary"] == "I finished formalize project tree."
-    assert prompt["needs_summary"] is False
-    assert prompt["needs_photo"] is True
-    assert any("need a picture" in item for item in sent)
+    assert prompt["type"] == "task_finish_confirmation"
+    assert prompt["summary_candidate"] == "I finished formalize project tree."
+    assert "pending_admin_review" not in session.metadata
+    assert any("ready for admin review" in item for item in sent)
 
 
 def test_runtime_generic_done_requests_summary_and_photo() -> None:
@@ -1189,11 +3296,200 @@ def test_runtime_generic_done_requests_summary_and_photo() -> None:
         )
     )
     prompt = session.metadata["clickup_prompt"]
+    assert prompt["type"] == "task_finish_confirmation"
+    assert prompt["summary_candidate"] == "im done"
+    assert any("ready for admin review" in item for item in sent)
+
+
+def test_runtime_finish_confirmation_yes_starts_review_submission() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="active")
+    session.metadata["active_clickup_task_id"] = "868jun6qg"
+    session.metadata["active_clickup_task_name"] = "formalize project tree"
+    session.metadata["clickup_prompt"] = {
+        "type": "task_finish_confirmation",
+        "task_id": "868jun6qg",
+        "task_name": "formalize project tree",
+        "summary_candidate": "im done",
+        "requested_at": "2026-05-28T14:00:00",
+    }
+    inbound = MessageRecord(
+        message_id="msg-yes",
+        direction="inbound",
+        author_id=1,
+        created_at=datetime.fromisoformat("2026-05-28T14:01:00"),
+        content="yes",
+        attachments=[],
+    )
+    handled = asyncio.run(
+        runtime._handle_clickup_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            inbound,
+            SimpleNamespace(recovered=False, stuck=False),
+            datetime.fromisoformat("2026-05-28T14:01:00"),
+        )
+    )
+    assert handled is True
+    prompt = session.metadata["clickup_prompt"]
     assert prompt["type"] == "task_review_submission"
     assert prompt["summary"] == ""
     assert prompt["needs_summary"] is True
     assert prompt["needs_photo"] is True
     assert any("short summary" in item and "picture" in item for item in sent)
+
+
+def test_runtime_finish_confirmation_no_keeps_task_active() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="active")
+    session.metadata["active_clickup_task_id"] = "868jun6qg"
+    session.metadata["active_clickup_task_name"] = "formalize project tree"
+    session.metadata["clickup_prompt"] = {
+        "type": "task_finish_confirmation",
+        "task_id": "868jun6qg",
+        "task_name": "formalize project tree",
+        "summary_candidate": "I finished formalize project tree.",
+        "requested_at": "2026-05-28T14:00:00",
+    }
+    inbound = MessageRecord(
+        message_id="msg-no",
+        direction="inbound",
+        author_id=1,
+        created_at=datetime.fromisoformat("2026-05-28T14:01:00"),
+        content="no",
+        attachments=[],
+    )
+    handled = asyncio.run(
+        runtime._handle_clickup_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            inbound,
+            SimpleNamespace(recovered=False, stuck=False),
+            datetime.fromisoformat("2026-05-28T14:01:00"),
+        )
+    )
+    assert handled is True
+    assert "clickup_prompt" not in session.metadata
+    assert "pending_admin_review" not in session.metadata
+    assert session.stage == "active"
+    assert any("leave the task active" in item for item in sent)
+
+
+def test_runtime_almost_done_progress_does_not_trigger_finish_confirmation() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="ali",
+        display_name="Ali",
+        discord_user_id=2,
+        discord_username="ali",
+        storage_folder_name="AliAhmed",
+    )
+    session = SessionState(user_key="ali", session_date="2026-05-28", stage="active")
+    session.metadata["active_clickup_task_id"] = "868jun6qg"
+    session.metadata["active_clickup_task_name"] = "Convert CAD to URDF"
+    inbound = MessageRecord(
+        message_id="msg-progress",
+        direction="inbound",
+        author_id=2,
+        created_at=datetime.fromisoformat("2026-05-28T17:25:00"),
+        content="all the unnecessary components are suppressed, and almost done with mating",
+        attachments=[],
+    )
+    asyncio.run(
+        runtime._apply_post_route_clickup_automation(
+            SimpleNamespace(),
+            user,
+            session,
+            inbound,
+            SimpleNamespace(recovered=False, stuck=False),
+            datetime.fromisoformat("2026-05-28T17:25:00"),
+        )
+    )
+    assert "clickup_prompt" not in session.metadata
+    assert "pending_admin_review" not in session.metadata
+    assert sent == []
+
+
+def test_runtime_finished_but_still_working_progress_does_not_trigger_finish_confirmation() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="navin",
+        display_name="Navin",
+        discord_user_id=3,
+        discord_username="navin",
+        storage_folder_name="NavinNagavel",
+    )
+    session = SessionState(user_key="navin", session_date="2026-05-28", stage="active")
+    session.metadata["active_clickup_task_id"] = "868jun6qg"
+    session.metadata["active_clickup_task_name"] = "Onshape CAD work"
+    inbound = MessageRecord(
+        message_id="msg-progress-2",
+        direction="inbound",
+        author_id=3,
+        created_at=datetime.fromisoformat("2026-05-28T14:35:00"),
+        content=(
+            "I have finished developing the CAD part, sent it to George, waiting for approval, "
+            "and in the meantime I am still working through some Onshape CAD tutorials."
+        ),
+        attachments=[],
+    )
+    asyncio.run(
+        runtime._apply_post_route_clickup_automation(
+            SimpleNamespace(),
+            user,
+            session,
+            inbound,
+            SimpleNamespace(recovered=False, stuck=False),
+            datetime.fromisoformat("2026-05-28T14:35:00"),
+        )
+    )
+    assert "clickup_prompt" not in session.metadata
+    assert "pending_admin_review" not in session.metadata
+    assert sent == []
 
 
 def test_runtime_generic_done_not_treated_as_clock_out() -> None:
@@ -1242,7 +3538,8 @@ def test_runtime_stuck_prompt_offers_admin_names_and_task_draft() -> None:
     runtime = _build_runtime()
     sent: list[str] = []
 
-    async def fake_send(_client, _user, _session, content: str, _now: datetime) -> None:
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
         sent.append(content)
 
     runtime._send_dm = fake_send  # type: ignore[method-assign]
@@ -1272,9 +3569,10 @@ def test_runtime_stuck_prompt_offers_admin_names_and_task_draft() -> None:
         )
     )
     prompt = session.metadata["clickup_prompt"]
-    assert prompt["type"] == "stuck_assistance"
-    assert any("George" in item for item in sent)
-    assert any("unblocker task" in item for item in sent)
+    assert prompt["type"] == "blocker_resolution"
+    assert prompt["step"] == "offer_help"
+    assert any("Ask admin" in item for item in sent)
+    assert any("Draft an unblocker task" in item for item in sent)
 
 
 def test_runtime_stuck_prompt_can_notify_specific_admin() -> None:
@@ -1306,9 +3604,9 @@ def test_runtime_stuck_prompt_can_notify_specific_admin() -> None:
     session = SessionState(user_key="andrew", session_date="2026-05-28", stage="active", latest_blocker="controller issue")
     session.metadata["active_clickup_task_name"] = "formalize project tree"
     session.metadata["clickup_prompt"] = {
-        "type": "stuck_assistance",
-        "step": "offer",
-        "draft": {"blocker_text": "controller issue"},
+        "type": "blocker_resolution",
+        "step": "choose_admin",
+        "blocker_text": "controller issue",
     }
     inbound = MessageRecord(
         message_id="msg-help",
@@ -1319,7 +3617,7 @@ def test_runtime_stuck_prompt_can_notify_specific_admin() -> None:
         attachments=[],
     )
     handled = asyncio.run(
-        runtime._handle_stuck_assistance_prompt(
+        runtime._handle_blocker_resolution_prompt(
             SimpleNamespace(),
             user,
             session,
@@ -1332,6 +3630,235 @@ def test_runtime_stuck_prompt_can_notify_specific_admin() -> None:
     assert "clickup_prompt" not in session.metadata
     assert admin_messages[0][1] == ["George"]
     assert any("I messaged George" in item for item in sent)
+
+
+def test_runtime_blocker_prompt_declined_help_moves_to_keep_or_clear_followup() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="navin",
+        display_name="Navin",
+        discord_user_id=3,
+        discord_username="navin",
+        storage_folder_name="NavinNagavel",
+    )
+    session = SessionState(
+        user_key="navin",
+        session_date="2026-05-28",
+        stage="active",
+        stuck_since="2026-05-28T13:15:00",
+        latest_blocker="waiting on fitment direction",
+    )
+    session.metadata["clickup_prompt"] = {
+        "type": "blocker_resolution",
+        "step": "offer_help",
+        "blocker_text": "waiting on fitment direction",
+        "origin_message_id": "msg-blocked",
+    }
+    inbound = MessageRecord(
+        message_id="msg-no-help",
+        direction="inbound",
+        author_id=3,
+        created_at=datetime.fromisoformat("2026-05-28T13:16:00"),
+        content="No I don't need any help",
+        attachments=[],
+    )
+    handled = asyncio.run(
+        runtime.process_inbound_event(
+            SimpleNamespace(),
+            user,
+            session,
+            inbound,
+            inbound.created_at,
+        )
+    )
+    assert handled is None
+    prompt = session.metadata["clickup_prompt"]
+    assert prompt["type"] == "blocker_resolution"
+    assert prompt["step"] == "declined_help_followup"
+    assert any("keep this blocker logged" in item.lower() for item in sent)
+
+
+def test_runtime_blocker_prompt_keep_logged_marks_no_help_requested() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="navin",
+        display_name="Navin",
+        discord_user_id=3,
+        discord_username="navin",
+        storage_folder_name="NavinNagavel",
+    )
+    session = SessionState(
+        user_key="navin",
+        session_date="2026-05-28",
+        stage="active",
+        stuck_since="2026-05-28T13:15:00",
+        latest_blocker="waiting on fitment direction",
+    )
+    session.metadata["clickup_prompt"] = {
+        "type": "blocker_resolution",
+        "step": "declined_help_followup",
+        "blocker_text": "waiting on fitment direction",
+        "help_decision": "declined",
+    }
+    inbound = MessageRecord(
+        message_id="msg-keep",
+        direction="inbound",
+        author_id=3,
+        created_at=datetime.fromisoformat("2026-05-28T13:17:00"),
+        content="keep logged",
+        attachments=[],
+    )
+    handled = asyncio.run(
+        runtime._handle_blocker_resolution_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            inbound,
+            inbound.created_at,
+            session.metadata["clickup_prompt"],
+        )
+    )
+    assert handled is True
+    assert "clickup_prompt" not in session.metadata
+    assert session.metadata["blocker_state"] == "blocked_no_help"
+    assert session.latest_blocker == "waiting on fitment direction"
+    assert any("will keep the blocker logged locally" in item.lower() for item in sent)
+
+
+def test_runtime_blocker_prompt_clear_it_clears_blocker_state() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="navin",
+        display_name="Navin",
+        discord_user_id=3,
+        discord_username="navin",
+        storage_folder_name="NavinNagavel",
+    )
+    session = SessionState(
+        user_key="navin",
+        session_date="2026-05-28",
+        stage="active",
+        stuck_since="2026-05-28T13:15:00",
+        latest_blocker="waiting on fitment direction",
+    )
+    session.metadata["clickup_prompt"] = {
+        "type": "blocker_resolution",
+        "step": "declined_help_followup",
+        "blocker_text": "waiting on fitment direction",
+        "help_decision": "declined",
+    }
+    inbound = MessageRecord(
+        message_id="msg-clear",
+        direction="inbound",
+        author_id=3,
+        created_at=datetime.fromisoformat("2026-05-28T13:17:00"),
+        content="clear it",
+        attachments=[],
+    )
+    handled = asyncio.run(
+        runtime._handle_blocker_resolution_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            inbound,
+            inbound.created_at,
+            session.metadata["clickup_prompt"],
+        )
+    )
+    assert handled is True
+    assert "clickup_prompt" not in session.metadata
+    assert session.metadata["blocker_state"] == "not_blocked"
+    assert session.latest_blocker is None
+    assert session.stuck_since is None
+    assert any("cleared the blocker" in item.lower() for item in sent)
+
+
+def test_runtime_blocked_no_help_does_not_reprompt_until_help_is_requested() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="navin",
+        display_name="Navin",
+        discord_user_id=3,
+        discord_username="navin",
+        storage_folder_name="NavinNagavel",
+    )
+    session = SessionState(
+        user_key="navin",
+        session_date="2026-05-28",
+        stage="active",
+        stuck_since="2026-05-28T13:15:00",
+        latest_blocker="waiting on fitment direction",
+    )
+    session.metadata["blocker_state"] = "blocked_no_help"
+    inbound = MessageRecord(
+        message_id="msg-still-blocked",
+        direction="inbound",
+        author_id=3,
+        created_at=datetime.fromisoformat("2026-05-28T13:18:00"),
+        content="still blocked on fitment",
+        attachments=[],
+    )
+    asyncio.run(
+        runtime._apply_post_route_clickup_automation(
+            SimpleNamespace(),
+            user,
+            session,
+            inbound,
+            SimpleNamespace(recovered=False, stuck=True, blocked_status=True, help_requested=False),
+            inbound.created_at,
+        )
+    )
+    assert "clickup_prompt" not in session.metadata
+    assert sent == []
+
+    inbound_help = MessageRecord(
+        message_id="msg-help-now",
+        direction="inbound",
+        author_id=3,
+        created_at=datetime.fromisoformat("2026-05-28T13:20:00"),
+        content="I need help now",
+        attachments=[],
+    )
+    asyncio.run(
+        runtime._apply_post_route_clickup_automation(
+            SimpleNamespace(),
+            user,
+            session,
+            inbound_help,
+            SimpleNamespace(recovered=False, stuck=True, blocked_status=False, help_requested=True),
+            inbound_help.created_at,
+        )
+    )
+    assert session.metadata["clickup_prompt"]["type"] == "blocker_resolution"
+    assert any("What do you want me to do about it" in item for item in sent)
 
 
 def test_runtime_send_admin_notice_fans_out_to_all_admins_by_default() -> None:
@@ -1405,8 +3932,9 @@ def test_runtime_recovered_signal_resumes_task_and_tracking() -> None:
     async def fake_send(_client, _user, _session, content: str, _now: datetime) -> None:
         sent.append(content)
 
-    async def fake_activate(_user, _session, _now, task_id: str, task_name: str) -> None:
+    async def fake_activate(_user, _session, _now, task_id: str, task_name: str) -> TaskActivationResult:
         activated.append((task_id, task_name))
+        return _activation_result(task_id, task_name)
 
     runtime._send_dm = fake_send  # type: ignore[method-assign]
     runtime._activate_clickup_task = fake_activate  # type: ignore[method-assign]
@@ -1448,7 +3976,7 @@ def test_runtime_recovered_signal_resumes_task_and_tracking() -> None:
     assert session.latest_blocker is None
     assert session.metadata["last_resolved_blocker"] == "waiting on controller dimensions"
     assert activated == [("868jun6qg", "formalize project tree")]
-    assert any("back to `in progress`" in item for item in sent)
+    assert any("confirmed `formalize project tree` is back to `in progress`" in item.lower() for item in sent)
 
 
 def test_runtime_auto_clock_out_activity_resumes_same_day_and_processes_stuck_message() -> None:
@@ -1456,11 +3984,13 @@ def test_runtime_auto_clock_out_activity_resumes_same_day_and_processes_stuck_me
     sent: list[str] = []
     activated: list[tuple[str, str]] = []
 
-    async def fake_send(_client, _user, _session, content: str, _now: datetime) -> None:
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
         sent.append(content)
 
-    async def fake_activate(_user, _session, _now, task_id: str, task_name: str) -> None:
+    async def fake_activate(_user, _session, _now, task_id: str, task_name: str) -> TaskActivationResult:
         activated.append((task_id, task_name))
+        return _activation_result(task_id, task_name)
 
     runtime._send_dm = fake_send  # type: ignore[method-assign]
     runtime._activate_clickup_task = fake_activate  # type: ignore[method-assign]
@@ -1511,7 +4041,7 @@ def test_runtime_auto_clock_out_activity_resumes_same_day_and_processes_stuck_me
     assert session.latest_status == "im blocked again"
     assert session.latest_blocker == "im blocked again"
     assert any("clocked back in and resumed" in item.lower() for item in sent)
-    assert any("specific admin help" in item.lower() for item in sent)
+    assert any("what do you want me to do about it" in item.lower() for item in sent)
 
 
 def test_runtime_persist_session_state_writes_transition_log_only_on_change() -> None:
@@ -1715,8 +4245,9 @@ def test_runtime_recovered_reply_clears_stuck_prompt_and_cancels_pending_unblock
         admin_messages.append(content)
         return ["George"]
 
-    async def fake_activate(_user, _session, _now, task_id: str, task_name: str) -> None:
+    async def fake_activate(_user, _session, _now, task_id: str, task_name: str) -> TaskActivationResult:
         activated.append((task_id, task_name))
+        return _activation_result(task_id, task_name)
 
     runtime._send_dm = fake_send  # type: ignore[method-assign]
     runtime._send_admin_notice = fake_admin_notice  # type: ignore[method-assign]
@@ -1738,9 +4269,9 @@ def test_runtime_recovered_reply_clears_stuck_prompt_and_cancels_pending_unblock
     session.metadata["active_clickup_task_id"] = "868jun6qg"
     session.metadata["active_clickup_task_name"] = "formalize project tree"
     session.metadata["clickup_prompt"] = {
-        "type": "stuck_assistance",
-        "step": "offer",
-        "draft": {"blocker_text": "waiting on pinout"},
+        "type": "blocker_resolution",
+        "step": "offer_help",
+        "blocker_text": "waiting on pinout",
     }
     session.metadata["pending_admin_unblocker_task"] = {
         "draft": {"title": "Get controller pinout"},
@@ -1766,6 +4297,7 @@ def test_runtime_recovered_reply_clears_stuck_prompt_and_cancels_pending_unblock
     assert handled is True
     assert "clickup_prompt" not in session.metadata
     assert "pending_admin_unblocker_task" not in session.metadata
+    assert session.metadata["blocker_state"] == "not_blocked"
     assert activated == [("868jun6qg", "formalize project tree")]
     assert any("cancelled the pending unblocker-task draft" in item for item in sent)
     assert any("cancelled the pending unblocker-task draft" in item for item in admin_messages)
@@ -1817,16 +4349,180 @@ def test_runtime_unblocker_task_prompt_submits_admin_review() -> None:
 
 def test_runtime_resolves_admin_unblocker_assignee_from_clickup_member_lookup() -> None:
     runtime = _build_runtime()
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
 
     async def fake_resolve_workspace_member_id(*, name=None, email=None):
         assert name == "George"
         return "198031927"
 
     runtime.clickup = SimpleNamespace(resolve_workspace_member_id=fake_resolve_workspace_member_id)
-    label, assignee_id, note = asyncio.run(runtime._resolve_unblocker_assignee("George"))
+    label, assignee_id, note, self_assigned = asyncio.run(runtime._resolve_unblocker_assignee(user, "George"))
     assert label == "George"
     assert assignee_id == "198031927"
     assert note is None
+    assert self_assigned is False
+
+
+def test_runtime_resolves_self_unblocker_assignee_alias_to_requester() -> None:
+    runtime = _build_runtime()
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+
+    label, assignee_id, note, self_assigned = asyncio.run(runtime._resolve_unblocker_assignee(user, "me"))
+
+    assert label == "Andrew"
+    assert assignee_id == "87438366"
+    assert note is None
+    assert self_assigned is True
+
+
+def test_runtime_unblocker_task_prompt_self_assignment_creates_task_and_switches() -> None:
+    runtime = _build_runtime()
+    runtime.config.clickup.mission_board_list_id = "mission-board"
+    sent: list[str] = []
+    admin_messages: list[str] = []
+    create_calls: list[dict[str, object]] = []
+    pauses: list[tuple[bool, str]] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    async def fake_admin_notice(_client, content: str, **_kwargs):
+        admin_messages.append(content)
+        return ["George"]
+
+    async def fake_create_task(list_id: str, **kwargs):
+        create_calls.append({"list_id": list_id, **kwargs})
+        return {"id": "self-unblocker-1", "name": kwargs["name"]}
+
+    async def fake_pause(_user, _session, _now, *, set_hold: bool, end_reason: str):
+        pauses.append((set_hold, end_reason))
+        return "I paused local task tracking for `formalize project tree` and will keep the time window in the local log."
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    runtime._send_admin_notice = fake_admin_notice  # type: ignore[method-assign]
+    runtime.clickup.create_task = fake_create_task  # type: ignore[method-assign]
+    runtime._pause_current_task_tracking = fake_pause  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(
+        user_key="andrew",
+        session_date="2026-05-28",
+        stage="active",
+        latest_blocker="waiting on pinout",
+    )
+    session.metadata["active_clickup_task_id"] = "868jun6qg"
+    session.metadata["active_clickup_task_name"] = "formalize project tree"
+    prompt = {
+        "type": "unblocker_task_draft",
+        "step": "title",
+        "draft": {"blocker_text": "waiting on pinout"},
+    }
+    session.metadata["clickup_prompt"] = prompt
+    now = datetime.fromisoformat("2026-05-28T14:12:00")
+
+    async def run_steps():
+        await runtime._handle_unblocker_task_prompt(SimpleNamespace(), user, session, MessageRecord("1", "inbound", 1, now, "Get controller pinout from electrical", []), now, prompt)
+        await runtime._handle_unblocker_task_prompt(SimpleNamespace(), user, session, MessageRecord("2", "inbound", 1, now, "Need someone to pull the right CAN and GPIO pin map so I can finish wiring.", []), now, prompt)
+        await runtime._handle_unblocker_task_prompt(SimpleNamespace(), user, session, MessageRecord("3", "inbound", 1, now, "me", []), now, prompt)
+        await runtime._handle_unblocker_task_prompt(SimpleNamespace(), user, session, MessageRecord("4", "inbound", 1, now, "high", []), now, prompt)
+        await runtime._handle_unblocker_task_prompt(SimpleNamespace(), user, session, MessageRecord("5", "inbound", 1, now, "none", []), now, prompt)
+
+    asyncio.run(run_steps())
+
+    assert len(create_calls) == 1
+    assert create_calls[0]["list_id"] == "mission-board"
+    assert create_calls[0]["name"] == "Get controller pinout from electrical"
+    assert create_calls[0]["assignee_ids"] == ["87438366"]
+    assert create_calls[0]["priority"] == "high"
+    assert create_calls[0]["due_date"] is None
+    assert create_calls[0]["tags"] == ["unblocker", "andrew"]
+    assert "waiting on pinout" in str(create_calls[0]["description"])
+    assert pauses == [(True, "self_assigned_unblocker_switch")]
+    assert "pending_admin_unblocker_task" not in session.metadata
+    assert session.metadata["clickup_prompt"]["type"] == "task_onboarding"
+    assert session.metadata["clickup_prompt"]["source"] == "self_assigned_unblocker_task"
+    assert session.metadata["clickup_prompt"]["step"] == "plan"
+    assert session.metadata["clickup_prompt"]["task_id"] == "self-unblocker-1"
+    assert session.stage == "awaiting_plan"
+    assert session.metadata["blocker_state"] == "not_blocked"
+    assert session.latest_blocker is None
+    assert session.metadata["last_resolved_blocker"] == "waiting on pinout"
+    assert "active_clickup_task_id" not in session.metadata
+    assert any("created `Get controller pinout from electrical` as your unblocker task" in item for item in sent)
+    assert any("What is your plan for `Get controller pinout from electrical`?" in item for item in sent)
+    assert any("created a self-assigned unblocker task and switched onto it" in item for item in admin_messages)
+    assert any("Blocked task: `formalize project tree` (868jun6qg)" in item for item in admin_messages)
+
+
+def test_runtime_unblocker_task_prompt_self_assignment_falls_back_to_admin_review_when_user_mapping_missing() -> None:
+    runtime = _build_runtime()
+    runtime.config.clickup.mission_board_list_id = "mission-board"
+    sent: list[str] = []
+    admin_requests: list[dict[str, object]] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    async def fake_admin_review(_client, _user, _session, _now: datetime) -> None:
+        admin_requests.append(dict(_session.metadata["pending_admin_unblocker_task"]))
+
+    async def fake_resolve_clickup_user_id(_user):
+        return None
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    runtime._send_admin_unblocker_task_request = fake_admin_review  # type: ignore[method-assign]
+    runtime.clickup.resolve_clickup_user_id = fake_resolve_clickup_user_id  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="active", latest_blocker="waiting on pinout")
+    session.metadata["active_clickup_task_id"] = "868jun6qg"
+    session.metadata["active_clickup_task_name"] = "formalize project tree"
+    prompt = {
+        "type": "unblocker_task_draft",
+        "step": "title",
+        "draft": {"blocker_text": "waiting on pinout"},
+    }
+    session.metadata["clickup_prompt"] = prompt
+    now = datetime.fromisoformat("2026-05-28T14:12:00")
+
+    async def run_steps():
+        await runtime._handle_unblocker_task_prompt(SimpleNamespace(), user, session, MessageRecord("1", "inbound", 1, now, "Get controller pinout from electrical", []), now, prompt)
+        await runtime._handle_unblocker_task_prompt(SimpleNamespace(), user, session, MessageRecord("2", "inbound", 1, now, "Need someone to pull the right CAN and GPIO pin map so I can finish wiring.", []), now, prompt)
+        await runtime._handle_unblocker_task_prompt(SimpleNamespace(), user, session, MessageRecord("3", "inbound", 1, now, "me", []), now, prompt)
+        await runtime._handle_unblocker_task_prompt(SimpleNamespace(), user, session, MessageRecord("4", "inbound", 1, now, "high", []), now, prompt)
+        await runtime._handle_unblocker_task_prompt(SimpleNamespace(), user, session, MessageRecord("5", "inbound", 1, now, "none", []), now, prompt)
+
+    asyncio.run(run_steps())
+
+    assert "clickup_prompt" not in session.metadata
+    assert session.metadata["pending_admin_unblocker_task"]["draft"]["self_assigned"] is True
+    assert admin_requests
+    assert any("could not resolve your clickup assignee id" in item.lower() for item in sent)
+    assert any("sent the unblocker-task draft to admin for review instead" in item.lower() for item in sent)
 
 
 def test_runtime_second_admin_unblocker_resolution_is_rejected_after_first_resolution() -> None:
@@ -1901,8 +4597,9 @@ def test_runtime_admin_resume_clears_blocker_and_restarts_task() -> None:
     async def fake_send(_client, _user, _session, content: str, _now: datetime) -> None:
         sent.append(content)
 
-    async def fake_activate(_user, _session, _now, task_id: str, task_name: str) -> None:
+    async def fake_activate(_user, _session, _now, task_id: str, task_name: str) -> TaskActivationResult:
         activated.append((task_id, task_name))
+        return _activation_result(task_id, task_name)
 
     runtime._send_dm = fake_send  # type: ignore[method-assign]
     runtime._activate_clickup_task = fake_activate  # type: ignore[method-assign]
@@ -1933,11 +4630,11 @@ def test_runtime_admin_resume_clears_blocker_and_restarts_task() -> None:
             notify_user=True,
         )
     )
-    assert result == "Resumed `formalize project tree` and moved it back to in progress."
+    assert result == "Perfect. I confirmed `formalize project tree` is back to `in progress` and task tracking is running again."
     assert session.stuck_since is None
     assert session.latest_blocker is None
     assert activated == [("868jun6qg", "formalize project tree")]
-    assert any("resumed task tracking" in item for item in sent)
+    assert any("task tracking is running again" in item for item in sent)
 
 
 def test_runtime_task_review_prompt_can_collect_summary_after_photo() -> None:
@@ -1993,12 +4690,66 @@ def test_runtime_task_review_prompt_can_collect_summary_after_photo() -> None:
     assert captured["photo_paths"] == [photo_path]
 
 
+def test_runtime_task_review_prompt_not_done_cancels_and_keeps_task_active() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="active")
+    session.metadata["active_clickup_task_id"] = "868jun6qg"
+    session.metadata["active_clickup_task_name"] = "formalize project tree"
+    session.metadata["clickup_prompt"] = {
+        "type": "task_review_submission",
+        "summary": "I finished the project tree cleanup.",
+        "needs_summary": False,
+        "needs_photo": True,
+        "photo_paths": [],
+        "task_id": "868jun6qg",
+        "task_name": "formalize project tree",
+    }
+    inbound = MessageRecord(
+        message_id="msg-not-done",
+        direction="inbound",
+        author_id=1,
+        created_at=datetime.fromisoformat("2026-05-28T14:06:00"),
+        content="It's not done yet. I'm still working.",
+        attachments=[],
+    )
+    handled = asyncio.run(
+        runtime._handle_task_review_submission_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            inbound,
+            datetime.fromisoformat("2026-05-28T14:06:00"),
+            session.metadata["clickup_prompt"],
+        )
+    )
+    assert handled is True
+    assert "clickup_prompt" not in session.metadata
+    assert session.stage == "active"
+    assert "pending_admin_review" not in session.metadata
+    assert any("left the task active" in item for item in sent)
+
+
 def test_runtime_resolve_admin_review_rework_starts_same_task_onboarding() -> None:
     runtime = _build_runtime()
     sent: list[str] = []
     states: list[tuple[str | None, str]] = []
 
-    async def fake_send(_client, _user, _session, content: str, _now: datetime) -> None:
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
         sent.append(content)
 
     async def fake_state(_session, task_id: str | None, state: str) -> None:
@@ -2163,6 +4914,421 @@ def test_runtime_second_admin_review_resolution_is_rejected_after_first_resoluti
 
     assert "Closed `formalize project tree`" in first
     assert second == "Andrew does not have a task waiting on admin review."
+
+
+def test_runtime_intern_switch_request_from_active_pauses_and_opens_selection() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+    pauses: list[tuple[bool, str]] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    async def fake_pause(_user, _session, _now: datetime, *, set_hold: bool, end_reason: str) -> str:
+        pauses.append((set_hold, end_reason))
+        return "I paused your previous task."
+
+    async def fake_prompt(_user, _session=None) -> str:
+        return "Assigned tasks I can see:\n- formalize project tree\n- secondary cleanup"
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    runtime._pause_current_task_tracking = fake_pause  # type: ignore[method-assign]
+    runtime._task_selection_prompt = fake_prompt  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="active")
+    session.metadata["active_clickup_task_id"] = "868jun6qg"
+    session.metadata["active_clickup_task_name"] = "formalize project tree"
+    handled = asyncio.run(
+        runtime._maybe_handle_intern_task_switch_request(
+            SimpleNamespace(),
+            user,
+            session,
+            MessageRecord(
+                message_id="msg-switch",
+                direction="inbound",
+                author_id=1,
+                created_at=datetime.fromisoformat("2026-05-28T11:00:00"),
+                content="I want to switch tasks",
+                attachments=[],
+            ),
+            datetime.fromisoformat("2026-05-28T11:00:00"),
+        )
+    )
+    assert handled is True
+    assert pauses == [(True, "intern_switch")]
+    assert session.stage == "awaiting_task_selection"
+    prompt = session.metadata["clickup_prompt"]
+    assert prompt["type"] == "task_onboarding"
+    assert prompt["source"] == "intern_switch"
+    assert prompt["step"] == "select_task"
+    assert session.metadata["pending_intern_task_switch"]["previous_task_id"] == "868jun6qg"
+    assert "active_clickup_task_id" not in session.metadata
+    assert any("Assigned tasks I can see" in item for item in sent)
+
+
+def test_runtime_intern_switch_request_with_hint_opens_confirmation() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        assert view is not None
+        sent.append(content)
+
+    async def fake_pause(_user, _session, _now: datetime, *, set_hold: bool, end_reason: str) -> str:
+        assert set_hold is True
+        assert end_reason == "intern_switch"
+        return "Paused old task."
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    runtime._pause_current_task_tracking = fake_pause  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="active")
+    session.metadata["active_clickup_task_id"] = "868jun6qg"
+    session.metadata["active_clickup_task_name"] = "formalize project tree"
+    handled = asyncio.run(
+        runtime._maybe_handle_intern_task_switch_request(
+            SimpleNamespace(),
+            user,
+            session,
+            MessageRecord(
+                message_id="msg-switch-hint",
+                direction="inbound",
+                author_id=1,
+                created_at=datetime.fromisoformat("2026-05-28T11:05:00"),
+                content="switch task to secondary cleanup",
+                attachments=[],
+            ),
+            datetime.fromisoformat("2026-05-28T11:05:00"),
+        )
+    )
+    assert handled is True
+    assert session.stage == "awaiting_task_selection"
+    prompt = session.metadata["clickup_prompt"]
+    assert prompt["step"] == "confirm_task"
+    assert prompt["candidate_task_id"] == "868jun6qh"
+    assert prompt["candidate_task_name"] == "secondary cleanup"
+    assert any("Is that the task you want to onboard right now?" in item for item in sent)
+
+
+def test_runtime_cancelled_intern_switch_restores_previous_active_task() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+    resumed: list[tuple[str, str]] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    async def fake_activate(_user, _session, _now: datetime, task_id: str | None, task_name: str | None):
+        resumed.append((task_id or "", task_name or ""))
+        return _activation_result(task_id or "", task_name or "")
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    runtime._activate_clickup_task = fake_activate  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="awaiting_task_selection")
+    session.metadata["pending_intern_task_switch"] = {
+        "source": "intern_switch",
+        "previous_stage": "active",
+        "previous_task_id": "868jun6qg",
+        "previous_task_name": "formalize project tree",
+        "previous_selection_reason": "Confirmed earlier.",
+        "started_at": "2026-05-28T11:00:00",
+    }
+    prompt = {
+        "type": "task_onboarding",
+        "source": "intern_switch",
+        "step": "select_task",
+        "reason": "Okay, let's switch tasks.",
+        "draft": {},
+    }
+    handled = asyncio.run(
+        runtime._handle_task_onboarding_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            MessageRecord(
+                message_id="msg-cancel",
+                direction="inbound",
+                author_id=1,
+                created_at=datetime.fromisoformat("2026-05-28T11:06:00"),
+                content="cancel",
+                attachments=[],
+            ),
+            datetime.fromisoformat("2026-05-28T11:06:00"),
+            prompt,
+        )
+    )
+    assert handled is True
+    assert session.stage == "active"
+    assert session.metadata["active_clickup_task_id"] == "868jun6qg"
+    assert resumed == [("868jun6qg", "formalize project tree")]
+    assert "pending_intern_task_switch" not in session.metadata
+    assert any("cancelled the task switch and resumed `formalize project tree`" in item for item in sent)
+
+
+def test_runtime_cancelled_task_creation_from_intern_switch_restores_previous_active_task() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+    resumed: list[tuple[str, str]] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    async def fake_activate(_user, _session, _now: datetime, task_id: str | None, task_name: str | None):
+        resumed.append((task_id or "", task_name or ""))
+        return _activation_result(task_id or "", task_name or "")
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    runtime._activate_clickup_task = fake_activate  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="awaiting_task_selection")
+    session.metadata["pending_intern_task_switch"] = {
+        "source": "intern_switch",
+        "previous_stage": "active",
+        "previous_task_id": "868jun6qg",
+        "previous_task_name": "formalize project tree",
+        "previous_selection_reason": "Confirmed earlier.",
+        "started_at": "2026-05-28T11:00:00",
+    }
+    prompt = {
+        "type": "task_creation",
+        "source": "intern_switch",
+        "step": "title",
+        "draft": {},
+    }
+
+    handled = asyncio.run(
+        runtime._handle_task_creation_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            MessageRecord(
+                message_id="msg-cancel-create",
+                direction="inbound",
+                author_id=1,
+                created_at=datetime.fromisoformat("2026-05-28T11:08:00"),
+                content="cancel",
+                attachments=[],
+            ),
+            datetime.fromisoformat("2026-05-28T11:08:00"),
+            prompt,
+        )
+    )
+
+    assert handled is True
+    assert session.stage == "active"
+    assert session.metadata["active_clickup_task_id"] == "868jun6qg"
+    assert resumed == [("868jun6qg", "formalize project tree")]
+    assert "pending_intern_task_switch" not in session.metadata
+    assert any("cancelled the task switch and resumed `formalize project tree`" in item for item in sent)
+
+
+def test_runtime_intern_switch_request_from_awaiting_admin_review_keeps_queue() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    async def fake_prompt(_user, _session=None) -> str:
+        return "Assigned tasks I can see:\n- secondary cleanup"
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    runtime._task_selection_prompt = fake_prompt  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="awaiting_admin_review")
+    session.metadata["pending_admin_reviews"] = [
+        {"task_id": "868jun6qg", "task_name": "formalize project tree"}
+    ]
+    handled = asyncio.run(
+        runtime._maybe_handle_intern_task_switch_request(
+            SimpleNamespace(),
+            user,
+            session,
+            MessageRecord(
+                message_id="msg-switch-review",
+                direction="inbound",
+                author_id=1,
+                created_at=datetime.fromisoformat("2026-05-28T11:10:00"),
+                content="show my tasks so I can switch",
+                attachments=[],
+            ),
+            datetime.fromisoformat("2026-05-28T11:10:00"),
+        )
+    )
+    assert handled is True
+    assert session.stage == "awaiting_task_selection"
+    assert len(session.metadata["pending_admin_reviews"]) == 1
+    assert any("already waiting on admin review" in item for item in sent)
+
+
+def test_runtime_resolve_admin_review_requires_disambiguation_when_multiple_pending() -> None:
+    runtime = _build_runtime()
+    runtime.refresh_configuration = lambda force=False: asyncio.sleep(0)  # type: ignore[method-assign]
+    runtime.clickup = SimpleNamespace(comment_on_task=lambda *_args, **_kwargs: asyncio.sleep(0))
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="awaiting_admin_review")
+    session.metadata["pending_admin_reviews"] = [
+        {"task_id": "868jun6qg", "task_name": "formalize project tree"},
+        {"task_id": "868jun6qh", "task_name": "secondary cleanup"},
+    ]
+    result = asyncio.run(
+        runtime.resolve_admin_review(
+            SimpleNamespace(),
+            user,
+            session,
+            approve_close=True,
+            admin_message="Looks good.",
+            now=datetime.fromisoformat("2026-05-28T15:30:00"),
+        )
+    )
+    assert "multiple pending reviews" in result
+    assert "formalize project tree" in result
+    assert "secondary cleanup" in result
+
+
+def test_runtime_resolve_admin_review_close_keeps_current_active_task() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+    states: list[tuple[str | None, str]] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    async def fake_state(_session, task_id: str | None, state: str) -> None:
+        states.append((task_id, state))
+
+    async def fake_comment(_task_id: str, _comment_text: str) -> None:
+        return None
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    runtime._safe_set_task_state = fake_state  # type: ignore[method-assign]
+    runtime.clickup = SimpleNamespace(comment_on_task=fake_comment)
+    runtime.refresh_configuration = lambda force=False: asyncio.sleep(0)  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="active")
+    session.metadata["active_clickup_task_id"] = "868jun6qh"
+    session.metadata["active_clickup_task_name"] = "secondary cleanup"
+    session.metadata["pending_admin_reviews"] = [
+        {"task_id": "868jun6qg", "task_name": "formalize project tree"},
+    ]
+    result = asyncio.run(
+        runtime.resolve_admin_review(
+            SimpleNamespace(),
+            user,
+            session,
+            approve_close=True,
+            admin_message="Looks good, close it.",
+            task_id="868jun6qg",
+            now=datetime.fromisoformat("2026-05-28T15:30:00"),
+        )
+    )
+    assert "left `secondary cleanup` active" in result
+    assert session.stage == "active"
+    assert session.metadata["active_clickup_task_id"] == "868jun6qh"
+    assert session.metadata.get("pending_admin_reviews") in (None, [])
+    assert states == [("868jun6qg", "complete")]
+    assert any("left `secondary cleanup` active" in item for item in sent)
+
+
+def test_runtime_resolve_admin_review_rework_on_older_review_prompts_switch_choice() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+    states: list[tuple[str | None, str]] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        assert view is not None
+        sent.append(content)
+
+    async def fake_state(_session, task_id: str | None, state: str) -> None:
+        states.append((task_id, state))
+
+    async def fake_comment(_task_id: str, _comment_text: str) -> None:
+        return None
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    runtime._safe_set_task_state = fake_state  # type: ignore[method-assign]
+    runtime.clickup = SimpleNamespace(comment_on_task=fake_comment)
+    runtime.refresh_configuration = lambda force=False: asyncio.sleep(0)  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="active")
+    session.metadata["active_clickup_task_id"] = "868jun6qh"
+    session.metadata["active_clickup_task_name"] = "secondary cleanup"
+    session.metadata["pending_admin_reviews"] = [
+        {"task_id": "868jun6qg", "task_name": "formalize project tree"},
+    ]
+    result = asyncio.run(
+        runtime.resolve_admin_review(
+            SimpleNamespace(),
+            user,
+            session,
+            approve_close=False,
+            admin_message="Fix the wiring alignment first.",
+            task_id="868jun6qg",
+            now=datetime.fromisoformat("2026-05-28T15:45:00"),
+        )
+    )
+    assert "Queued a switch decision" in result
+    assert session.stage == "active"
+    assert session.metadata["active_clickup_task_id"] == "868jun6qh"
+    prompt = session.metadata["clickup_prompt"]
+    assert prompt["type"] == "queued_review_rework_decision"
+    assert prompt["task_id"] == "868jun6qg"
+    assert states == [("868jun6qg", "in_progress")]
+    assert any("switch back now" in item.lower() for item in sent)
 
 
 def test_runtime_task_selection_prompt_hides_recently_closed_tasks() -> None:
@@ -2448,8 +5614,9 @@ def test_runtime_finish_task_onboarding_reactivates_clocked_out_session() -> Non
     )
     activated: list[tuple[str, str]] = []
 
-    async def fake_activate(_user, _session, _now, task_id: str, task_name: str) -> None:
+    async def fake_activate(_user, _session, _now, task_id: str, task_name: str) -> TaskActivationResult:
         activated.append((task_id, task_name))
+        return _activation_result(task_id, task_name)
 
     runtime._activate_clickup_task = fake_activate  # type: ignore[method-assign]
     prompt = {
@@ -2487,3 +5654,249 @@ def test_runtime_normalize_session_state_repairs_clocked_out_with_open_tracking(
     assert session.stage == "active"
     assert session.clocked_out_at is None
     assert "session_reactivated_at" in session.metadata
+
+
+def test_runtime_normalize_session_state_clears_stale_task_onboarding_after_clock_out() -> None:
+    runtime = _build_runtime()
+    session = SessionState(
+        user_key="andrew",
+        session_date="2026-05-28",
+        stage="clocked_out",
+        clocked_out_at="2026-05-28T19:32:16",
+    )
+    session.metadata["clickup_prompt"] = {
+        "type": "task_onboarding",
+        "step": "estimated_duration",
+        "task_id": "868jurjm4",
+        "task_name": "see if task priority works",
+    }
+
+    changed = runtime._normalize_session_state(session)
+
+    assert changed is True
+    assert session.stage == "clocked_out"
+    assert session.clocked_out_at == "2026-05-28T19:32:16"
+    assert "clickup_prompt" not in session.metadata
+    assert "session_reactivated_at" not in session.metadata
+
+
+def test_runtime_normalize_session_state_clears_stale_task_creation_after_clock_out() -> None:
+    runtime = _build_runtime()
+    session = SessionState(
+        user_key="andrew",
+        session_date="2026-05-28",
+        stage="clocked_out",
+        clocked_out_at="2026-05-28T19:32:16",
+    )
+    session.metadata["clickup_prompt"] = {
+        "type": "task_creation",
+        "step": "title",
+        "draft": {"parent_task_id": "parent-1"},
+    }
+
+    changed = runtime._normalize_session_state(session)
+
+    assert changed is True
+    assert session.stage == "clocked_out"
+    assert "clickup_prompt" not in session.metadata
+
+
+def test_runtime_stuck_alert_uses_friendly_pacific_time() -> None:
+    runtime = _build_runtime()
+    runtime.config.schedule.stuck_alert_after_hours = 0
+    notices: list[str] = []
+
+    async def fake_notice(_client, content: str, **_kwargs):
+        notices.append(content)
+        return ["George"]
+
+    runtime._send_admin_notice = fake_notice  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="navin",
+        display_name="Navin",
+        discord_user_id=3,
+        discord_username="navin",
+        storage_folder_name="NavinNagavel",
+    )
+    session = SessionState(
+        user_key="navin",
+        session_date="2026-06-04",
+        stage="active",
+        stuck_since="2026-06-04T13:14:38-07:00",
+        latest_blocker="waiting on hardware dimensions",
+    )
+
+    alerted = asyncio.run(
+        runtime._maybe_alert_admin(
+            SimpleNamespace(),
+            user,
+            session,
+            datetime.fromisoformat("2026-06-04T13:36:38-07:00"),
+        )
+    )
+
+    assert alerted is True
+    assert notices == [
+        "Navin has appeared stuck since today at 1:14 PM PDT (about 22 minutes ago). "
+        "Latest blocker: waiting on hardware dimensions"
+    ]
+
+
+def test_runtime_write_dashboard_uses_friendly_pacific_time() -> None:
+    runtime = _build_runtime()
+    written: list[str] = []
+
+    async def fake_write_dashboard(_filename: str, content: str) -> Path:
+        written.append(content)
+        return Path("dashboard.md")
+
+    runtime.store.write_dashboard = fake_write_dashboard
+    user = UserProfile(
+        user_key="navin",
+        display_name="Navin",
+        discord_user_id=3,
+        discord_username="navin",
+        storage_folder_name="NavinNagavel",
+        timezone="America/New_York",
+    )
+    runtime.roster_by_key = {user.user_key: user}
+    session = SessionState(
+        user_key="navin",
+        session_date="2026-06-04",
+        stage="on_lunch_break",
+        clocked_in_at="2026-06-04T09:00:00-04:00",
+        metadata={"lunch_started_at": "2026-06-04T12:15:00-04:00"},
+    )
+    runtime.get_user_session_for_moment = lambda _user, _moment=None: (
+        session,
+        datetime.fromisoformat("2026-06-04T13:00:00-04:00"),
+    )
+
+    asyncio.run(InternManagementRuntime.write_dashboard(runtime))
+
+    assert written
+    content = written[0]
+    assert "- Clocked in: " in content
+    assert "6:00 AM PDT" in content
+    assert "- On lunch break since: " in content
+    assert "9:15 AM PDT" in content
+    assert "T09:00:00" not in content
+
+
+def test_runtime_backfill_transcripts_to_pacific_once_rewrites_existing_transcripts(tmp_path: Path) -> None:
+    storage_root = tmp_path / "storage"
+    user_dir = storage_root / "people" / "Alex"
+    daily_dir = user_dir / "2026-06-08"
+    daily_dir.mkdir(parents=True)
+    (user_dir / "profile.json").write_text(
+        json.dumps(
+            {
+                "user_key": "alex",
+                "display_name": "Alex",
+                "discord_user_id": 1,
+                "discord_username": "alex",
+                "storage_folder_name": "Alex",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (daily_dir / "session.json").write_text(
+        json.dumps(
+            {
+                "user_key": "alex",
+                "session_date": "2026-06-08",
+                "stage": "active",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (daily_dir / "transcript.md").write_text("old transcript\n", encoding="utf-8")
+
+    state_store = StateStore(tmp_path / "data" / "agent_state.sqlite3")
+    message = MessageRecord(
+        message_id="m1",
+        direction="inbound",
+        author_id=1,
+        created_at=datetime.fromisoformat("2026-06-08T16:09:32+00:00"),
+        content="controller update",
+        attachments=[],
+    )
+    state_store.append_message("alex", "2026-06-08", message)
+
+    runtime = InternManagementRuntime.__new__(InternManagementRuntime)
+    runtime.bootstrap = SimpleNamespace(
+        storage_root_path=storage_root,
+        state_db_path=tmp_path / "data" / "agent_state.sqlite3",
+        default_timezone="America/Los_Angeles",
+    )
+    runtime.state_store = state_store
+
+    rewritten = asyncio.run(InternManagementRuntime.backfill_transcripts_to_pacific_once(runtime))
+
+    assert rewritten == 1
+    content = (daily_dir / "transcript.md").read_text(encoding="utf-8")
+    assert "### 2026-06-08 09:09:32 - Alex" in content
+    marker = tmp_path / "data" / "transcript_pacific_backfill_v1.done"
+    assert marker.exists()
+
+    second_run = asyncio.run(InternManagementRuntime.backfill_transcripts_to_pacific_once(runtime))
+    assert second_run == 0
+
+
+def test_runtime_process_inbound_prioritizes_clock_out_artifacts_over_task_onboarding_prompt() -> None:
+    runtime = _build_runtime()
+    prompt_called = False
+    artifacts_called = False
+
+    async def fake_prompt(*_args, **_kwargs):
+        nonlocal prompt_called
+        prompt_called = True
+        return True
+
+    async def fake_artifacts(*_args, **_kwargs):
+        nonlocal artifacts_called
+        artifacts_called = True
+        return None
+
+    runtime._handle_clickup_prompt = fake_prompt  # type: ignore[method-assign]
+    runtime._handle_clock_out_artifacts = fake_artifacts  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(
+        user_key="andrew",
+        session_date="2026-05-28",
+        stage="awaiting_clock_out_artifacts",
+        clocked_in_at="2026-05-28T09:00:00",
+    )
+    session.metadata["clickup_prompt"] = {
+        "type": "task_onboarding",
+        "step": "estimated_duration",
+        "task_id": "868jurjm4",
+        "task_name": "see if task priority works",
+    }
+    inbound = MessageRecord(
+        message_id="msg-artifacts",
+        direction="inbound",
+        author_id=1,
+        created_at=datetime.fromisoformat("2026-05-28T18:16:48"),
+        content="Here is what I finished today.",
+        attachments=[],
+    )
+
+    asyncio.run(
+        runtime.process_inbound_event(
+            SimpleNamespace(),
+            user,
+            session,
+            inbound,
+            inbound.created_at,
+        )
+    )
+
+    assert artifacts_called is True
+    assert prompt_called is False

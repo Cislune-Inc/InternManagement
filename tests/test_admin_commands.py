@@ -8,7 +8,7 @@ import discord
 from agent.admin_commands import AdminCommandRouter, UserDailySnapshot, _AdminMenuView, _pick_highest_priority_task, _split_message
 from agent.admin_console import build_admin_console_registry, parse_admin_input, render_reference_markdown
 from agent.interface_intelligence import AdminCommandMatch
-from agent.models import AdminProfile, SessionState, UserProfile
+from agent.models import AdminProfile, MessageRecord, SessionState, UserProfile
 
 
 def _build_snapshot(**session_overrides) -> UserDailySnapshot:
@@ -100,6 +100,61 @@ def test_snapshot_on_lunch_break_is_clocked_in_but_not_active() -> None:
     assert snapshot.clocked_in is True
     assert snapshot.on_lunch_break is True
     assert snapshot.active_now is False
+
+
+def test_last_message_report_uses_friendly_pacific_time() -> None:
+    runtime = _build_runtime()
+    router = AdminCommandRouter(runtime)
+    snapshot = _build_snapshot(stage="active")
+    snapshot.last_inbound = MessageRecord(
+        message_id="msg-1",
+        direction="inbound",
+        author_id=1,
+        created_at=datetime.fromisoformat("2026-05-28T09:15:00-07:00"),
+        content="status update",
+        attachments=[],
+    )
+
+    report = router._last_message_report([snapshot])
+
+    assert "last user message" in report
+    assert "May 28 at 9:15 AM PDT" in report
+    assert "T09:15:00" not in report
+
+
+def test_stuck_report_uses_friendly_pacific_time() -> None:
+    runtime = _build_runtime()
+    router = AdminCommandRouter(runtime)
+    snapshot = _build_snapshot(
+        clocked_in_at="2026-05-28T09:00:00",
+        stage="active",
+        stuck_since="2026-05-28T10:00:00-07:00",
+        latest_blocker="waiting on approval",
+    )
+
+    report = router._stuck_report([snapshot])
+
+    assert "stuck since" in report
+    assert "May 28 at 10:00 AM PDT" in report
+    assert "T10:00:00" not in report
+
+
+def test_manager_report_fallback_uses_friendly_pacific_times() -> None:
+    runtime = _build_runtime()
+    router = AdminCommandRouter(runtime)
+    snapshot = _build_snapshot(
+        clocked_in_at="2026-05-28T09:00:00-07:00",
+        clocked_out_at="2026-05-28T17:00:00-07:00",
+        stage="clocked_out",
+    )
+
+    report = router._manager_report_fallback([snapshot])
+
+    assert "clocked_in=" in report
+    assert "May 28 at 9:00 AM PDT" in report
+    assert "clocked_out=" in report
+    assert "May 28 at 5:00 PM PDT" in report
+    assert "T09:00:00" not in report
 
 
 def test_pick_highest_priority_task_prefers_urgent_then_high() -> None:
@@ -424,6 +479,34 @@ def test_pending_review_listing_command() -> None:
     assert any("Pending task reviews:" in item for item in sent)
 
 
+def test_pending_review_listing_command_lists_multiple_reviews_for_one_user() -> None:
+    runtime = _build_runtime()
+    router = AdminCommandRouter(runtime)
+    sent: list[str] = []
+
+    async def fake_send(_client, content: str, *, view=None) -> None:
+        assert view is None
+        sent.append(content)
+
+    async def fake_collect():
+        snapshot = _build_snapshot(clocked_in_at="2026-05-28T09:00:00", stage="active")
+        snapshot.session.metadata["pending_admin_reviews"] = [
+            {"task_name": "formalize project tree", "task_id": "868jun6qg"},
+            {"task_name": "secondary cleanup", "task_id": "868jun6qh"},
+        ]
+        return [snapshot]
+
+    router._send_admin_text = fake_send  # type: ignore[method-assign]
+    router._collect_snapshots = fake_collect  # type: ignore[method-assign]
+
+    message = SimpleNamespace(author=SimpleNamespace(id=999), content="run review.pending_tasks")
+    handled = asyncio.run(router.handle_message(SimpleNamespace(), message))
+    assert handled is True
+    assert sent == [
+        "Pending task reviews:\n- Alex: formalize project tree | id=868jun6qg\n- Alex: secondary cleanup | id=868jun6qh"
+    ]
+
+
 def test_pending_review_listing_is_identical_for_both_admins() -> None:
     runtime = _build_runtime()
     runtime.config.admins = [
@@ -461,6 +544,96 @@ def test_pending_review_listing_is_identical_for_both_admins() -> None:
         "Pending task reviews:\n- Alex: formalize project tree",
         "Pending task reviews:\n- Alex: formalize project tree",
     ]
+
+
+def test_review_close_passes_task_disambiguation_args() -> None:
+    runtime = _build_runtime()
+    router = AdminCommandRouter(runtime)
+    captured: dict[str, object] = {}
+
+    async def fake_resolve(
+        _client,
+        _user,
+        _session,
+        *,
+        approve_close: bool,
+        admin_message: str,
+        task_hint: str | None = None,
+        task_id: str | None = None,
+        now=None,
+    ) -> str:
+        del now
+        captured.update(
+            approve_close=approve_close,
+            admin_message=admin_message,
+            task_hint=task_hint,
+            task_id=task_id,
+        )
+        return "ok"
+
+    runtime.resolve_admin_review = fake_resolve
+    snapshot = _build_snapshot(clocked_in_at="2026-05-28T09:00:00", stage="active")
+
+    result = asyncio.run(
+        router._command_review_close(
+            SimpleNamespace(),
+            [snapshot],
+            {"user": "Alex", "task": "formalize project tree", "task_id": "868jun6qg", "comments": "Looks good."},
+        )
+    )
+
+    assert result == "ok"
+    assert captured == {
+        "approve_close": True,
+        "admin_message": "Looks good.",
+        "task_hint": "formalize project tree",
+        "task_id": "868jun6qg",
+    }
+
+
+def test_review_rework_passes_task_disambiguation_args() -> None:
+    runtime = _build_runtime()
+    router = AdminCommandRouter(runtime)
+    captured: dict[str, object] = {}
+
+    async def fake_resolve(
+        _client,
+        _user,
+        _session,
+        *,
+        approve_close: bool,
+        admin_message: str,
+        task_hint: str | None = None,
+        task_id: str | None = None,
+        now=None,
+    ) -> str:
+        del now
+        captured.update(
+            approve_close=approve_close,
+            admin_message=admin_message,
+            task_hint=task_hint,
+            task_id=task_id,
+        )
+        return "ok"
+
+    runtime.resolve_admin_review = fake_resolve
+    snapshot = _build_snapshot(clocked_in_at="2026-05-28T09:00:00", stage="active")
+
+    result = asyncio.run(
+        router._command_review_rework(
+            SimpleNamespace(),
+            [snapshot],
+            {"user": "Alex", "task_id": "868jun6qg", "comments": "Fix the wiring."},
+        )
+    )
+
+    assert result == "ok"
+    assert captured == {
+        "approve_close": False,
+        "admin_message": "Fix the wiring.",
+        "task_hint": None,
+        "task_id": "868jun6qg",
+    }
 
 
 def test_pending_unblocker_listing_command() -> None:

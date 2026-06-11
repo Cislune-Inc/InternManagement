@@ -17,6 +17,7 @@ def main() -> None:
     runtime = InternManagementRuntime()
     try:
         asyncio.run(runtime.refresh_configuration(force=True))
+        asyncio.run(runtime.backfill_transcripts_to_pacific_once())
     except (RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
 

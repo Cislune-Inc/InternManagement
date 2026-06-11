@@ -30,7 +30,7 @@ from .admin_console import (
 from .clickup_client import ClickUpClient
 from .models import MessageRecord, SessionState, UserProfile
 from .openai_models import ModelFallbackChain
-from .time_utils import resolve_timezone
+from .time_utils import ADMIN_DISPLAY_TIMEZONE, format_admin_datetime, resolve_timezone
 
 if TYPE_CHECKING:
     from .runtime import InternManagementRuntime
@@ -108,9 +108,24 @@ class UserDailySnapshot:
         return str(value) if isinstance(value, str) and value else None
 
     @property
+    def blocker_state(self) -> str | None:
+        value = self.session.metadata.get("blocker_state")
+        return str(value) if isinstance(value, str) and value else None
+
+    @property
     def pending_admin_review(self) -> dict[str, Any] | None:
-        value = self.session.metadata.get("pending_admin_review")
-        return value if isinstance(value, dict) else None
+        reviews = self.pending_admin_reviews
+        return reviews[0] if reviews else None
+
+    @property
+    def pending_admin_reviews(self) -> list[dict[str, Any]]:
+        value = self.session.metadata.get("pending_admin_reviews")
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+        legacy = self.session.metadata.get("pending_admin_review")
+        if isinstance(legacy, dict):
+            return [legacy]
+        return []
 
     @property
     def pending_admin_unblocker_task(self) -> dict[str, Any] | None:
@@ -1079,16 +1094,18 @@ class AdminCommandRouter:
         snapshots: list[UserDailySnapshot],
         _args: dict[str, str],
     ) -> str:
-        pending = [snapshot for snapshot in snapshots if snapshot.pending_admin_review]
-        if not pending:
+        pending_lines: list[str] = []
+        for snapshot in snapshots:
+            for review in snapshot.pending_admin_reviews:
+                task_name = str(review.get("task_name") or snapshot.active_clickup_task_name or "current task")
+                task_id = str(review.get("task_id") or "").strip()
+                line = f"- {snapshot.user.display_name}: {task_name}"
+                if task_id:
+                    line += f" | id={task_id}"
+                pending_lines.append(line)
+        if not pending_lines:
             return "No intern tasks are waiting on admin review right now."
-        lines = ["Pending task reviews:"]
-        for snapshot in pending:
-            review = snapshot.pending_admin_review or {}
-            lines.append(
-                f"- {snapshot.user.display_name}: {review.get('task_name') or snapshot.active_clickup_task_name or 'current task'}"
-            )
-        return "\n".join(lines)
+        return "\n".join(["Pending task reviews:", *pending_lines])
 
     async def _command_review_close(
         self,
@@ -1108,6 +1125,8 @@ class AdminCommandRouter:
             snapshot.session,
             approve_close=True,
             admin_message=admin_message,
+            task_hint=(args.get("task") or "").strip() or None,
+            task_id=(args.get("task_id") or "").strip() or None,
         )
 
     async def _command_review_rework(
@@ -1130,6 +1149,8 @@ class AdminCommandRouter:
             snapshot.session,
             approve_close=False,
             admin_message=comments,
+            task_hint=(args.get("task") or "").strip() or None,
+            task_id=(args.get("task_id") or "").strip() or None,
         )
 
     async def _command_review_pending_unblockers(
@@ -1610,9 +1631,11 @@ class AdminCommandRouter:
         label = args.get("user") or "that user"
         if isinstance(target, UserDailySnapshot):
             label = target.user.display_name
+        task_label = args.get("task_id") or args.get("task")
+        task_suffix = f" for `{task_label}`" if task_label else ""
         return AdminActionPreview(
             title="Preview `review.close`",
-            summary=f"{label}'s pending task review will be approved and the reviewed task will be closed in ClickUp.",
+            summary=f"{label}'s pending task review{task_suffix} will be approved and the reviewed task will be closed in ClickUp.",
             command_id="review.close",
             args=dict(args),
         )
@@ -1627,9 +1650,11 @@ class AdminCommandRouter:
         if isinstance(target, UserDailySnapshot):
             label = target.user.display_name
         comments = args.get("comments") or "No comments provided."
+        task_label = args.get("task_id") or args.get("task")
+        task_suffix = f" for `{task_label}`" if task_label else ""
         return AdminActionPreview(
             title="Preview `review.rework`",
-            summary=f"{label} will receive rework comments and their task will be moved back to `in progress`.\n\nComments:\n{comments}",
+            summary=f"{label} will receive rework comments{task_suffix} and that task will be moved back to `in progress`.\n\nComments:\n{comments}",
             command_id="review.rework",
             args=dict(args),
         )
@@ -1707,13 +1732,22 @@ class AdminCommandRouter:
         )
 
     def _last_message_report(self, snapshots: list[UserDailySnapshot]) -> str:
+        now = datetime.now(tz=resolve_timezone(ADMIN_DISPLAY_TIMEZONE))
         lines = ["Roster status:"]
         for snapshot in snapshots:
-            last_user = snapshot.last_inbound.created_at.isoformat() if snapshot.last_inbound else "no user message yet"
+            last_user = (
+                format_admin_datetime(snapshot.last_inbound.created_at, reference=now)
+                if snapshot.last_inbound
+                else "no user message yet"
+            )
             lunch_note = ""
             if snapshot.on_lunch_break:
                 lunch_started_at = str(snapshot.session.metadata.get("lunch_started_at") or "").strip()
-                lunch_note = f"; on lunch since {lunch_started_at or 'unknown'}"
+                lunch_note = (
+                    f"; on lunch since {format_admin_datetime(lunch_started_at, reference=now)}"
+                    if lunch_started_at
+                    else "; on lunch since unknown"
+                )
             lines.append(f"- {snapshot.user.display_name}: last user message {last_user}{lunch_note}")
         return "\n".join(lines)
 
@@ -1721,18 +1755,20 @@ class AdminCommandRouter:
         stuck = [snapshot for snapshot in snapshots if snapshot.stuck_now]
         if not stuck:
             return "Nobody is currently marked stuck."
+        now = datetime.now(tz=resolve_timezone(ADMIN_DISPLAY_TIMEZONE))
         lines = ["Currently stuck:"]
         for snapshot in stuck:
+            suffix = " (no help requested)" if snapshot.blocker_state == "blocked_no_help" else ""
             lines.append(
-                f"- {snapshot.user.display_name}: stuck since {snapshot.session.stuck_since}; "
-                f"blocker: {snapshot.session.latest_blocker or 'no blocker text'}"
+                f"- {snapshot.user.display_name}: stuck since {format_admin_datetime(snapshot.session.stuck_since, reference=now)}; "
+                f"blocker: {snapshot.session.latest_blocker or 'no blocker text'}{suffix}"
             )
         return "\n".join(lines)
 
     def _admin_intervention_report(self, snapshots: list[UserDailySnapshot]) -> str:
         if not self.runtime.config:
             return "Configuration is not loaded."
-        now = datetime.now(tz=resolve_timezone(self.runtime.config.timezone))
+        now = datetime.now(tz=resolve_timezone(ADMIN_DISPLAY_TIMEZONE))
         threshold_hours = self.runtime.config.schedule.stuck_alert_after_hours
         lines = ["Admin intervention candidates:"]
         found = False
@@ -1743,9 +1779,10 @@ class AdminCommandRouter:
             hours = (now - stuck_since).total_seconds() / 3600
             if hours >= threshold_hours or snapshot.session.stuck_alerted_at:
                 found = True
+                suffix = " (no help requested)" if snapshot.blocker_state == "blocked_no_help" else ""
                 lines.append(
                     f"- {snapshot.user.display_name}: {snapshot.session.latest_blocker or 'no blocker text'} "
-                    f"(stuck {hours:.1f}h)"
+                    f"(stuck {hours:.1f}h; since {format_admin_datetime(snapshot.session.stuck_since, reference=now)}){suffix}"
                 )
         if not found:
             lines.append("- none beyond the current intervention threshold")
@@ -2179,20 +2216,33 @@ class AdminCommandRouter:
         return snapshot
 
     def _manager_report_fallback(self, snapshots: list[UserDailySnapshot]) -> str:
+        now = datetime.now(tz=resolve_timezone(ADMIN_DISPLAY_TIMEZONE))
         lines = ["Today's manager report:"]
         for snapshot in snapshots:
+            clocked_in = (
+                format_admin_datetime(snapshot.session.clocked_in_at, reference=now)
+                if snapshot.session.clocked_in_at
+                else "no"
+            )
+            clocked_out = (
+                format_admin_datetime(snapshot.session.clocked_out_at, reference=now)
+                if snapshot.session.clocked_out_at
+                else "no"
+            )
             lines.append(
                 f"- {snapshot.user.display_name}: stage={snapshot.session.stage}; "
-                f"clocked_in={snapshot.session.clocked_in_at or 'no'}; "
-                f"clocked_out={snapshot.session.clocked_out_at or 'no'}; "
+                f"clocked_in={clocked_in}; "
+                f"clocked_out={clocked_out}; "
                 f"task={snapshot.active_clickup_task_name or 'unresolved'}; "
-                f"blocker={snapshot.session.latest_blocker or 'none'}"
+                f"blocker={(snapshot.session.latest_blocker or 'none')}"
+                + (" [no help requested]" if snapshot.blocker_state == "blocked_no_help" else "")
             )
         return "\n".join(lines)
 
     def _blocked_task_fallback(self, snapshots: list[UserDailySnapshot]) -> str:
         blocked = [
             f"- {snapshot.user.display_name}: {snapshot.session.latest_blocker}"
+            + (" (no help requested)" if snapshot.blocker_state == "blocked_no_help" else "")
             for snapshot in snapshots
             if snapshot.session.latest_blocker
         ]
@@ -2246,7 +2296,8 @@ class AdminCommandRouter:
         lines = ["Blocked, stale, or missing-update candidates:"]
         for snapshot in snapshots:
             if snapshot.stuck_now:
-                lines.append(f"- {snapshot.user.display_name}: blocked - {snapshot.session.latest_blocker or 'no blocker text'}")
+                suffix = " (no help requested)" if snapshot.blocker_state == "blocked_no_help" else ""
+                lines.append(f"- {snapshot.user.display_name}: blocked - {snapshot.session.latest_blocker or 'no blocker text'}{suffix}")
             elif not snapshot.responded:
                 lines.append(f"- {snapshot.user.display_name}: missing update - no response today")
             elif snapshot.clocked_in and not snapshot.session.latest_status and not snapshot.clocked_out:

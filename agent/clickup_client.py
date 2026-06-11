@@ -234,6 +234,144 @@ class ClickUpClient:
     async def list_assigned_tasks(self, user: UserProfile, limit: int = 25) -> list[dict[str, Any]]:
         return (await self._load_candidate_tasks(user))[:limit]
 
+    async def build_assigned_task_hierarchy(
+        self,
+        user: UserProfile,
+        *,
+        tasks: list[dict[str, Any]] | None = None,
+        limit: int = 25,
+    ) -> dict[str, Any]:
+        assigned_tasks = list(tasks) if tasks is not None else await self.list_assigned_tasks(user, limit=limit)
+        tasks_by_id: dict[str, dict[str, Any]] = {}
+        assigned_task_ids: list[str] = []
+        for task in assigned_tasks[:limit]:
+            task_id = str(task.get("id") or "").strip()
+            if not task_id:
+                continue
+            tasks_by_id[task_id] = task
+            if task_id not in assigned_task_ids:
+                assigned_task_ids.append(task_id)
+        pending_parent_ids = [
+            parent_id
+            for task in assigned_tasks
+            for parent_id in [self._parent_task_id(task)]
+            if parent_id and parent_id not in tasks_by_id
+        ]
+        while pending_parent_ids:
+            parent_id = pending_parent_ids.pop()
+            if not parent_id or parent_id in tasks_by_id:
+                continue
+            try:
+                parent_task = await self.get_task(parent_id)
+            except requests.HTTPError:
+                logger.warning("Could not fetch ClickUp parent task %s while building assigned task hierarchy.", parent_id)
+                continue
+            if not isinstance(parent_task, dict):
+                continue
+            tasks_by_id[parent_id] = parent_task
+            next_parent_id = self._parent_task_id(parent_task)
+            if next_parent_id and next_parent_id not in tasks_by_id:
+                pending_parent_ids.append(next_parent_id)
+
+        included_task_ids: set[str] = set()
+        for task_id in assigned_task_ids:
+            current_task_id: str | None = task_id
+            while current_task_id and current_task_id not in included_task_ids:
+                included_task_ids.add(current_task_id)
+                parent_id = self._parent_task_id(tasks_by_id.get(current_task_id, {}))
+                current_task_id = parent_id if parent_id in tasks_by_id else None
+
+        children_by_parent_id: dict[str, list[str]] = {}
+        root_ids: list[str] = []
+        for task_id in included_task_ids:
+            task = tasks_by_id[task_id]
+            parent_id = self._parent_task_id(task)
+            if parent_id and parent_id in included_task_ids:
+                children = children_by_parent_id.setdefault(parent_id, [])
+                if task_id not in children:
+                    children.append(task_id)
+                continue
+            root_ids.append(task_id)
+
+        def _sort_task_ids(task_ids: list[str]) -> list[str]:
+            return sorted(
+                task_ids,
+                key=lambda item: (
+                    self._task_created_sort_key(tasks_by_id.get(item, {})),
+                    str((tasks_by_id.get(item, {}) or {}).get("name") or "").strip().lower(),
+                    item,
+                ),
+            )
+
+        root_ids = _sort_task_ids(list(dict.fromkeys(root_ids)))
+        children_by_parent_id = {
+            parent_id: _sort_task_ids(child_ids)
+            for parent_id, child_ids in children_by_parent_id.items()
+        }
+        return {
+            "tasks_by_id": {
+                task_id: tasks_by_id[task_id]
+                for task_id in included_task_ids
+                if task_id in tasks_by_id
+            },
+            "assigned_task_ids": assigned_task_ids,
+            "root_ids": root_ids,
+            "children_by_parent_id": children_by_parent_id,
+        }
+
+    def render_assigned_task_hierarchy(
+        self,
+        hierarchy: dict[str, Any],
+        *,
+        recommended_task_id: str | None = None,
+    ) -> str:
+        tasks_by_id = hierarchy.get("tasks_by_id")
+        tasks_by_id = tasks_by_id if isinstance(tasks_by_id, dict) else {}
+        assigned_task_ids = {
+            str(task_id)
+            for task_id in (hierarchy.get("assigned_task_ids") or [])
+            if str(task_id).strip()
+        }
+        root_ids = [
+            str(task_id)
+            for task_id in (hierarchy.get("root_ids") or [])
+            if str(task_id).strip()
+        ]
+        raw_children = hierarchy.get("children_by_parent_id")
+        raw_children = raw_children if isinstance(raw_children, dict) else {}
+        children_by_parent_id: dict[str, list[str]] = {
+            str(parent_id): [str(child_id) for child_id in child_ids if str(child_id).strip()]
+            for parent_id, child_ids in raw_children.items()
+            if isinstance(child_ids, list)
+        }
+        lines: list[str] = []
+
+        def _task_label(task_id: str) -> str:
+            task = tasks_by_id.get(task_id) or {}
+            task_name = str(task.get("name") or task_id)
+            markers: list[str] = []
+            if task_id in assigned_task_ids:
+                markers.append("assigned")
+            if recommended_task_id and task_id == recommended_task_id:
+                markers.append("recommended")
+            marker_suffix = f" [{' | '.join(markers)}]" if markers else ""
+            return f"{task_name} | id={task_id}{marker_suffix}"
+
+        def _walk(task_id: str, prefix: str, is_last: bool) -> None:
+            connector = "\\- " if is_last else "|- "
+            lines.append(f"{prefix}{connector}{_task_label(task_id)}")
+            child_ids = children_by_parent_id.get(task_id, [])
+            child_prefix = prefix + ("   " if is_last else "|  ")
+            for index, child_id in enumerate(child_ids):
+                _walk(child_id, child_prefix, index == len(child_ids) - 1)
+
+        for index, task_id in enumerate(root_ids):
+            _walk(task_id, "", index == len(root_ids) - 1)
+        return "\n".join(lines)
+
+    def match_task_hint(self, tasks: list[dict[str, Any]], task_hint: str) -> dict[str, Any] | None:
+        return self._match_task_hint(tasks, task_hint)
+
     async def list_workspace_tasks(self, limit: int = 100, include_closed: bool = False) -> list[dict[str, Any]]:
         payload = await asyncio.to_thread(
             self._request,
@@ -311,8 +449,21 @@ class ClickUpClient:
         if not target:
             logger.warning("No ClickUp status in list %s matched desired state %s.", list_id, state)
             return None
-        await self.update_task_status(task_id, target)
-        return target
+        updated = await self.update_task_status(task_id, target)
+        updated_status = str((updated.get("status") or {}).get("status") or "")
+        if self._status_matches_state(updated_status, state):
+            return updated_status or target
+        refreshed = await self.get_task(task_id)
+        refreshed_status = str((refreshed.get("status") or {}).get("status") or "")
+        if self._status_matches_state(refreshed_status, state):
+            return refreshed_status or target
+        logger.warning(
+            "ClickUp task %s did not confirm transition to %s. Current status is %r.",
+            task_id,
+            state,
+            refreshed_status or updated_status or current_status,
+        )
+        return None
 
     async def create_task(
         self,
@@ -952,6 +1103,14 @@ class ClickUpClient:
         if not priority:
             return None
         return _PRIORITY_TO_INT.get(priority.strip().lower())
+
+    def _parent_task_id(self, task: dict[str, Any]) -> str | None:
+        raw_parent = task.get("parent")
+        if isinstance(raw_parent, dict):
+            parent_id = str(raw_parent.get("id") or "").strip()
+            return parent_id or None
+        parent_id = str(raw_parent or "").strip()
+        return parent_id or None
 
     @staticmethod
     def _task_created_sort_key(task: dict[str, Any]) -> int:

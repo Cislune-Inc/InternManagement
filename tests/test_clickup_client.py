@@ -205,12 +205,36 @@ def test_set_task_state_resolves_list_status_name() -> None:
                     {"status": "complete"},
                 ]
             },
-            ("PUT", "/task/task-2"): {},
+            ("PUT", "/task/task-2"): {"status": {"status": "in progress"}},
         }
     )
     status_name = asyncio.run(client.set_task_state("task-2", "in_progress"))
     assert status_name == "in progress"
     assert ("PUT", "/task/task-2", None, {"status": "in progress"}) in client.calls
+
+
+def test_set_task_state_returns_none_when_clickup_does_not_confirm_transition() -> None:
+    client = FakeClickUpClient(
+        {
+            ("GET", "/task/task-2"): {
+                "id": "task-2",
+                "name": "Intake form API integration",
+                "status": {"status": "to do"},
+                "list": {"id": "list-1"},
+            },
+            ("GET", "/list/list-1"): {
+                "statuses": [
+                    {"status": "to do"},
+                    {"status": "in progress"},
+                    {"status": "hold"},
+                    {"status": "complete"},
+                ]
+            },
+            ("PUT", "/task/task-2"): {"status": {"status": "to do"}},
+        }
+    )
+    status_name = asyncio.run(client.set_task_state("task-2", "in_progress"))
+    assert status_name is None
 
 
 def test_post_update_requires_explicit_task_id() -> None:
@@ -268,6 +292,93 @@ def test_create_task_uses_mission_board_payload() -> None:
             "due_date": 1772496000000,
             "due_date_time": False,
             "tags": ["blocker", "andrew"],
+        },
+    ) in client.calls
+
+
+def test_build_assigned_task_hierarchy_renders_parent_chain_once() -> None:
+    client = FakeClickUpClient(
+        {
+            ("GET", "/team/9011286053/task"): {
+                "tasks": [
+                    {
+                        "id": "child-1",
+                        "name": "Harness Validation",
+                        "parent": "parent-1",
+                        "status": {"status": "to do", "type": "open"},
+                        "date_created": "200",
+                        "list": {"id": "list-1"},
+                    },
+                    {
+                        "id": "child-2",
+                        "name": "Sensor Calibration",
+                        "parent": "parent-1",
+                        "status": {"status": "to do", "type": "open"},
+                        "date_created": "300",
+                        "list": {"id": "list-1"},
+                    },
+                ]
+            },
+            ("GET", "/task/parent-1"): {
+                "id": "parent-1",
+                "name": "Robot Build",
+                "status": {"status": "to do", "type": "open"},
+                "date_created": "100",
+                "list": {"id": "list-1"},
+            },
+        }
+    )
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+        clickup_user_id="87438366",
+    )
+
+    hierarchy = asyncio.run(client.build_assigned_task_hierarchy(user))
+    rendered = client.render_assigned_task_hierarchy(hierarchy, recommended_task_id="child-2")
+
+    assert hierarchy["root_ids"] == ["parent-1"]
+    assert hierarchy["children_by_parent_id"]["parent-1"] == ["child-1", "child-2"]
+    assert "Robot Build | id=parent-1" in rendered
+    assert "Harness Validation | id=child-1 [assigned]" in rendered
+    assert "Sensor Calibration | id=child-2 [assigned | recommended]" in rendered
+
+
+def test_create_task_includes_parent_when_creating_subtask() -> None:
+    client = FakeClickUpClient(
+        {
+            ("POST", "/list/list-1/task"): {
+                "id": "new-task",
+                "name": "Need fixture dimensions from PM",
+                "assignees": [{"id": 198031927}],
+            }
+        }
+    )
+
+    created = asyncio.run(
+        client.create_task(
+            "list-1",
+            name="Need fixture dimensions from PM",
+            description="Blocked waiting on measurements.",
+            assignee_ids=["198031927"],
+            parent_task_id="parent-1",
+        )
+    )
+
+    assert created["id"] == "new-task"
+    assert (
+        "POST",
+        "/list/list-1/task",
+        None,
+        {
+            "name": "Need fixture dimensions from PM",
+            "description": "Blocked waiting on measurements.",
+            "notify_all": False,
+            "assignees": [198031927],
+            "parent": "parent-1",
         },
     ) in client.calls
 

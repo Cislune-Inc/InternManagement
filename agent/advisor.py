@@ -1,15 +1,27 @@
 from __future__ import annotations
 
+import json
 import logging
+import re
+from dataclasses import dataclass
 from datetime import datetime
 
 from openai import AsyncOpenAI
 
 from .models import MessageRecord, SessionState, UserProfile
 from .openai_models import ModelFallbackChain
+from .time_utils import format_admin_datetime
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class CheckInAssessment:
+    meaningful_progress: bool
+    needs_probe: bool
+    reason: str
+    probe_questions: list[str]
 
 
 class Advisor:
@@ -23,6 +35,19 @@ class Advisor:
         messages: list[MessageRecord],
         clickup_context: str,
     ) -> str:
+        raise NotImplementedError
+
+    async def assess_check_in_reply(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        question_text: str,
+        reply_text: str,
+        recent_messages: list[MessageRecord],
+        *,
+        previous_status: str | None = None,
+        attachment_count: int = 0,
+    ) -> CheckInAssessment:
         raise NotImplementedError
 
 
@@ -69,13 +94,92 @@ class HeuristicAdvisor(Advisor):
         if session.latest_status:
             lines.append(f"Latest status: {session.latest_status}")
         if session.clocked_out_at:
-            lines.append(f"They have clocked out at {session.clocked_out_at}.")
+            lines.append(
+                f"They have clocked out at {format_admin_datetime(session.clocked_out_at, include_relative=False)}."
+            )
         if attachment_count:
             lines.append(f"They shared {attachment_count} attachment(s) in this update window.")
         if latest_excerpt:
             lines.append("Recent updates:")
             lines.extend(f"- {item}" for item in latest_excerpt)
         return "\n".join(lines)
+
+    async def assess_check_in_reply(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        question_text: str,
+        reply_text: str,
+        recent_messages: list[MessageRecord],
+        *,
+        previous_status: str | None = None,
+        attachment_count: int = 0,
+    ) -> CheckInAssessment:
+        del user, session, question_text, recent_messages, previous_status
+        normalized = " ".join(reply_text.strip().lower().split())
+        if attachment_count > 0:
+            return CheckInAssessment(
+                meaningful_progress=True,
+                needs_probe=False,
+                reason="Attachments were included with the reply.",
+                probe_questions=[],
+            )
+        if not normalized:
+            return CheckInAssessment(
+                meaningful_progress=False,
+                needs_probe=True,
+                reason="The reply did not contain any concrete project detail.",
+                probe_questions=_default_probe_questions(),
+            )
+        generic_phrases = {
+            "ok",
+            "okay",
+            "k",
+            "still working",
+            "working on it",
+            "same thing",
+            "same as before",
+            "nothing much",
+            "not much",
+            "progress",
+            "good",
+            "fine",
+        }
+        if normalized in generic_phrases:
+            return CheckInAssessment(
+                meaningful_progress=False,
+                needs_probe=True,
+                reason="The reply is too generic to show what changed.",
+                probe_questions=_default_probe_questions(),
+            )
+        words = [word for word in re.split(r"\s+", normalized) if word]
+        if len(words) <= 3:
+            return CheckInAssessment(
+                meaningful_progress=False,
+                needs_probe=True,
+                reason="The reply is too short to show meaningful project progress.",
+                probe_questions=_default_probe_questions(),
+            )
+        weak_patterns = (
+            "still working",
+            "keeping at it",
+            "same task",
+            "same project",
+            "on it",
+        )
+        if any(phrase in normalized for phrase in weak_patterns) and not _looks_concrete(normalized):
+            return CheckInAssessment(
+                meaningful_progress=False,
+                needs_probe=True,
+                reason="The reply mentions ongoing work but not what actually changed.",
+                probe_questions=_default_probe_questions(),
+            )
+        return CheckInAssessment(
+            meaningful_progress=True,
+            needs_probe=False,
+            reason="The reply contains enough concrete detail to count as progress.",
+            probe_questions=[],
+        )
 
 
 class OpenAIAdvisor(Advisor):
@@ -134,6 +238,65 @@ class OpenAIAdvisor(Advisor):
         )
         return await self._response_text(prompt)
 
+    async def assess_check_in_reply(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        question_text: str,
+        reply_text: str,
+        recent_messages: list[MessageRecord],
+        *,
+        previous_status: str | None = None,
+        attachment_count: int = 0,
+    ) -> CheckInAssessment:
+        recent_excerpt = "\n".join(
+            f"- {message.direction}: {message.content.strip()}"
+            for message in recent_messages[-6:]
+            if message.content.strip()
+        )
+        active_task_id = str(session.metadata.get("active_clickup_task_id") or "") or "unknown"
+        active_task_name = str(session.metadata.get("active_clickup_task_name") or "") or "unknown"
+        prompt = (
+            "You are reviewing an intern's reply to a scheduled project check-in.\n"
+            "Decide whether the reply shows a real attempt to describe progress.\n"
+            "Be conservative about probing. Short but concrete replies should count as meaningful.\n"
+            "If the reply is too vague, ask for more detail with 1 to 3 direct questions.\n"
+            "Return strict JSON with keys: meaningful_progress, needs_probe, reason, probe_questions.\n"
+            "probe_questions must be an array of short strings.\n\n"
+            f"Intern: {user.display_name}\n"
+            f"Scheduled follow-up question: {question_text}\n"
+            f"Combined reply:\n{reply_text or '(empty)'}\n\n"
+            f"Attachment count in reply window: {attachment_count}\n"
+            f"Active task: {active_task_name} ({active_task_id})\n"
+            f"Latest plan: {session.latest_plan or 'n/a'}\n"
+            f"Previous status: {previous_status or 'n/a'}\n"
+            f"Recent transcript:\n{recent_excerpt or 'n/a'}"
+        )
+        raw = await self._response_text(prompt)
+        payload = _extract_json(raw)
+        if not isinstance(payload, dict):
+            raise RuntimeError("Advisor returned invalid check-in assessment JSON.")
+        meaningful_progress = bool(payload.get("meaningful_progress"))
+        needs_probe = bool(payload.get("needs_probe")) and not meaningful_progress
+        probe_questions = [
+            str(item).strip()
+            for item in payload.get("probe_questions", [])
+            if str(item).strip()
+        ][:3]
+        if needs_probe and not probe_questions:
+            probe_questions = _default_probe_questions()
+        reason = str(payload.get("reason") or "").strip() or (
+            "The reply looks too vague to count as meaningful progress."
+            if needs_probe
+            else "The reply looks concrete enough to count as progress."
+        )
+        return CheckInAssessment(
+            meaningful_progress=meaningful_progress and not needs_probe,
+            needs_probe=needs_probe,
+            reason=reason,
+            probe_questions=probe_questions,
+        )
+
 
 class ResilientAdvisor(Advisor):
     def __init__(self, primary: Advisor, fallback: Advisor) -> None:
@@ -163,6 +326,40 @@ class ResilientAdvisor(Advisor):
                 self._disable_primary(exc, "session summary")
         return await self.fallback.summarize_updates(user, session, messages, clickup_context)
 
+    async def assess_check_in_reply(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        question_text: str,
+        reply_text: str,
+        recent_messages: list[MessageRecord],
+        *,
+        previous_status: str | None = None,
+        attachment_count: int = 0,
+    ) -> CheckInAssessment:
+        if self.primary_enabled:
+            try:
+                return await self.primary.assess_check_in_reply(
+                    user,
+                    session,
+                    question_text,
+                    reply_text,
+                    recent_messages,
+                    previous_status=previous_status,
+                    attachment_count=attachment_count,
+                )
+            except Exception as exc:
+                self._disable_primary(exc, "check-in assessment")
+        return await self.fallback.assess_check_in_reply(
+            user,
+            session,
+            question_text,
+            reply_text,
+            recent_messages,
+            previous_status=previous_status,
+            attachment_count=attachment_count,
+        )
+
     def _disable_primary(self, exc: Exception, context: str) -> None:
         self.primary_enabled = False
         logger.warning(
@@ -178,3 +375,51 @@ def build_advisor(openai_api_key: str | None, model: str | None, backup_model: s
     if openai_api_key:
         return ResilientAdvisor(OpenAIAdvisor(openai_api_key, model or "gpt-5-mini", backup_model), fallback)
     return fallback
+
+
+def _default_probe_questions() -> list[str]:
+    return [
+        "What specifically changed since the last check-in?",
+        "What exact part, file, component, or task did you work on?",
+        "What is the next step, or what is blocking you right now?",
+    ]
+
+
+def _looks_concrete(normalized: str) -> bool:
+    if any(char.isdigit() for char in normalized):
+        return True
+    concrete_terms = (
+        "file",
+        "component",
+        "module",
+        "motor",
+        "controller",
+        "wired",
+        "flashed",
+        "tested",
+        "printed",
+        "cad",
+        "board",
+        "firmware",
+        "code",
+        "can",
+        "sensor",
+        "mount",
+        "solder",
+        "configured",
+        "assembled",
+    )
+    return any(term in normalized for term in concrete_terms)
+
+
+def _extract_json(text: str) -> dict | list | None:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}|\[.*\]", text, re.DOTALL)
+        if not match:
+            return None
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return None

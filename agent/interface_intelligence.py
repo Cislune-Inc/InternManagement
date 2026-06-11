@@ -85,7 +85,12 @@ class InterfaceIntelligence:
         if stage == "awaiting_clock_in" and not signals.clocked_in:
             should_query = True
         elif stage in {"active", "awaiting_clock_out_artifacts"} and not (
-            signals.clocking_out or signals.stuck or signals.recovered or signals.starting_lunch
+            signals.clocking_out
+            or signals.blocked_status
+            or signals.help_requested
+            or signals.help_declined
+            or signals.recovered
+            or signals.starting_lunch
         ):
             should_query = True
         elif stage == "on_lunch_break" and not signals.ending_lunch:
@@ -95,7 +100,7 @@ class InterfaceIntelligence:
 
         prompt = (
             "You are classifying a Discord DM from an intern for a workflow state machine.\n"
-            "Return strict JSON with boolean keys: clocked_in, clocking_out, stuck, recovered, starting_lunch, ending_lunch.\n"
+            "Return strict JSON with boolean keys: clocked_in, clocking_out, blocked_status, help_requested, help_declined, recovered, starting_lunch, ending_lunch.\n"
             "Be conservative. Only set a field to true if the message clearly implies it.\n\n"
             f"Workflow stage: {stage}\n"
             f"Message:\n{text}"
@@ -108,10 +113,16 @@ class InterfaceIntelligence:
         payload = _extract_json(response.output_text)
         if not isinstance(payload, dict):
             return signals
+        blocked_status = signals.blocked_status or bool(payload.get("blocked_status"))
+        help_requested = signals.help_requested or bool(payload.get("help_requested"))
+        help_declined = signals.help_declined or bool(payload.get("help_declined"))
         return MessageSignals(
             clocked_in=signals.clocked_in or bool(payload.get("clocked_in")),
             clocking_out=signals.clocking_out or bool(payload.get("clocking_out")),
-            stuck=signals.stuck or bool(payload.get("stuck")),
+            blocked_status=blocked_status,
+            help_requested=help_requested,
+            help_declined=help_declined,
+            stuck=signals.stuck or blocked_status or help_requested,
             recovered=signals.recovered or bool(payload.get("recovered")),
             starting_lunch=signals.starting_lunch or bool(payload.get("starting_lunch")),
             ending_lunch=signals.ending_lunch or bool(payload.get("ending_lunch")),
