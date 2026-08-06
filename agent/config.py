@@ -412,6 +412,10 @@ def _parse_labor_config(raw_labor: Any) -> LaborConfig:
         return LaborConfig()
     return LaborConfig(
         enabled=bool(raw_labor.get("enabled", True)),
+        short_rest_break_minutes=max(
+            1,
+            int(raw_labor.get("short_rest_break_minutes", 10)),
+        ),
         meal_warning_after_hours=float(raw_labor.get("meal_warning_after_hours", 4.5)),
         meal_auto_pause_after_hours=float(raw_labor.get("meal_auto_pause_after_hours", 5.0)),
         overtime_limit_hours=float(raw_labor.get("overtime_limit_hours", 8.0)),

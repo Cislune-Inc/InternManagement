@@ -83,6 +83,8 @@ _PROGRESS_PROBE_HISTORY_KEY = "progress_probe_history"
 _FOLLOW_UP_PROBE_GRACE_WINDOW = timedelta(minutes=1)
 _PROGRESS_PROBE_TIMEOUT = timedelta(minutes=30)
 _AUTO_CLOCK_OUT_WARNING_KEY = "auto_clock_out_warning"
+_SHORT_REST_ACTIVE_KEY = "short_rest_break_active"
+_SHORT_REST_HISTORY_KEY = "short_rest_breaks"
 _SLACK_USER_MIN_POST_INTERVAL = timedelta(minutes=90)
 _TRANSCRIPT_PACIFIC_BACKFILL_MARKER = "transcript_pacific_backfill_v1.done"
 _SESSION_DATE_DIRECTORY_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -1374,6 +1376,31 @@ class InternManagementRuntime:
                 session.stage,
                 signals,
             )
+        if self._active_short_rest_break(session):
+            await self._handle_short_rest_break_message(
+                client,
+                user,
+                session,
+                inbound,
+                signals,
+                now,
+            )
+            session.pending_clickup_sync = True
+            await self._persist_session_state(
+                user,
+                session,
+                now=now,
+                previous_session=previous_session,
+                trigger="inbound_message",
+                details={
+                    "message_id": inbound.message_id,
+                    "content_excerpt": self._excerpt_text(inbound.content),
+                    "signals": self._signal_details(signals),
+                    "handled_by_short_rest_break": True,
+                },
+            )
+            await self.write_dashboard()
+            return
         if self._day_suppression_active_for_session(session) and signals.clocked_in:
             self._clear_day_suppression_state(session)
         if await self._maybe_recover_missing_clock_in(client, user, session, inbound, signals, now):
@@ -1446,6 +1473,24 @@ class InternManagementRuntime:
             )
             await self.write_dashboard()
             return
+        if getattr(signals, "starting_short_rest", False):
+            if await self._maybe_start_short_rest_break(client, user, session, now):
+                session.pending_clickup_sync = True
+                await self._persist_session_state(
+                    user,
+                    session,
+                    now=now,
+                    previous_session=previous_session,
+                    trigger="inbound_message",
+                    details={
+                        "message_id": inbound.message_id,
+                        "content_excerpt": self._excerpt_text(inbound.content),
+                        "signals": self._signal_details(signals),
+                        "handled_by_short_rest_intent": True,
+                    },
+                )
+                await self.write_dashboard()
+                return
         if (
             session.stage != "awaiting_clock_out_artifacts"
             and not signals.clocking_out
@@ -1729,6 +1774,23 @@ class InternManagementRuntime:
             if normalized_changed:
                 changed = True
                 reasons.append("normalized_session_state")
+            if self._active_short_rest_break(session):
+                if await self._maybe_check_short_rest_break(client, user, session, now):
+                    changed = True
+                    reasons.append("short_rest_break_auto_clock_out")
+                if changed:
+                    await self._persist_session_state(
+                        user,
+                        session,
+                        now=now,
+                        previous_session=previous_session,
+                        trigger="scheduler_tick",
+                        details={
+                            "workday": is_workday,
+                            "reasons": reasons + ["short_rest_break_active"],
+                        },
+                    )
+                return
             if self._day_suppression_active_for_session(session):
                 if await self._maybe_send_auto_clock_out_warning(client, user, session, now):
                     changed = True
@@ -2101,6 +2163,251 @@ class InternManagementRuntime:
             return max(1, round(amount * 60))
         return max(1, round(amount * 8 * 60))
 
+    def _active_short_rest_break(
+        self,
+        session: SessionState,
+    ) -> dict[str, Any] | None:
+        raw = session.metadata.get(_SHORT_REST_ACTIVE_KEY)
+        if not isinstance(raw, dict):
+            return None
+        if not str(raw.get("started_at") or "").strip():
+            return None
+        if not str(raw.get("deadline_at") or "").strip():
+            return None
+        return raw
+
+    async def _maybe_start_short_rest_break(
+        self,
+        client: discord.Client,
+        user: UserProfile,
+        session: SessionState,
+        now: datetime,
+    ) -> bool:
+        if self._active_short_rest_break(session):
+            await self._send_dm(
+                client,
+                user,
+                session,
+                "Your short rest break is already active. Reply `back from break` when you return.",
+                now,
+            )
+            return True
+        if (
+            not self.config.labor.enabled
+            or not user.time_tracking_required
+            or not session.clocked_in_at
+            or session.clocked_out_at
+            or session.stage != "active"
+            or not self._active_task_id(session)
+        ):
+            await self._send_dm(
+                client,
+                user,
+                session,
+                "I can start a paid short rest only while you are clocked in on an active ClickUp task.",
+                now,
+            )
+            return True
+        if self._progress_probe_prompt(session):
+            await self._close_progress_probe(
+                client,
+                user,
+                session,
+                now,
+                reason="converted_to_short_rest",
+            )
+        else:
+            self._clear_follow_up_probe_tracking(session)
+        limit_minutes = self.config.labor.short_rest_break_minutes
+        deadline = now + timedelta(minutes=limit_minutes)
+        record = {
+            "started_at": now.isoformat(),
+            "deadline_at": deadline.isoformat(),
+            "limit_minutes": limit_minutes,
+            "task_id": self._active_task_id(session),
+            "task_name": str(session.metadata.get("active_clickup_task_name") or ""),
+            "source": "inbound_short_rest_signal",
+        }
+        session.metadata[_SHORT_REST_ACTIVE_KEY] = dict(record)
+        history = session.metadata.get(_SHORT_REST_HISTORY_KEY)
+        if not isinstance(history, list):
+            history = []
+            session.metadata[_SHORT_REST_HISTORY_KEY] = history
+        history.append(dict(record))
+        deadline_label = deadline.strftime("%I:%M %p").lstrip("0")
+        await self._send_dm(
+            client,
+            user,
+            session,
+            (
+                f"Paid short rest started. Your work and active-project time remain on the clock "
+                f"for up to {limit_minutes} minutes. Reply `back from break` by {deadline_label}. "
+                f"If you do not check back in by then, I will clock you out effective {deadline_label}."
+            ),
+            now,
+        )
+        return True
+
+    async def _handle_short_rest_break_message(
+        self,
+        client: discord.Client,
+        user: UserProfile,
+        session: SessionState,
+        inbound: MessageRecord,
+        signals: Any,
+        now: datetime,
+    ) -> None:
+        active = self._active_short_rest_break(session)
+        if not active:
+            return
+        deadline = self._coerce_datetime_for_reference(
+            str(active.get("deadline_at") or ""),
+            reference=now,
+            timezone_name=self.resolve_user_timezone_name(user),
+        )
+        if deadline and now > deadline:
+            await self._maybe_check_short_rest_break(client, user, session, now)
+            return
+        if getattr(signals, "clocking_out", False):
+            self._finish_short_rest_break(session, now, outcome="manual_clock_out")
+            await self._start_clock_out(client, user, session, inbound, now)
+            return
+        if (
+            getattr(signals, "ending_short_rest", False)
+            or getattr(signals, "recovered", False)
+        ):
+            started_at = self._coerce_datetime_for_reference(
+                str(active.get("started_at") or ""),
+                reference=now,
+                timezone_name=self.resolve_user_timezone_name(user),
+            )
+            self._finish_short_rest_break(session, now, outcome="returned")
+            elapsed_seconds = max(
+                0,
+                int((now - started_at).total_seconds()) if started_at else 0,
+            )
+            await self._send_dm(
+                client,
+                user,
+                session,
+                (
+                    f"Welcome back. I recorded a paid short rest of "
+                    f"{self._format_duration(elapsed_seconds)}. Continue on your active ClickUp task."
+                ),
+                now,
+            )
+            return
+        deadline_label = deadline.strftime("%I:%M %p").lstrip("0") if deadline else "the deadline"
+        await self._send_dm(
+            client,
+            user,
+            session,
+            (
+                "Your paid short rest is still active. Reply `back from break` when you return. "
+                f"If you do not check back in by {deadline_label}, I will clock you out."
+            ),
+            now,
+        )
+
+    def _finish_short_rest_break(
+        self,
+        session: SessionState,
+        ended_at: datetime,
+        *,
+        outcome: str,
+        detected_at: datetime | None = None,
+    ) -> None:
+        active = self._active_short_rest_break(session)
+        if not active:
+            return
+        started_at = str(active.get("started_at") or "")
+        active["ended_at"] = ended_at.isoformat()
+        active["outcome"] = outcome
+        if detected_at is not None:
+            active["detected_at"] = detected_at.isoformat()
+        history = session.metadata.get(_SHORT_REST_HISTORY_KEY)
+        if isinstance(history, list):
+            for record in reversed(history):
+                if not isinstance(record, dict):
+                    continue
+                if str(record.get("started_at") or "") != started_at:
+                    continue
+                record.update(active)
+                break
+        session.metadata.pop(_SHORT_REST_ACTIVE_KEY, None)
+
+    async def _maybe_check_short_rest_break(
+        self,
+        client: discord.Client,
+        user: UserProfile,
+        session: SessionState,
+        now: datetime,
+    ) -> bool:
+        active = self._active_short_rest_break(session)
+        if not active:
+            return False
+        deadline = self._coerce_datetime_for_reference(
+            str(active.get("deadline_at") or ""),
+            reference=now,
+            timezone_name=self.resolve_user_timezone_name(user),
+        )
+        if deadline is None or now <= deadline:
+            return False
+        if session.clocked_out_at or session.stage == "clocked_out":
+            self._finish_short_rest_break(
+                session,
+                deadline,
+                outcome="already_clocked_out",
+                detected_at=now,
+            )
+            return True
+        note = await self._finalize_clickup_day(
+            user,
+            session,
+            deadline,
+            allow_status_completion=False,
+            include_next_task_suggestion=False,
+            pause_reason="auto_clock_out_short_rest_limit",
+        )
+        session.clocked_out_at = deadline.isoformat()
+        self._close_current_work_segment(session, deadline)
+        session.stage = "clocked_out"
+        session.pending_clickup_sync = True
+        session.metadata["auto_clock_out_at"] = deadline.isoformat()
+        session.metadata["auto_clock_out_reference_at"] = str(active.get("started_at") or "")
+        session.metadata["auto_clock_out_reason"] = (
+            f"No return check-in within the {self.config.labor.short_rest_break_minutes}-minute short-rest limit."
+        )
+        if note:
+            session.metadata["auto_clock_out_note"] = note
+        self._finish_short_rest_break(
+            session,
+            deadline,
+            outcome="auto_clocked_out",
+            detected_at=now,
+        )
+        self._refresh_session_time_summary(session, deadline)
+        worked_seconds = int(session.time_summary.get("clocked_in_total_seconds") or 0)
+        self._append_compliance_event(
+            session,
+            event_type="short_rest_auto_clocked_out",
+            now=now,
+            worked_seconds=worked_seconds,
+        )
+        deadline_label = deadline.strftime("%I:%M %p").lstrip("0")
+        await self._send_dm(
+            client,
+            user,
+            session,
+            (
+                f"Your paid short rest reached {self.config.labor.short_rest_break_minutes} minutes "
+                f"without a return check-in, so I clocked you out effective {deadline_label}. "
+                "Reply `clock me back in` before doing more work."
+            ),
+            now,
+        )
+        return True
+
     async def _maybe_check_meal_compliance(
         self,
         client: discord.Client,
@@ -2137,7 +2444,7 @@ class InternManagementRuntime:
                     f"Lunch warning: you have {remaining_minutes} minute"
                     f"{'s' if remaining_minutes != 1 else ''} to begin your meal break. "
                     "If you do not start lunch, I will pause your work time automatically "
-                    "at the meal deadline and notify an admin."
+                    "at the meal deadline."
                 ),
                 now,
             )
@@ -2159,18 +2466,7 @@ class InternManagementRuntime:
             )
             if not started or session.stage != "on_lunch_break":
                 return changed
-            await self._safe_send_compliance_admin_notice(
-                client,
-                (
-                    f"Automatic lunch pause: {user.display_name} reached "
-                    f"{self._format_duration(gross_seconds)} without starting lunch. "
-                    "Their work timer was paused and they were notified."
-                ),
-                user=user,
-                session=session,
-            )
             session.metadata["meal_auto_pause_at"] = now.isoformat()
-            session.metadata["meal_compliance_admin_alert_at"] = now.isoformat()
             self._append_compliance_event(
                 session,
                 event_type="meal_auto_paused",
@@ -2249,7 +2545,7 @@ class InternManagementRuntime:
                     session.metadata["auto_clock_out_note"] = note
                 message = (
                     f"You reached {worked_label} of recorded work today, so I automatically "
-                    "clocked you out to prevent unapproved overtime. An admin was notified. "
+                    "clocked you out to prevent unapproved overtime. "
                     "Do not resume work until Erik or George approves more time."
                 )
             else:
@@ -2264,17 +2560,18 @@ class InternManagementRuntime:
                 message,
                 now,
             )
-            await self._safe_send_compliance_admin_notice(
-                client,
-                (
-                    f"Overtime {'automatic clock-out' if automatically_clocked_out else 'notice'}: "
-                    f"{user.display_name} reached "
-                    f"{self._format_duration(worked_seconds)} of recorded work for "
-                    f"{session.session_date} without a stored approval."
-                ),
-                user=user,
-                session=session,
-            )
+            if not automatically_clocked_out:
+                await self._safe_send_compliance_admin_notice(
+                    client,
+                    (
+                        f"Unresolved overtime risk: {user.display_name} reached "
+                        f"{self._format_duration(worked_seconds)} of recorded work for "
+                        f"{session.session_date} without a stored approval, and automatic "
+                        "clock-out is disabled."
+                    ),
+                    user=user,
+                    session=session,
+                )
             session.metadata["overtime_admin_alert_at"] = now.isoformat()
             self._append_compliance_event(
                 session,
@@ -2420,6 +2717,12 @@ class InternManagementRuntime:
         if getattr(signals, "clocked_in", False) or getattr(signals, "clocking_out", False):
             return False
         if getattr(signals, "starting_lunch", False) or getattr(signals, "ending_lunch", False):
+            return False
+        if getattr(signals, "starting_short_rest", False) or getattr(
+            signals,
+            "ending_short_rest",
+            False,
+        ):
             return False
         if getattr(signals, "recovered", False):
             return False
@@ -11875,6 +12178,12 @@ class InternManagementRuntime:
             "recovered": bool(getattr(signals, "recovered", False)),
             "starting_lunch": bool(getattr(signals, "starting_lunch", False)),
             "ending_lunch": bool(getattr(signals, "ending_lunch", False)),
+            "starting_short_rest": bool(
+                getattr(signals, "starting_short_rest", False)
+            ),
+            "ending_short_rest": bool(
+                getattr(signals, "ending_short_rest", False)
+            ),
         }
 
     def _excerpt_text(self, text: str, limit: int = 160) -> str:

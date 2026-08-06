@@ -47,3 +47,12 @@ def test_detect_lunch_start_and_end() -> None:
     assert starting.starting_lunch is True
     assert eating.starting_lunch is True
     assert ending.ending_lunch is True
+
+
+def test_detect_short_rest_start_and_return_without_matching_generic_break_text() -> None:
+    assert detect_signals("I'm taking a short break.").starting_short_rest is True
+    assert detect_signals("I'm taking a break now.").starting_short_rest is True
+    assert detect_signals("Taking a 10-minute break now.").starting_short_rest is True
+    assert detect_signals("I'm back from my short break.").ending_short_rest is True
+    assert detect_signals("Check me back in.").ending_short_rest is True
+    assert detect_signals("I need to break this task into subtasks.").starting_short_rest is False

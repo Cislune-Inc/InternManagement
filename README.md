@@ -188,7 +188,9 @@ Use `compensation_plan` to prevent project effort from becoming an accidental pa
 
 Do not infer `nasa_stipend` merely from `worker_type=intern`; funding source and legal worker classification are different questions. Deployment preserves explicit plans, infers Cislune hourly only from an existing Gusto mapping, and sends all other uncertain records to `needs_review`.
 
-Time policy is deliberately conservative: a recorded, duty-free meal pauses the task timer and is excluded from tracked work and hourly payroll. Short rest periods stay on the clock and allocated to the active project; they are not silently deducted. The bot warns before the configured meal and overtime thresholds, automatically starts lunch at the meal deadline, and automatically clocks nonexempt workers out at the unapproved overtime limit while notifying the worker and admins.
+Time policy is deliberately conservative: a recorded, duty-free meal pauses the task timer and is excluded from tracked work and hourly payroll. A declared short rest stays paid and allocated to the active project for up to 10 minutes. The worker must reply `back from break`; if the limit passes without that check-in, Don Pollo clocks them out effective at the 10-minute cutoff, stops project time, and tells them to clock back in before resuming work. The bot also warns before the configured meal and overtime thresholds, automatically starts lunch at the meal deadline, and automatically clocks nonexempt workers out at the unapproved overtime limit.
+
+Resolved enforcement does not produce an interrupting admin DM. Automatic meal pauses and successful short-rest, inactivity, or overtime clock-outs stay visible in the compliance history and manager dashboards. Direct admin alerts are reserved for unresolved risk, such as continued overtime when automatic enforcement is disabled, or an active blocker that needs help.
 
 ### Slack Admin Beta
 
@@ -360,6 +362,7 @@ from silently deleting historical evidence.
 - Uses ClickUp context to give plan feedback.
 - Uses a 90-minute average check-in cadence, adapting between 45 and 120 minutes from the task duration supplied during onboarding.
 - Lets a clocked-in intern mark a lunch break, pauses task timing, and checks every 30 minutes until they say they are back.
+- Lets a worker declare a paid short rest while an active ClickUp task keeps running, requires a return check-in within 10 minutes, and clocks them out effective at the cutoff if they do not return.
 - Lets an intern ask for their hours for the current week in DM and replies with both clocked-in time and task-tracked time plus a daily breakdown.
 - Can retroactively rebuild prior archived hours from local artifacts, writing a durable `hours_backfill_explanation.json` beside each applied day plus a per-run audit bundle under `storage/dashboard/time_tracking/retro_backfill/`.
 - Generates a local `storage/dashboard/time_tracking/time_tracking_dashboard.html` file with filterable archived hours plus expandable backfill-audit details.
@@ -368,7 +371,7 @@ from silently deleting historical evidence.
 - Warns a tracked worker near 4.5 recorded hours and automatically pauses work time at the configured meal deadline if lunch has not started.
 - Keeps clocked-in totals equal to recorded work segments; lunch never triggers a flat automatic time deduction.
 - Uses practical intern wording for lunch and end-of-day coaching, while configured employees and contractors receive explicit approval language.
-- Notifies an admin after an automatic meal pause. Covered hourly workers receive an overtime warning before the configured limit and are automatically clocked out at the limit unless approval is stored; salaried/exempt and external workers can opt out in the roster.
+- Records automatic meal pauses and successful enforcement in compliance history without interrupting admins. Covered hourly workers receive an overtime warning before the configured limit and are automatically clocked out at the limit unless approval is stored; salaried/exempt and external workers can opt out in the roster. Admin DMs are reserved for unresolved risk.
 - Never deducts, revokes, or changes recorded time merely because a compliance reminder was sent.
 - Generates Monday payroll, project-budget, overhead-review, compliance, NASA-reporting, and Gusto-ready export artifacts.
 - Alerts the configured admin if someone appears stuck for four hours.
@@ -413,6 +416,7 @@ from silently deleting historical evidence.
 - `schedule.auto_clock_out_after_hours` controls when a clocked-in but silent worker is treated as clocked out automatically. `schedule.auto_clock_out_warning_minutes` controls the stateful warning lead time. The production recommendation is `1` hour with a `15` minute warning.
 - `schedule.workday_rollover_time` controls when a user's local workday rolls into the next date folder. The default is `03:30`.
 - Lunch breaks suspend the inactivity auto-clock-out timer and keep the current ClickUp task in `in progress` while local task timing is paused.
+- `labor.short_rest_break_minutes` defaults to `10`. Declared short rests remain paid and project-allocated until the worker checks back in or the exact cutoff is reached.
 - Manual clock-out also parks the current active ClickUp task on `hold`. Task closure should happen through the finish-task admin review flow instead of ordinary clock-out.
 - Daily image metadata is written to `images_manifest.json`, and transcripts include any generated descriptions/tags for saved images.
 - The admin console is grouped and deterministic by default. Normal admin control uses `help`, `menu`, `flow`, and `run <command-id> ...`.

@@ -81,6 +81,7 @@ class ClickUpConfig:
 @dataclass(slots=True)
 class LaborConfig:
     enabled: bool = True
+    short_rest_break_minutes: int = 10
     meal_warning_after_hours: float = 4.5
     meal_auto_pause_after_hours: float = 5.0
     overtime_limit_hours: float = 8.0

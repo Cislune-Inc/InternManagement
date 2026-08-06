@@ -16,6 +16,15 @@ def test_production_controls_disable_practice_channel() -> None:
     assert "slack.practice_channel_id" in changed
 
 
+def test_production_controls_enforce_ten_minute_short_rest_limit() -> None:
+    payload: dict = {}
+
+    changed = apply_controls(payload)
+
+    assert payload["labor"]["short_rest_break_minutes"] == 10
+    assert "labor.short_rest_break_minutes" in changed
+
+
 def test_production_controls_configure_erik_as_slack_admin_beta_tester() -> None:
     payload = {
         "admins": [

@@ -17,6 +17,7 @@ def test_parse_agent_config_defaults() -> None:
     assert config.schedule.task_onboarding_interval_minutes == 5
     assert config.schedule.auto_clock_out_after_hours == 6
     assert config.schedule.workday_rollover_time == "03:30"
+    assert config.labor.short_rest_break_minutes == 10
     assert config.admins[0].discord_user_id == 123
     assert config.admin_console.enable_ai_fallback is True
     assert config.admin_console.menu_timeout_minutes == 10

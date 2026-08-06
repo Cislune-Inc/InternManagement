@@ -103,6 +103,22 @@ LUNCH_END_PATTERNS = [
     r"\bi'?m back\b",
 ]
 
+SHORT_REST_START_PATTERNS = [
+    r"^\s*(?:i(?:\s+am|'m)\s+)?taking a break(?: now)?[.!?]*\s*$",
+    r"\btaking (?:a )?(?:short |rest |10[- ]?minute |ten[- ]?minute )break\b",
+    r"\bstarting (?:a )?(?:short |rest |10[- ]?minute |ten[- ]?minute )break\b",
+    r"\b(?:short|rest|10[- ]?minute|ten[- ]?minute) break (?:now|please)\b",
+    r"^\s*(?:i(?:\s+am|'m)\s+)?(?:going|stepping) (?:on|out for) (?:a )?(?:short |rest |10[- ]?minute |ten[- ]?minute )break[.!?]*\s*$",
+]
+
+SHORT_REST_END_PATTERNS = [
+    r"\bback from (?:my |the )?(?:short |rest |10[- ]?minute |ten[- ]?minute )break\b",
+    r"\bdone with (?:my |the )?(?:short |rest |10[- ]?minute |ten[- ]?minute )break\b",
+    r"\b(?:short|rest|10[- ]?minute|ten[- ]?minute) break is over\b",
+    r"^\s*(?:i(?:\s+am|'m)\s+)?back (?:to work|from break)[.!?]*\s*$",
+    r"^\s*(?:check|clock)(?:\s+me)?\s+back\s+in[.!?]*\s*$",
+]
+
 RECOVERED_PATTERNS = [
     r"\bunblocked\b",
     r"\bfixed\b",
@@ -128,6 +144,8 @@ class MessageSignals:
     recovered: bool = False
     starting_lunch: bool = False
     ending_lunch: bool = False
+    starting_short_rest: bool = False
+    ending_short_rest: bool = False
 
 
 def detect_signals(text: str) -> MessageSignals:
@@ -147,6 +165,8 @@ def detect_signals(text: str) -> MessageSignals:
         recovered=_matches_any(normalized, RECOVERED_PATTERNS),
         starting_lunch=_matches_any(normalized, LUNCH_START_PATTERNS),
         ending_lunch=_matches_any(normalized, LUNCH_END_PATTERNS),
+        starting_short_rest=_matches_any(normalized, SHORT_REST_START_PATTERNS),
+        ending_short_rest=_matches_any(normalized, SHORT_REST_END_PATTERNS),
     )
 
 

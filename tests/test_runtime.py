@@ -14,6 +14,7 @@ from agent.formatting import build_transcript_markdown
 from agent.models import AdminProfile, AgentConfig, AttachmentRecord, ClickUpConfig, ClickUpContextBundle, MessageRecord, PromptConfig, ScheduleConfig, SessionState, UserProfile
 from agent.advisor import CheckInAssessment
 from agent.runtime import InternManagementRuntime, TaskActivationResult
+from agent.signals import detect_signals
 from agent.state_store import StateStore
 
 
@@ -439,7 +440,163 @@ def test_slack_admin_dm_uses_admin_console_without_worker_roster_entry() -> None
     assert posted == [("U01SWQKDTBM", "Admin beta console ready.")]
 
 
-def test_meal_compliance_auto_pauses_worker_and_notifies_admin_at_five_hours() -> None:
+def test_short_rest_stays_paid_and_requires_return_check_in() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def send_dm(_client, _user, _session, content: str, _now, **_kwargs):
+        sent.append(content)
+        return None
+
+    runtime._send_dm = send_dm  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="alex",
+        display_name="Alex",
+        discord_user_id=1,
+    )
+    running_timer = {
+        "task_id": "task-1",
+        "task_name": "Build fixture",
+        "started_at": "2026-07-28T09:00:00-07:00",
+    }
+    session = SessionState(
+        user_key="alex",
+        session_date="2026-07-28",
+        stage="active",
+        clocked_in_at="2026-07-28T09:00:00-07:00",
+        work_segments=[
+            {
+                "clocked_in_at": "2026-07-28T09:00:00-07:00",
+                "clocked_out_at": None,
+            }
+        ],
+        metadata={
+            "active_clickup_task_id": "task-1",
+            "active_clickup_task_name": "Build fixture",
+            "clickup_time_tracking": running_timer,
+        },
+    )
+
+    started = asyncio.run(
+        runtime._maybe_start_short_rest_break(
+            SimpleNamespace(),
+            user,
+            session,
+            datetime.fromisoformat("2026-07-28T12:00:00-07:00"),
+        )
+    )
+
+    assert started is True
+    assert session.metadata["short_rest_break_active"]["deadline_at"] == (
+        "2026-07-28T12:10:00-07:00"
+    )
+    assert "closed_at" not in running_timer
+    assert session.work_segments[-1]["clocked_out_at"] is None
+    assert "Reply `back from break`" in sent[-1]
+
+    returned_at = datetime.fromisoformat("2026-07-28T12:08:00-07:00")
+    inbound = MessageRecord(
+        message_id="rest-return",
+        direction="inbound",
+        author_id=1,
+        created_at=returned_at,
+        content="I'm back from my short break.",
+        attachments=[],
+    )
+    asyncio.run(
+        runtime._handle_short_rest_break_message(
+            SimpleNamespace(),
+            user,
+            session,
+            inbound,
+            detect_signals(inbound.content),
+            returned_at,
+        )
+    )
+
+    assert "short_rest_break_active" not in session.metadata
+    assert session.metadata["short_rest_breaks"][0]["outcome"] == "returned"
+    assert session.stage == "active"
+    assert session.clocked_out_at is None
+    assert "8m" in sent[-1]
+
+
+def test_short_rest_over_ten_minutes_clocks_out_at_exact_cutoff_without_admin_dm() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def send_dm(_client, _user, _session, content: str, _now, **_kwargs):
+        sent.append(content)
+        return None
+
+    async def finalize_day(*_args, **_kwargs):
+        return "Task timer stopped."
+
+    async def fail_admin_notice(*_args, **_kwargs):
+        raise AssertionError("resolved auto clock-out must not DM admins")
+
+    runtime._send_dm = send_dm  # type: ignore[method-assign]
+    runtime._finalize_clickup_day = finalize_day  # type: ignore[method-assign]
+    runtime._safe_send_compliance_admin_notice = fail_admin_notice  # type: ignore[method-assign]
+    user = UserProfile(user_key="alex", display_name="Alex", discord_user_id=1)
+    rest_record = {
+        "started_at": "2026-07-28T12:00:00-07:00",
+        "deadline_at": "2026-07-28T12:10:00-07:00",
+        "limit_minutes": 10,
+        "task_id": "task-1",
+        "task_name": "Build fixture",
+    }
+    session = SessionState(
+        user_key="alex",
+        session_date="2026-07-28",
+        stage="active",
+        clocked_in_at="2026-07-28T09:00:00-07:00",
+        work_segments=[
+            {
+                "clocked_in_at": "2026-07-28T09:00:00-07:00",
+                "clocked_out_at": None,
+            }
+        ],
+        metadata={
+            "active_clickup_task_id": "task-1",
+            "active_clickup_task_name": "Build fixture",
+            "short_rest_break_active": dict(rest_record),
+            "short_rest_breaks": [dict(rest_record)],
+        },
+    )
+
+    at_limit = asyncio.run(
+        runtime._maybe_check_short_rest_break(
+            SimpleNamespace(),
+            user,
+            session,
+            datetime.fromisoformat("2026-07-28T12:10:00-07:00"),
+        )
+    )
+    assert at_limit is False
+    assert session.stage == "active"
+
+    changed = asyncio.run(
+        runtime._maybe_check_short_rest_break(
+            SimpleNamespace(),
+            user,
+            session,
+            datetime.fromisoformat("2026-07-28T12:11:00-07:00"),
+        )
+    )
+
+    assert changed is True
+    assert session.stage == "clocked_out"
+    assert session.clocked_out_at == "2026-07-28T12:10:00-07:00"
+    assert session.work_segments[-1]["clocked_out_at"] == "2026-07-28T12:10:00-07:00"
+    assert session.metadata["short_rest_breaks"][0]["outcome"] == "auto_clocked_out"
+    assert session.metadata["compliance_events"][0]["event_type"] == (
+        "short_rest_auto_clocked_out"
+    )
+    assert "clocked you out effective 12:10 PM" in sent[-1]
+
+
+def test_meal_compliance_auto_pauses_worker_without_admin_interruption_at_five_hours() -> None:
     runtime = _build_runtime()
     user_messages: list[str] = []
     admin_messages: list[str] = []
@@ -482,7 +639,7 @@ def test_meal_compliance_auto_pauses_worker_and_notifies_admin_at_five_hours() -
     assert any("automatically paused your work time" in message for message in user_messages)
     assert session.stage == "on_lunch_break"
     assert session.metadata["meal_auto_pause_at"]
-    assert any("Automatic lunch pause" in message for message in admin_messages)
+    assert admin_messages == []
     assert [event["event_type"] for event in session.metadata["compliance_events"]] == [
         "meal_auto_paused",
     ]
@@ -617,7 +774,7 @@ def test_overtime_compliance_auto_clocks_out_at_limit() -> None:
 
     assert changed is True
     assert any("automatically clocked you out" in message for message in user_messages)
-    assert any("Overtime automatic clock-out" in message for message in admin_messages)
+    assert admin_messages == []
     assert session.clocked_out_at == "2026-07-28T17:01:00-07:00"
     assert session.stage == "clocked_out"
 
@@ -677,6 +834,55 @@ def test_overtime_compliance_auto_clock_out_notifies_slack_only_worker() -> None
     assert len(posted) == 1
     assert posted[0][0] == "U123"
     assert "automatically clocked you out" in posted[0][1]
+
+
+def test_overtime_compliance_notifies_admin_only_when_risk_remains_unresolved() -> None:
+    runtime = _build_runtime()
+    runtime.config.labor.auto_clock_out_at_overtime_limit = False
+    user_messages: list[str] = []
+    admin_messages: list[str] = []
+
+    async def send_dm(_client, _user, _session, content: str, _now, **_kwargs):
+        user_messages.append(content)
+        return None
+
+    async def send_admin(_client, content: str, **_kwargs):
+        admin_messages.append(content)
+        return ["George"]
+
+    def refresh_summary(session: SessionState, _now: datetime) -> None:
+        session.time_summary["clocked_in_total_seconds"] = 8 * 60 * 60
+
+    runtime._send_dm = send_dm  # type: ignore[method-assign]
+    runtime._send_admin_notice = send_admin  # type: ignore[method-assign]
+    runtime._refresh_session_time_summary = refresh_summary  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="alex",
+        display_name="Alex",
+        discord_user_id=1,
+        overtime_approval_required=True,
+    )
+    session = SessionState(
+        user_key="alex",
+        session_date="2026-07-28",
+        stage="active",
+        clocked_in_at="2026-07-28T09:00:00-07:00",
+    )
+
+    changed = asyncio.run(
+        runtime._maybe_check_overtime_compliance(
+            SimpleNamespace(),
+            user,
+            session,
+            datetime.fromisoformat("2026-07-28T17:00:00-07:00"),
+        )
+    )
+
+    assert changed is True
+    assert session.stage == "active"
+    assert "Stop work and clock out" in user_messages[0]
+    assert len(admin_messages) == 1
+    assert "Unresolved overtime risk" in admin_messages[0]
 
 
 def test_overtime_compliance_warns_before_limit_without_clocking_out() -> None:

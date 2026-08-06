@@ -199,7 +199,7 @@ class InterfaceIntelligence:
 
         prompt = (
             "You are classifying a Discord DM from an intern for a workflow state machine.\n"
-            "Return strict JSON with boolean keys: clocked_in, clocking_out, blocked_status, help_requested, help_declined, recovered, starting_lunch, ending_lunch.\n"
+            "Return strict JSON with boolean keys: clocked_in, clocking_out, blocked_status, help_requested, help_declined, recovered, starting_lunch, ending_lunch, starting_short_rest, ending_short_rest.\n"
             "Be conservative. Only set a field to true if the message clearly implies it.\n\n"
             f"Workflow stage: {stage}\n"
             f"Message:\n{text}"
@@ -225,6 +225,14 @@ class InterfaceIntelligence:
             recovered=signals.recovered or bool(payload.get("recovered")),
             starting_lunch=signals.starting_lunch or bool(payload.get("starting_lunch")),
             ending_lunch=signals.ending_lunch or bool(payload.get("ending_lunch")),
+            starting_short_rest=(
+                signals.starting_short_rest
+                or bool(payload.get("starting_short_rest"))
+            ),
+            ending_short_rest=(
+                signals.ending_short_rest
+                or bool(payload.get("ending_short_rest"))
+            ),
         )
 
 

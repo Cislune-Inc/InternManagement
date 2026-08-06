@@ -17,6 +17,7 @@ CONTROL_VALUES: dict[str, dict[str, Any]] = {
         "auto_clock_out_warning_minutes": 15,
     },
     "labor": {
+        "short_rest_break_minutes": 10,
         "meal_warning_after_hours": 4.5,
         "meal_auto_pause_after_hours": 5.0,
         "overtime_limit_hours": 8.0,

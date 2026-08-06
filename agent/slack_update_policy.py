@@ -53,7 +53,13 @@ class SlackUpdatePolicy:
         }:
             return True
         signals = detect_signals(text)
-        if signals.clocking_out or signals.starting_lunch or signals.ending_lunch:
+        if (
+            signals.clocking_out
+            or signals.starting_lunch
+            or signals.ending_lunch
+            or signals.starting_short_rest
+            or signals.ending_short_rest
+        ):
             return True
         return bool(
             re.search(
