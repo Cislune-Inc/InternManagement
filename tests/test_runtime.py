@@ -429,14 +429,16 @@ def test_slack_admin_dm_uses_admin_console_without_worker_roster_entry() -> None
         "*Sent using* <@U0BATRYF16C>",
         "*Sent using* <@U0BATRYF16C|ChatGPT>",
         "Connector attribution represented outside the plain-text footer.",
+        "*Sent using* <@U0BATRYF16C|ChatGPT> on the same rendered line.",
     ):
+        separator = " " if trailing_metadata.endswith("rendered line.") else "\n"
         asyncio.run(
             runtime.handle_slack_direct_message(
                 SimpleNamespace(),
                 {
                     "user": "U01SWQKDTBM",
                     "text": (
-                        "run presence.attention\n"
+                        f"run presence.attention{separator}"
                         f"{trailing_metadata}"
                     ),
                     "ts": "1785859200.0",
@@ -448,8 +450,10 @@ def test_slack_admin_dm_uses_admin_console_without_worker_roster_entry() -> None
         (999, "run presence.attention"),
         (999, "run presence.attention"),
         (999, "run presence.attention"),
+        (999, "run presence.attention"),
     ]
     assert posted == [
+        ("U01SWQKDTBM", "Admin beta console ready."),
         ("U01SWQKDTBM", "Admin beta console ready."),
         ("U01SWQKDTBM", "Admin beta console ready."),
         ("U01SWQKDTBM", "Admin beta console ready."),

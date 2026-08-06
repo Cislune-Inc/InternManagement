@@ -85,6 +85,10 @@ _SLACK_CHATGPT_ATTRIBUTION_RE = re.compile(
     r"\s*\n+\*Sent using\*\s+<@[^>\r\n]+>\s*$",
     flags=re.IGNORECASE,
 )
+_SLACK_SENT_USING_MARKER_RE = re.compile(
+    r"\s+(?:[*_~]{1,2})?sent\s+using(?:[*_~]{1,2})?(?=\s|<)",
+    flags=re.IGNORECASE,
+)
 _FOLLOW_UP_RESPONSE_AGGREGATION_KEY = "follow_up_response_aggregation"
 _PROGRESS_PROBE_HISTORY_KEY = "progress_probe_history"
 _FOLLOW_UP_PROBE_GRACE_WINDOW = timedelta(minutes=1)
@@ -224,16 +228,20 @@ _AUTO_CLOCK_OUT_NOTIFICATION_MESSAGE = (
 
 def _normalize_slack_admin_text(value: Any) -> str:
     text = _SLACK_CHATGPT_ATTRIBUTION_RE.sub("", str(value or "")).strip()
+    normalized_text = text.casefold()
+    is_deterministic_command = (
+        normalized_text == "help"
+        or normalized_text.startswith("help ")
+        or normalized_text.startswith("run ")
+    )
+    if is_deterministic_command:
+        attribution_marker = _SLACK_SENT_USING_MARKER_RE.search(text)
+        if attribution_marker:
+            text = text[: attribution_marker.start()].strip()
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if len(lines) > 1:
+    if len(lines) > 1 and is_deterministic_command:
         first_line = lines[0]
-        normalized_first_line = first_line.casefold()
-        if (
-            normalized_first_line == "help"
-            or normalized_first_line.startswith("help ")
-            or normalized_first_line.startswith("run ")
-        ):
-            return first_line
+        return first_line
     return text
 
 
