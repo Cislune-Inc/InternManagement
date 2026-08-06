@@ -356,6 +356,89 @@ class StateStore:
                 )
         return len(matching)
 
+    def merge_operational_issues(
+        self,
+        *,
+        target_fingerprint: str,
+        source_fingerprints: list[str],
+        resolved_at: datetime | None = None,
+    ) -> bool:
+        fingerprints = list(
+            dict.fromkeys(
+                fingerprint.strip()
+                for fingerprint in source_fingerprints
+                if fingerprint.strip()
+            )
+        )
+        if not target_fingerprint.strip() or not fingerprints:
+            return False
+        placeholders = ",".join("?" for _ in fingerprints)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM operational_issues WHERE fingerprint IN ({placeholders})",
+                fingerprints,
+            ).fetchall()
+            if not rows:
+                return False
+            newest = max(rows, key=lambda row: str(row["last_seen_at"] or ""))
+            first_seen_at = min(str(row["first_seen_at"] or "") for row in rows)
+            last_seen_at = max(str(row["last_seen_at"] or "") for row in rows)
+            occurrence_count = sum(int(row["occurrence_count"] or 1) for row in rows)
+            notified_values = [
+                str(row["last_notified_at"])
+                for row in rows
+                if row["last_notified_at"]
+            ]
+            last_notified_at = max(notified_values) if notified_values else None
+            conn.execute(
+                """
+                INSERT INTO operational_issues(
+                    fingerprint, category, severity, summary, details_json,
+                    first_seen_at, last_seen_at, occurrence_count, status,
+                    last_notified_at, resolved_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, NULL)
+                ON CONFLICT(fingerprint)
+                DO UPDATE SET
+                    category = excluded.category,
+                    severity = excluded.severity,
+                    summary = excluded.summary,
+                    details_json = excluded.details_json,
+                    first_seen_at = excluded.first_seen_at,
+                    last_seen_at = excluded.last_seen_at,
+                    occurrence_count = excluded.occurrence_count,
+                    status = 'open',
+                    last_notified_at = excluded.last_notified_at,
+                    resolved_at = NULL
+                """,
+                (
+                    target_fingerprint,
+                    str(newest["category"]),
+                    str(newest["severity"]),
+                    str(newest["summary"]),
+                    str(newest["details_json"]),
+                    first_seen_at,
+                    last_seen_at,
+                    occurrence_count,
+                    last_notified_at,
+                ),
+            )
+            superseded = [
+                fingerprint
+                for fingerprint in fingerprints
+                if fingerprint != target_fingerprint
+            ]
+            if superseded:
+                timestamp = (resolved_at or datetime.now().astimezone()).isoformat()
+                conn.executemany(
+                    """
+                    UPDATE operational_issues
+                    SET status = 'resolved', resolved_at = ?
+                    WHERE fingerprint = ? AND status = 'open'
+                    """,
+                    [(timestamp, fingerprint) for fingerprint in superseded],
+                )
+        return True
+
     def list_operational_issues(
         self,
         *,

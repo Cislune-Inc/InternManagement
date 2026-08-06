@@ -188,7 +188,7 @@ Use `compensation_plan` to prevent project effort from becoming an accidental pa
 
 Do not infer `nasa_stipend` merely from `worker_type=intern`; funding source and legal worker classification are different questions. Deployment preserves explicit plans, infers Cislune hourly only from an existing Gusto mapping, and sends all other uncertain records to `needs_review`.
 
-Time policy is deliberately conservative: a recorded, duty-free meal pauses the task timer and is excluded from tracked work and hourly payroll. A declared short rest stays paid and allocated to the active project for up to 10 minutes. The worker must reply `back from break`; if the limit passes without that check-in, Don Pollo clocks them out effective at the 10-minute cutoff, stops project time, and tells them to clock back in before resuming work. The bot also warns before the configured meal and overtime thresholds, automatically starts lunch at the meal deadline, and automatically clocks nonexempt workers out at the unapproved overtime limit.
+Time policy is deliberately conservative: a recorded, duty-free meal pauses the task timer and is excluded from tracked work and hourly payroll. A meal timer cannot restart until the configured 30-minute minimum has passed, after which the worker can check themselves back in. A declared short rest stays paid and allocated to the active project for up to 10 minutes. The worker must reply `back from break`; if the limit passes without that check-in, Don Pollo clocks them out effective at the 10-minute cutoff, stops project time, and tells them to clock back in before resuming work. The bot also warns before the configured meal and overtime thresholds, automatically starts lunch at the meal deadline, and automatically clocks nonexempt workers out at the unapproved overtime limit. An overtime stop cannot be restarted that workday until Erik or George runs the approval-first `review.overtime_approve` command; the other approver is notified.
 
 Resolved enforcement does not produce an interrupting admin DM. Automatic meal pauses and successful short-rest, inactivity, or overtime clock-outs stay visible in the compliance history and manager dashboards. Direct admin alerts are reserved for unresolved risk, such as continued overtime when automatic enforcement is disabled, or an active blocker that needs help.
 
@@ -222,6 +222,17 @@ The bundle is written under `storage/dashboard/payroll/<week-ending>/` and copie
 - `gusto_time_sheets.json`, deliberately marked approval-required and not submitted
 
 Open `http://127.0.0.1:8765/payroll` for the human-readable review page and downloads. Review rows can be resolved there with a required reviewer name and note. Resolutions are tied to an evidence fingerprint, so changing the underlying hours automatically reopens the row. Optional learned resolution is deliberately limited to same-worker task-time variances; meal, overtime, compliance, and incomplete-segment reviews are never learned away.
+
+Deployment also writes `compensation_classification_review.csv`, containing only classifications that still need a human decision. Explicit roster classifications, Gusto mappings, and operator overrides can be applied automatically when the evidence is high-confidence. Stipend wording and other best guesses remain in the review file and are never promoted into payroll instructions without confirmation. The production roster records `Rosemead, CA` and `California` as the work location and labor jurisdiction unless a reviewed worker-specific value already exists.
+
+Reviewed classifications can be recorded without hand-editing local JSON:
+
+```bash
+.venv/bin/python ops/record-compensation.py --user example --slack-id U123 --plan cislune-hourly --evidence signed-hourly-agreement --reviewed-by Erik
+.venv/bin/python ops/infer_compensation_plans.py --apply-confident
+```
+
+The recorder preserves unrelated workforce fields, timestamps the decision, stores only a short evidence label, and backs up existing overrides before replacing them.
 
 Missing Gusto mappings are informational for workers explicitly classified as `cislune_hourly`; they remain in the review queue but cannot enter the Gusto bundle. Only mapped Cislune-hourly workers are included in `gusto_time_sheets.json`; everyone remains visible in tracked-time and project-labor exports. The dashboard separately shows all tracked hours, hourly-payroll hours, NASA-stipend effort, and unclassified hours. The installed macOS LaunchAgent runs the exporter each Monday at 7:00 AM. Gusto production submission remains disabled until the company has an approved integration and an operator has reviewed the bundle.
 
@@ -371,7 +382,7 @@ from silently deleting historical evidence.
 - Warns a tracked worker near 4.5 recorded hours and automatically pauses work time at the configured meal deadline if lunch has not started.
 - Keeps clocked-in totals equal to recorded work segments; lunch never triggers a flat automatic time deduction.
 - Uses practical intern wording for lunch and end-of-day coaching, while configured employees and contractors receive explicit approval language.
-- Records automatic meal pauses and successful enforcement in compliance history without interrupting admins. Covered hourly workers receive an overtime warning before the configured limit and are automatically clocked out at the limit unless approval is stored; salaried/exempt and external workers can opt out in the roster. Admin DMs are reserved for unresolved risk.
+- Records automatic meal pauses and successful enforcement in compliance history without interrupting admins. Covered hourly workers receive an overtime warning before the configured limit and are automatically clocked out at the limit unless approval is stored; salaried/exempt and external workers can opt out in the roster. The 30-minute meal restart gate is worker self-service, while the overtime restart gate requires Erik or George and tells the other approver. Admin DMs are reserved for unresolved risk.
 - Never deducts, revokes, or changes recorded time merely because a compliance reminder was sent.
 - Generates Monday payroll, project-budget, overhead-review, compliance, NASA-reporting, and Gusto-ready export artifacts.
 - Alerts the configured admin if someone appears stuck for four hours.
@@ -414,6 +425,8 @@ from silently deleting historical evidence.
 - `slack.enabled` defaults to `false`. When enabling it, configure `SLACK_BOT_TOKEN`, roster `slack_user_id` values, and `slack.project_routes` so updates go to the correct project channels. Use `slack.unmapped_channel_id` for mapping-review posts when a ClickUp task is not confidently routed.
 - ClickUp's assignee timer APIs are permission-sensitive. The bot will query/start assignee-linked timers when allowed by the token and workspace, and otherwise it falls back to local running-timer state plus synced closed time entries.
 - `schedule.auto_clock_out_after_hours` controls when a clocked-in but silent worker is treated as clocked out automatically. `schedule.auto_clock_out_warning_minutes` controls the stateful warning lead time. The production recommendation is `1` hour with a `15` minute warning.
+- Before inactivity enforcement, Don Pollo checks the active ClickUp task for a newer credible update. A newer task update resets the inactivity reference; a merely running stale timer does not.
+- Operational warnings are consolidated by worker/task and delivered once daily at the configured 8:00 AM Pacific digest time. Route warnings older than 14 days are retired and recur automatically if the condition returns.
 - `schedule.workday_rollover_time` controls when a user's local workday rolls into the next date folder. The default is `03:30`.
 - Lunch breaks suspend the inactivity auto-clock-out timer and keep the current ClickUp task in `in progress` while local task timing is paused.
 - `labor.short_rest_break_minutes` defaults to `10`. Declared short rests remain paid and project-allocated until the worker checks back in or the exact cutoff is reached.

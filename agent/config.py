@@ -207,6 +207,8 @@ def parse_user_profile(row: dict[str, Any], source: str = "roster") -> UserProfi
         active=_parse_bool(row.get("active", True)),
         preferred_transport=preferred_transport,
         worker_type=worker_type,
+        work_location=str(row.get("work_location") or "").strip(),
+        labor_jurisdiction=str(row.get("labor_jurisdiction") or "").strip(),
         compensation_plan=compensation_plan,
         time_tracking_required=_parse_bool_default(row.get("time_tracking_required"), True),
         meal_tracking_required=_parse_bool_default(row.get("meal_tracking_required"), True),
@@ -371,8 +373,16 @@ def _parse_slack_config(raw_slack: Any) -> SlackConfig:
         ),
         operational_digest_interval_minutes=max(
             15,
-            int(raw_slack.get("operational_digest_interval_minutes", 360)),
+            int(raw_slack.get("operational_digest_interval_minutes", 1440)),
         ),
+        operational_digest_hour=max(
+            0,
+            min(23, int(raw_slack.get("operational_digest_hour", 8))),
+        ),
+        operational_digest_timezone=str(
+            raw_slack.get("operational_digest_timezone")
+            or "America/Los_Angeles"
+        ).strip(),
         manager_queue_url=str(
             raw_slack.get("manager_queue_url")
             or "http://127.0.0.1:8765/exceptions"
@@ -415,6 +425,10 @@ def _parse_labor_config(raw_labor: Any) -> LaborConfig:
         short_rest_break_minutes=max(
             1,
             int(raw_labor.get("short_rest_break_minutes", 10)),
+        ),
+        meal_minimum_minutes=max(
+            1,
+            int(raw_labor.get("meal_minimum_minutes", 30)),
         ),
         meal_warning_after_hours=float(raw_labor.get("meal_warning_after_hours", 4.5)),
         meal_auto_pause_after_hours=float(raw_labor.get("meal_auto_pause_after_hours", 5.0)),

@@ -1580,6 +1580,19 @@ class InternManagementRuntime:
     ) -> bool:
         if not session.clocked_out_at:
             return False
+        if self._overtime_restart_blocked(session):
+            await self._send_dm(
+                client,
+                user,
+                session,
+                (
+                    "You were clocked out at the unapproved overtime limit. "
+                    "I cannot restart work time today until Erik or George approves it. "
+                    "Any work you actually perform must still be reported so the record can be corrected."
+                ),
+                now,
+            )
+            return True
         self._clear_pending_lunch_confirmation(session)
         self._clear_clock_out_state(session)
         if not session.clocked_in_at:
@@ -1625,6 +1638,13 @@ class InternManagementRuntime:
         if not inbound.content.strip() and not inbound.attachments:
             return False
         return await self._maybe_resume_same_day_work(client, user, session, now)
+
+    def _overtime_restart_blocked(self, session: SessionState) -> bool:
+        if session.metadata.get("overtime_approved_at"):
+            return False
+        return str(session.metadata.get("auto_clock_out_reason") or "") == (
+            "Configured overtime limit reached."
+        )
 
     async def _begin_daily_clock_in_intake(
         self,
@@ -2670,6 +2690,84 @@ class InternManagementRuntime:
         except Exception:
             logger.exception("Could not send compliance admin notice for %s.", user.user_key)
 
+    async def approve_same_day_overtime(
+        self,
+        client: discord.Client,
+        user: UserProfile,
+        session: SessionState,
+        *,
+        approved_by: str,
+        comments: str,
+        now: datetime | None = None,
+    ) -> str:
+        if not user.overtime_approval_required:
+            return f"{user.display_name} is not configured for overtime approval."
+        if session.metadata.get("overtime_approved_at"):
+            prior = str(session.metadata.get("overtime_approved_by") or "an admin")
+            return f"Overtime for {user.display_name} was already approved by {prior}."
+        approval_reason = comments.strip()
+        if not approval_reason:
+            return "An overtime approval reason is required."
+        reference_now = now or self.resolve_user_local_now(user)
+        previous_session = self._clone_session_state(session)
+        self._refresh_session_time_summary(session, reference_now)
+        worked_seconds = int(
+            session.time_summary.get("clocked_in_total_seconds") or 0
+        )
+        session.metadata["overtime_approved_at"] = reference_now.isoformat()
+        session.metadata["overtime_approved_by"] = approved_by
+        session.metadata["overtime_approval_note"] = approval_reason
+        self._append_compliance_event(
+            session,
+            event_type="overtime_approved",
+            now=reference_now,
+            worked_seconds=worked_seconds,
+        )
+        await self._send_dm(
+            client,
+            user,
+            session,
+            (
+                f"{approved_by} approved additional work time for today: {approval_reason} "
+                "You may clock back in, confirm the ClickUp task, and continue."
+            ),
+            reference_now,
+        )
+        normalized_approver = self._normalize_identifier_value(approved_by)
+        other_approvers = [
+            admin
+            for admin in self._task_approval_admins()
+            if self._normalize_identifier_value(admin.name) != normalized_approver
+        ]
+        if other_approvers:
+            await self._send_admin_notice(
+                client,
+                (
+                    f"{approved_by} approved same-day overtime for {user.display_name} "
+                    f"({session.session_date}). Reason: {approval_reason}"
+                ),
+                target_admins=other_approvers,
+                user=user,
+                session=session,
+            )
+        await self._persist_session_state(
+            user,
+            session,
+            now=reference_now,
+            previous_session=previous_session,
+            trigger="overtime_approval",
+            details={
+                "approved_by": approved_by,
+                "approval_reason_excerpt": self._excerpt_text(approval_reason),
+                "worked_seconds_at_approval": worked_seconds,
+            },
+        )
+        await self.write_dashboard()
+        return (
+            f"Approved same-day overtime for {user.display_name}. "
+            "The worker and the other configured approver were notified."
+        )
+
     def _pending_follow_up(self, session: SessionState) -> dict[str, Any] | None:
         raw = session.metadata.get(_PENDING_FOLLOW_UP_KEY)
         return raw if isinstance(raw, dict) else None
@@ -3121,6 +3219,14 @@ class InternManagementRuntime:
             return False
         if now - reference_at < timedelta(hours=self.config.schedule.auto_clock_out_after_hours):
             return False
+        reference_at = await self._inactivity_reference_with_clickup_activity(
+            user,
+            session,
+            reference_at=reference_at,
+            now=now,
+        )
+        if now - reference_at < timedelta(hours=self.config.schedule.auto_clock_out_after_hours):
+            return False
         note = await self._finalize_clickup_day(
             user,
             session,
@@ -3175,6 +3281,18 @@ class InternManagementRuntime:
             return False
         auto_clock_out_at = reference_at + timedelta(hours=self.config.schedule.auto_clock_out_after_hours)
         warning_minutes = self.config.schedule.auto_clock_out_warning_minutes
+        warning_at = auto_clock_out_at - timedelta(minutes=warning_minutes)
+        if now < warning_at or now >= auto_clock_out_at:
+            return False
+        reference_at = await self._inactivity_reference_with_clickup_activity(
+            user,
+            session,
+            reference_at=reference_at,
+            now=now,
+        )
+        auto_clock_out_at = reference_at + timedelta(
+            hours=self.config.schedule.auto_clock_out_after_hours
+        )
         warning_at = auto_clock_out_at - timedelta(minutes=warning_minutes)
         if now < warning_at or now >= auto_clock_out_at:
             return False
@@ -3410,7 +3528,6 @@ class InternManagementRuntime:
                 },
                 fingerprint_parts=(
                     user.user_key,
-                    session.session_date,
                     str(self._active_task_id(session) or ""),
                 ),
                 now=now,
@@ -7235,6 +7352,31 @@ class InternManagementRuntime:
         ]
         return selected or admins
 
+    async def _notify_other_task_approvers(
+        self,
+        client: discord.Client,
+        *,
+        resolved_by: str,
+        content: str,
+        user: UserProfile,
+        session: SessionState,
+    ) -> None:
+        actor = self._normalize_identifier_value(resolved_by)
+        others = [
+            admin
+            for admin in self._task_approval_admins()
+            if self._normalize_identifier_value(admin.name) != actor
+        ]
+        if not others:
+            return
+        await self._send_admin_notice(
+            client,
+            content,
+            target_admins=others,
+            user=user,
+            session=session,
+        )
+
     async def _submit_new_task_for_admin_review(
         self,
         client: discord.Client,
@@ -7833,6 +7975,34 @@ class InternManagementRuntime:
         returned_at: datetime | None = None,
     ) -> None:
         lunch_ended_at = returned_at or now
+        lunch_started_at = self._coerce_datetime_for_reference(
+            str(session.metadata.get("lunch_started_at") or ""),
+            reference=now,
+            timezone_name=self.resolve_user_timezone_name(user),
+        )
+        if lunch_started_at is not None:
+            minimum_end_at = lunch_started_at + timedelta(
+                minutes=self.config.labor.meal_minimum_minutes
+            )
+            if lunch_ended_at < minimum_end_at:
+                remaining_seconds = max(
+                    1,
+                    int((minimum_end_at - lunch_ended_at).total_seconds()),
+                )
+                remaining_minutes = max(1, (remaining_seconds + 59) // 60)
+                session.metadata["lunch_last_prompt_at"] = now.isoformat()
+                await self._send_dm(
+                    client,
+                    user,
+                    session,
+                    (
+                        "Your unpaid meal period is still in progress. "
+                        f"Check back in after about {remaining_minutes} more minute"
+                        f"{'s' if remaining_minutes != 1 else ''}; I will then resume your task timer."
+                    ),
+                    now,
+                )
+                return
         resume_stage = str(session.metadata.get("lunch_resume_stage") or "active")
         task_id = str(session.metadata.get("lunch_resume_task_id") or self._active_task_id(session) or "")
         task_name = str(
@@ -9373,6 +9543,7 @@ class InternManagementRuntime:
         *,
         approve_create: bool,
         admin_message: str,
+        resolved_by: str = "Admin",
         now: datetime | None = None,
     ) -> str:
         await self.refresh_configuration()
@@ -9406,6 +9577,7 @@ class InternManagementRuntime:
                 "message": admin_message,
                 "created_task_id": created_id,
                 "category": str(proposal.get("category") or "project"),
+                "resolved_by": resolved_by,
             }
             session.metadata[_CLICKUP_PROMPT_KEY] = {
                 "type": "task_onboarding",
@@ -9433,6 +9605,17 @@ class InternManagementRuntime:
                     )
                 ),
                 now,
+            )
+            await self._notify_other_task_approvers(
+                client,
+                resolved_by=resolved_by,
+                content=(
+                    f"{resolved_by} approved {user.display_name}'s "
+                    f"{proposal.get('category') or 'project'} task proposal and created "
+                    f"`{created_name}` in ClickUp."
+                ),
+                user=user,
+                session=session,
             )
             await self._persist_session_state(
                 user,
@@ -9464,6 +9647,7 @@ class InternManagementRuntime:
             "decision": "revise",
             "at": now.isoformat(),
             "message": admin_message,
+            "resolved_by": resolved_by,
         }
         session.metadata[_CLICKUP_PROMPT_KEY] = restored
         session.stage = "awaiting_task_selection"
@@ -9477,6 +9661,16 @@ class InternManagementRuntime:
                 "Reply with a revised description, or reply `back` to change the title."
             ),
             now,
+        )
+        await self._notify_other_task_approvers(
+            client,
+            resolved_by=resolved_by,
+            content=(
+                f"{resolved_by} requested revisions to {user.display_name}'s "
+                f"{proposal.get('category') or 'project'} task proposal."
+            ),
+            user=user,
+            session=session,
         )
         await self._persist_session_state(
             user,
@@ -9501,6 +9695,7 @@ class InternManagementRuntime:
         *,
         approve_create: bool,
         admin_message: str,
+        resolved_by: str = "Admin",
         now: datetime | None = None,
     ) -> str:
         await self.refresh_configuration()
@@ -9535,6 +9730,7 @@ class InternManagementRuntime:
                 "at": now.isoformat(),
                 "message": admin_message,
                 "created_task_id": created_id,
+                "resolved_by": resolved_by,
             }
             await self._send_dm(
                 client,
@@ -9542,6 +9738,16 @@ class InternManagementRuntime:
                 session,
                 f"Admin approved the unblocker task, so I created `{created_name}` in ClickUp.",
                 now,
+            )
+            await self._notify_other_task_approvers(
+                client,
+                resolved_by=resolved_by,
+                content=(
+                    f"{resolved_by} approved {user.display_name}'s unblocker task "
+                    f"and created `{created_name}` in ClickUp."
+                ),
+                user=user,
+                session=session,
             )
             await self._persist_session_state(
                 user,
@@ -9562,6 +9768,7 @@ class InternManagementRuntime:
             "decision": "revise",
             "at": now.isoformat(),
             "message": admin_message,
+            "resolved_by": resolved_by,
         }
         session.metadata.pop("pending_admin_unblocker_task", None)
         session.metadata[_CLICKUP_PROMPT_KEY] = {
@@ -9580,6 +9787,16 @@ class InternManagementRuntime:
                 "Send me a revised short title to start the draft again."
             ),
             now,
+        )
+        await self._notify_other_task_approvers(
+            client,
+            resolved_by=resolved_by,
+            content=(
+                f"{resolved_by} requested revisions to {user.display_name}'s "
+                "unblocker task proposal."
+            ),
+            user=user,
+            session=session,
         )
         await self._persist_session_state(
             user,
@@ -12225,6 +12442,64 @@ class InternManagementRuntime:
         if session.stage in {"on_lunch_break", "awaiting_clock_out_artifacts"}:
             return None
         return self._last_inbound_check_in_at(user, session, reference=reference)
+
+    async def _inactivity_reference_with_clickup_activity(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        *,
+        reference_at: datetime,
+        now: datetime,
+    ) -> datetime:
+        task_id = str(self._active_task_id(session) or "").strip()
+        if not self.clickup or not task_id:
+            return reference_at
+        cache = session.metadata.get("credible_clickup_activity")
+        cache = cache if isinstance(cache, dict) else {}
+        checked_at = self._coerce_datetime_for_reference(
+            str(cache.get("checked_at") or ""),
+            reference=now,
+            timezone_name=self.resolve_user_timezone_name(user),
+        )
+        activity_at = self._coerce_datetime_for_reference(
+            str(cache.get("activity_at") or ""),
+            reference=now,
+            timezone_name=self.resolve_user_timezone_name(user),
+        )
+        if (
+            str(cache.get("task_id") or "") != task_id
+            or checked_at is None
+            or now - checked_at >= timedelta(minutes=5)
+        ):
+            activity_at = None
+            try:
+                task = await self.clickup.get_task(task_id)
+                raw_updated = task.get("date_updated") if isinstance(task, dict) else None
+                if raw_updated not in (None, ""):
+                    try:
+                        activity_at = datetime.fromtimestamp(
+                            int(raw_updated) / 1000,
+                            tz=now.tzinfo,
+                        )
+                    except (TypeError, ValueError, OSError):
+                        activity_at = self._coerce_datetime_for_reference(
+                            str(raw_updated),
+                            reference=now,
+                            timezone_name=self.resolve_user_timezone_name(user),
+                        )
+            except Exception:
+                logger.exception(
+                    "Could not verify ClickUp activity before inactivity enforcement for %s.",
+                    user.user_key,
+                )
+            session.metadata["credible_clickup_activity"] = {
+                "task_id": task_id,
+                "checked_at": now.isoformat(),
+                "activity_at": activity_at.isoformat() if activity_at else "",
+            }
+        if activity_at and reference_at < activity_at <= now:
+            return activity_at
+        return reference_at
 
     def _auto_clock_out_warning_state(self, session: SessionState) -> dict[str, Any] | None:
         raw = session.metadata.get(_AUTO_CLOCK_OUT_WARNING_KEY)

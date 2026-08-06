@@ -17,6 +17,7 @@ _PAYROLL_FILES = {
     "gusto_time_sheets.json",
     "summary.json",
     "workforce_identity_candidates.csv",
+    "compensation_classification_review.csv",
 }
 
 
@@ -38,7 +39,10 @@ def build_payroll_dashboard_payload(storage_root: Path) -> dict[str, Any]:
 def resolve_payroll_download(storage_root: Path, filename: str) -> Path | None:
     if filename not in _PAYROLL_FILES:
         return None
-    if filename == "workforce_identity_candidates.csv":
+    if filename in {
+        "workforce_identity_candidates.csv",
+        "compensation_classification_review.csv",
+    }:
         path = storage_root / "dashboard" / "payroll" / filename
     else:
         path = storage_root / _LATEST_PAYROLL_ROOT / filename

@@ -110,9 +110,21 @@ class OperationalIssueReporter:
             or not slack
         ):
             return False
+        digest_timezone = resolve_timezone(
+            config.slack.operational_digest_timezone
+        )
+        digest_now = observed_at.astimezone(digest_timezone)
+        if digest_now.hour < config.slack.operational_digest_hour:
+            return False
+        self._maintain_route_issues(observed_at)
         digest_state = self.state_store.get_operational_state(
             "operational_issue_digest"
         ) or {}
+        last_sent_local_date = str(
+            digest_state.get("last_sent_local_date") or ""
+        )
+        if last_sent_local_date == digest_now.date().isoformat():
+            return False
         last_sent_raw = str(digest_state.get("last_sent_at") or "")
         try:
             last_sent_at = datetime.fromisoformat(last_sent_raw) if last_sent_raw else None
@@ -121,9 +133,7 @@ class OperationalIssueReporter:
         if last_sent_at is not None:
             if last_sent_at.tzinfo is None and observed_at.tzinfo is not None:
                 last_sent_at = last_sent_at.replace(tzinfo=observed_at.tzinfo)
-            if observed_at - last_sent_at < timedelta(
-                minutes=config.slack.operational_digest_interval_minutes
-            ):
+            if last_sent_at.astimezone(digest_timezone).date() == digest_now.date():
                 return False
         issues = self.state_store.list_operational_issues(status="open", limit=1000)
         if not issues:
@@ -170,10 +180,77 @@ class OperationalIssueReporter:
             "operational_issue_digest",
             {
                 "last_sent_at": observed_at.isoformat(),
+                "last_sent_local_date": digest_now.date().isoformat(),
+                "timezone": config.slack.operational_digest_timezone,
                 "open_issue_count": len(issues),
             },
         )
         return True
+
+    def _maintain_route_issues(self, observed_at: datetime) -> dict[str, int]:
+        stale_before = observed_at - timedelta(days=14)
+        open_issues = self.state_store.list_operational_issues(
+            status="open",
+            limit=1000,
+        )
+        route_issues = [
+            issue
+            for issue in open_issues
+            if str(issue.get("category") or "") == "slack_route_uncertain"
+        ]
+        stale_resolved = 0
+        active: list[dict[str, Any]] = []
+        for issue in route_issues:
+            try:
+                last_seen_at = datetime.fromisoformat(
+                    str(issue.get("last_seen_at") or "")
+                )
+            except ValueError:
+                active.append(issue)
+                continue
+            if last_seen_at.tzinfo is None and stale_before.tzinfo is not None:
+                last_seen_at = last_seen_at.replace(tzinfo=stale_before.tzinfo)
+            if last_seen_at < stale_before:
+                if self.state_store.resolve_operational_issue(
+                    str(issue.get("fingerprint") or ""),
+                    resolved_at=observed_at,
+                ):
+                    stale_resolved += 1
+                continue
+            active.append(issue)
+
+        grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for issue in active:
+            details = issue.get("details")
+            details = details if isinstance(details, dict) else {}
+            user_key = str(details.get("user_key") or "").strip()
+            task_key = str(
+                details.get("active_task_id")
+                or details.get("active_task_name")
+                or "unassigned"
+            ).strip()
+            grouped.setdefault((user_key, task_key), []).append(issue)
+
+        merged = 0
+        for (user_key, task_key), issues in grouped.items():
+            target = issue_fingerprint(
+                "slack_route_uncertain",
+                user_key,
+                task_key,
+            )
+            fingerprints = [
+                str(issue.get("fingerprint") or "")
+                for issue in issues
+            ]
+            if fingerprints == [target]:
+                continue
+            if self.state_store.merge_operational_issues(
+                target_fingerprint=target,
+                source_fingerprints=fingerprints,
+                resolved_at=observed_at,
+            ):
+                merged += max(0, len(fingerprints) - 1)
+        return {"stale_resolved": stale_resolved, "merged": merged}
 
     def resolve(self, category: str, *fingerprint_parts: str) -> bool:
         return self.state_store.resolve_operational_issue(

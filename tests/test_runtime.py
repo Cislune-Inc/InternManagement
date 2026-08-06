@@ -8892,6 +8892,169 @@ def test_runtime_auto_clock_out_warning_supports_one_hour_threshold() -> None:
     assert "within 15 minutes" in sent[0]
 
 
+def test_meal_timer_cannot_restart_before_thirty_minutes() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None):
+        del view
+        sent.append(content)
+        return None
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(user_key="alex", display_name="Alex", discord_user_id=1)
+    session = SessionState(
+        user_key="alex",
+        session_date="2026-05-28",
+        stage="on_lunch_break",
+        clocked_in_at="2026-05-28T09:00:00-07:00",
+        metadata={"lunch_started_at": "2026-05-28T12:00:00-07:00"},
+    )
+
+    asyncio.run(
+        runtime._end_lunch_break(
+            SimpleNamespace(),
+            user,
+            session,
+            datetime.fromisoformat("2026-05-28T12:10:00-07:00"),
+        )
+    )
+
+    assert session.stage == "on_lunch_break"
+    assert session.metadata.get("lunch_ended_at") is None
+    assert "20 more minutes" in sent[0]
+
+
+def test_overtime_clockout_blocks_same_day_restart_until_approval() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None):
+        del view
+        sent.append(content)
+        return None
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="alex",
+        display_name="Alex",
+        discord_user_id=1,
+        overtime_approval_required=True,
+    )
+    session = SessionState(
+        user_key="alex",
+        session_date="2026-05-28",
+        stage="clocked_out",
+        clocked_in_at="2026-05-28T09:00:00-07:00",
+        clocked_out_at="2026-05-28T17:00:00-07:00",
+        metadata={"auto_clock_out_reason": "Configured overtime limit reached."},
+    )
+
+    handled = asyncio.run(
+        runtime._maybe_resume_same_day_work(
+            SimpleNamespace(),
+            user,
+            session,
+            datetime.fromisoformat("2026-05-28T17:05:00-07:00"),
+        )
+    )
+
+    assert handled is True
+    assert session.stage == "clocked_out"
+    assert session.clocked_out_at == "2026-05-28T17:00:00-07:00"
+    assert "cannot restart work time" in sent[0]
+
+
+def test_overtime_approval_notifies_worker_and_other_approver() -> None:
+    runtime = _build_runtime(
+        admins=[
+            AdminProfile(name="Erik", discord_user_id=1),
+            AdminProfile(name="George", discord_user_id=2),
+        ]
+    )
+    worker_messages: list[str] = []
+    admin_targets: list[list[str]] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None):
+        del view
+        worker_messages.append(content)
+        return None
+
+    async def fake_admin_notice(_client, _content: str, *, target_admins=None, **_kwargs):
+        admin_targets.append([admin.name for admin in (target_admins or [])])
+        return admin_targets[-1]
+
+    async def fake_persist(*_args, **_kwargs):
+        return None
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    runtime._send_admin_notice = fake_admin_notice  # type: ignore[method-assign]
+    runtime._persist_session_state = fake_persist  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="alex",
+        display_name="Alex",
+        discord_user_id=10,
+        overtime_approval_required=True,
+    )
+    session = SessionState(
+        user_key="alex",
+        session_date="2026-05-28",
+        stage="clocked_out",
+        clocked_in_at="2026-05-28T09:00:00-07:00",
+        clocked_out_at="2026-05-28T17:00:00-07:00",
+        metadata={"auto_clock_out_reason": "Configured overtime limit reached."},
+    )
+
+    result = asyncio.run(
+        runtime.approve_same_day_overtime(
+            SimpleNamespace(),
+            user,
+            session,
+            approved_by="Erik",
+            comments="Finish the thermal test.",
+            now=datetime.fromisoformat("2026-05-28T17:05:00-07:00"),
+        )
+    )
+
+    assert session.metadata["overtime_approved_by"] == "Erik"
+    assert admin_targets == [["George"]]
+    assert "may clock back in" in worker_messages[0]
+    assert "Approved same-day overtime" in result
+
+
+def test_recent_clickup_task_activity_defers_inactivity_clockout() -> None:
+    runtime = _build_runtime()
+    runtime.config.schedule.auto_clock_out_after_hours = 1
+    activity_at = datetime.fromisoformat("2026-05-28T10:30:00-07:00")
+
+    async def fake_get_task(_task_id: str):
+        return {"id": "task-1", "date_updated": str(int(activity_at.timestamp() * 1000))}
+
+    runtime.clickup.get_task = fake_get_task  # type: ignore[method-assign]
+    user = UserProfile(user_key="alex", display_name="Alex", discord_user_id=1)
+    session = SessionState(
+        user_key="alex",
+        session_date="2026-05-28",
+        stage="active",
+        clocked_in_at="2026-05-28T09:00:00-07:00",
+        last_user_message_at="2026-05-28T10:00:00-07:00",
+        metadata={"active_clickup_task_id": "task-1"},
+    )
+
+    changed = asyncio.run(
+        runtime._maybe_auto_clock_out_inactive(
+            None,
+            user,
+            session,
+            datetime.fromisoformat("2026-05-28T11:01:00-07:00"),
+        )
+    )
+
+    assert changed is False
+    assert session.stage == "active"
+    assert session.metadata["credible_clickup_activity"]["task_id"] == "task-1"
+
+
 def test_runtime_clock_out_finalize_puts_task_on_hold_not_complete() -> None:
     runtime = _build_runtime()
     runtime.clickup = None

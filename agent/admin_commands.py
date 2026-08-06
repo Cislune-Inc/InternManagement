@@ -972,6 +972,12 @@ class AdminCommandRouter:
             lines.extend(f"- {item}" for item in items)
         return "\n".join(lines)
 
+    def _active_admin_name(self) -> str:
+        admin = self.runtime._admin_profile_by_discord_user_id(
+            int(self._active_admin_user_id or 0)
+        )
+        return admin.name if admin else "Admin"
+
     async def _command_presence_clocked_in(
         self,
         _client: discord.Client | None,
@@ -1297,6 +1303,28 @@ class AdminCommandRouter:
             lines.append(f"- {snapshot.user.display_name}: [{category}] {title}")
         return "\n".join(lines)
 
+    async def _command_review_overtime_approve(
+        self,
+        client: discord.Client | None,
+        snapshots: list[UserDailySnapshot],
+        args: dict[str, str],
+    ) -> str:
+        if not client:
+            return "Discord client is unavailable."
+        snapshot = self._snapshot_or_error(args.get("user"), snapshots)
+        if isinstance(snapshot, str):
+            return snapshot
+        comments = (args.get("comments") or "").strip()
+        if not comments:
+            return "I need `comments=` describing why the overtime is approved."
+        return await self.runtime.approve_same_day_overtime(
+            client,
+            snapshot.user,
+            snapshot.session,
+            approved_by=self._active_admin_name(),
+            comments=comments,
+        )
+
     async def _command_review_task_proposal_approve(
         self,
         client: discord.Client | None,
@@ -1315,6 +1343,7 @@ class AdminCommandRouter:
             snapshot.session,
             approve_create=True,
             admin_message=admin_message,
+            resolved_by=self._active_admin_name(),
         )
 
     async def _command_review_task_proposal_revise(
@@ -1337,6 +1366,7 @@ class AdminCommandRouter:
             snapshot.session,
             approve_create=False,
             admin_message=comments,
+            resolved_by=self._active_admin_name(),
         )
 
     async def _command_review_unblocker_approve(
@@ -1357,6 +1387,7 @@ class AdminCommandRouter:
             snapshot.session,
             approve_create=True,
             admin_message=admin_message,
+            resolved_by=self._active_admin_name(),
         )
 
     async def _command_review_unblocker_revise(
@@ -1379,6 +1410,7 @@ class AdminCommandRouter:
             snapshot.session,
             approve_create=False,
             admin_message=comments,
+            resolved_by=self._active_admin_name(),
         )
 
     async def _command_evidence_before_after(
@@ -1855,6 +1887,27 @@ class AdminCommandRouter:
             title="Preview `review.task_proposal_approve`",
             summary=f"The pending project/overhead task proposal for {label} will be created in ClickUp.",
             command_id="review.task_proposal_approve",
+            args=dict(args),
+        )
+
+    async def _preview_review_overtime_approve(
+        self,
+        snapshots: list[UserDailySnapshot],
+        args: dict[str, str],
+    ) -> AdminActionPreview:
+        target = self._snapshot_or_error(args.get("user"), snapshots)
+        label = args.get("user") or "that user"
+        if isinstance(target, UserDailySnapshot):
+            label = target.user.display_name
+        comments = (args.get("comments") or "No approval reason provided.").strip()
+        return AdminActionPreview(
+            title="Preview `review.overtime_approve`",
+            summary=(
+                f"{label} will be allowed to restart tracked work today after the overtime stop. "
+                "The worker and the other configured approver will be notified.\n\n"
+                f"Reason: {comments}"
+            ),
+            command_id="review.overtime_approve",
             args=dict(args),
         )
 

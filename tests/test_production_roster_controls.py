@@ -38,6 +38,8 @@ def test_roster_controls_track_every_active_worker_and_preserve_pay_separation()
     assert rows[0]["compensation_plan"] == "cislune_hourly"
     assert rows[1]["compensation_plan"] == "nasa_stipend"
     for row in rows[:2]:
+        assert row["work_location"] == "Rosemead, CA"
+        assert row["labor_jurisdiction"] == "California"
         assert row["time_tracking_required"] == "true"
         assert row["meal_tracking_required"] == "true"
         assert row["overtime_approval_required"] == "true"

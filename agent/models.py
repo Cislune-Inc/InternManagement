@@ -82,6 +82,7 @@ class ClickUpConfig:
 class LaborConfig:
     enabled: bool = True
     short_rest_break_minutes: int = 10
+    meal_minimum_minutes: int = 30
     meal_warning_after_hours: float = 4.5
     meal_auto_pause_after_hours: float = 5.0
     overtime_limit_hours: float = 8.0
@@ -133,7 +134,9 @@ class SlackConfig:
     weekly_recap_hour: int = 16
     operational_alerts_enabled: bool = True
     operational_alert_cooldown_minutes: int = 360
-    operational_digest_interval_minutes: int = 360
+    operational_digest_interval_minutes: int = 1440
+    operational_digest_hour: int = 8
+    operational_digest_timezone: str = "America/Los_Angeles"
     manager_queue_url: str = "http://127.0.0.1:8765/exceptions"
     quarantine_uncertain_routes: bool = True
     thread_daily_updates: bool = True
@@ -208,6 +211,8 @@ class UserProfile:
     active: bool = True
     preferred_transport: str = "auto"
     worker_type: str = "intern"
+    work_location: str = ""
+    labor_jurisdiction: str = ""
     compensation_plan: str = "needs_review"
     time_tracking_required: bool = True
     meal_tracking_required: bool = True

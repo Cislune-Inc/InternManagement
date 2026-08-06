@@ -15,6 +15,9 @@ from agent.config import parse_roster_bytes
 
 
 CONTROL_FIELDS = (
+    "worker_type",
+    "work_location",
+    "labor_jurisdiction",
     "compensation_plan",
     "time_tracking_required",
     "meal_tracking_required",
@@ -57,6 +60,11 @@ def apply_roster_controls(
         if not _is_active(row):
             continue
         desired_values = {
+            "worker_type": str(row.get("worker_type") or "intern").strip(),
+            "work_location": str(row.get("work_location") or "Rosemead, CA").strip(),
+            "labor_jurisdiction": str(
+                row.get("labor_jurisdiction") or "California"
+            ).strip(),
             "compensation_plan": str(row.get("compensation_plan") or "").strip()
             or _default_compensation_plan(row),
             "time_tracking_required": "true",

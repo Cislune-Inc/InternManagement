@@ -18,6 +18,7 @@ CONTROL_VALUES: dict[str, dict[str, Any]] = {
     },
     "labor": {
         "short_rest_break_minutes": 10,
+        "meal_minimum_minutes": 30,
         "meal_warning_after_hours": 4.5,
         "meal_auto_pause_after_hours": 5.0,
         "overtime_limit_hours": 8.0,
@@ -29,7 +30,9 @@ CONTROL_VALUES: dict[str, dict[str, Any]] = {
         "new_task_approver_names": ["Erik", "George"],
     },
     "slack": {
-        "operational_digest_interval_minutes": 360,
+        "operational_digest_interval_minutes": 1440,
+        "operational_digest_hour": 8,
+        "operational_digest_timezone": "America/Los_Angeles",
         "manager_queue_url": "http://192.168.4.87:8765/exceptions",
         "practice_channel_id": None,
         "quarantine_uncertain_routes": True,

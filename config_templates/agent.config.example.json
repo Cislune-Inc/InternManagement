@@ -46,7 +46,9 @@
     "weekly_recaps_enabled": true,
     "operational_alerts_enabled": true,
     "operational_alert_cooldown_minutes": 360,
-    "operational_digest_interval_minutes": 360,
+    "operational_digest_interval_minutes": 1440,
+    "operational_digest_hour": 8,
+    "operational_digest_timezone": "America/Los_Angeles",
     "manager_queue_url": "http://127.0.0.1:8765/exceptions",
     "quarantine_uncertain_routes": true,
     "thread_daily_updates": true,
@@ -96,6 +98,7 @@
   "labor": {
     "enabled": true,
     "short_rest_break_minutes": 10,
+    "meal_minimum_minutes": 30,
     "meal_warning_after_hours": 4.5,
     "meal_auto_pause_after_hours": 5.0,
     "overtime_limit_hours": 8.0,

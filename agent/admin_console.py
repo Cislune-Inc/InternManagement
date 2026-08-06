@@ -380,6 +380,22 @@ def build_admin_console_registry() -> AdminConsoleRegistry:
             scenarios=("review",),
         ),
         AdminCommandDefinition(
+            command_id="review.overtime_approve",
+            label="Approve same-day overtime",
+            help_text="Release a worker's same-day overtime restart gate, notify the worker, and notify the other configured approver.",
+            group_id="review",
+            read_only=False,
+            confirm_required=True,
+            args=(
+                AdminCommandArgument("user", "Roster user key or display name", example="Andrew"),
+                AdminCommandArgument("comments", "Reason and approved work scope", example="Approve one hour to finish the test."),
+            ),
+            handler_name="_command_review_overtime_approve",
+            preview_name="_preview_review_overtime_approve",
+            examples=('run review.overtime_approve user=Andrew comments="Approve one hour for testing."',),
+            scenarios=("review", "attention"),
+        ),
+        AdminCommandDefinition(
             command_id="review.close",
             label="Close reviewed task",
             help_text="Approve an intern's pending task review and close the reviewed task in ClickUp.",

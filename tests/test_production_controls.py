@@ -25,6 +25,18 @@ def test_production_controls_enforce_ten_minute_short_rest_limit() -> None:
     assert "labor.short_rest_break_minutes" in changed
 
 
+def test_production_controls_schedule_daily_pacific_digest_and_meal_minimum() -> None:
+    payload: dict = {}
+
+    changed = apply_controls(payload)
+
+    assert payload["slack"]["operational_digest_interval_minutes"] == 1440
+    assert payload["slack"]["operational_digest_hour"] == 8
+    assert payload["slack"]["operational_digest_timezone"] == "America/Los_Angeles"
+    assert payload["labor"]["meal_minimum_minutes"] == 30
+    assert "slack.operational_digest_hour" in changed
+
+
 def test_production_controls_configure_erik_as_slack_admin_beta_tester() -> None:
     payload = {
         "admins": [

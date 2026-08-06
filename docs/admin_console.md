@@ -91,6 +91,9 @@ Handle finished-task reviews and unblocker-task drafts that are waiting on admin
 - `review.pending_tasks` - Pending task reviews (read-only)
   - List interns whose finished task is waiting for admin review.
   - Example: `run review.pending_tasks`
+- `review.overtime_approve` - Approve same-day overtime (mutating)
+  - Release a worker's same-day overtime restart gate, notify the worker, and notify the other configured approver.
+  - Example: `run review.overtime_approve user=Andrew comments="Approve one hour for testing."`
 - `review.close` - Close reviewed task (mutating)
   - Approve an intern's pending task review and close the reviewed task in ClickUp.
   - Example: `run review.close user=Andrew`
@@ -235,6 +238,7 @@ flowchart TD
   scenario_task --> task_prioritize["task.prioritize"]
   start --> scenario_review["Review / Approve Work"]
   scenario_review --> review_pending_tasks["review.pending_tasks"]
+  scenario_review --> review_overtime_approve["review.overtime_approve"]
   scenario_review --> review_close["review.close"]
   scenario_review --> review_rework["review.rework"]
   scenario_review --> review_pending_task_proposals["review.pending_task_proposals"]
