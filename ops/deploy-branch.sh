@@ -1,7 +1,28 @@
 #!/bin/zsh
 set -euo pipefail
 
-repo_root="${0:A:h:h}"
+if [[ -z "${DON_POLLO_DEPLOY_STABLE_COPY:-}" ]]; then
+  repo_root="${0:A:h:h}"
+  stable_script="$(mktemp "${TMPDIR:-/tmp}/don-pollo-deploy.XXXXXX")"
+  cp "${0:A}" "${stable_script}"
+  chmod 700 "${stable_script}"
+  exec env \
+    DON_POLLO_DEPLOY_STABLE_COPY=1 \
+    DON_POLLO_DEPLOY_REPO_ROOT="${repo_root}" \
+    DON_POLLO_DEPLOY_STABLE_PATH="${stable_script}" \
+    /bin/zsh "${stable_script}" "$@"
+fi
+
+repo_root="${DON_POLLO_DEPLOY_REPO_ROOT:?}"
+stable_script="${DON_POLLO_DEPLOY_STABLE_PATH:?}"
+reconciliation_index=""
+
+cleanup() {
+  [[ -z "${reconciliation_index}" ]] || rm -f "${reconciliation_index}"
+  rm -f "${stable_script}"
+}
+trap cleanup EXIT
+
 branch="${1:-}"
 
 if [[ ! "${branch}" =~ '^agent/[A-Za-z0-9._/-]+$' ]]; then
@@ -45,7 +66,6 @@ if git merge-base --is-ancestor HEAD "${candidate}"; then
   git merge --ff-only "${candidate}"
 else
   reconciliation_index="$(mktemp)"
-  trap 'rm -f "${reconciliation_index}"' EXIT
   GIT_INDEX_FILE="${reconciliation_index}" git read-tree "${candidate}^{tree}"
   workflow_path=".github/workflows/test.yml"
   if git cat-file -e "HEAD:${workflow_path}" 2>/dev/null; then
@@ -61,7 +81,7 @@ else
       | git commit-tree "${reconciliation_tree}" -p HEAD -p "${candidate}"
   )"
   rm -f "${reconciliation_index}"
-  trap - EXIT
+  reconciliation_index=""
   git merge --ff-only "${reconciliation_commit}"
 fi
 .venv/bin/python -m pip install -r requirements.txt
