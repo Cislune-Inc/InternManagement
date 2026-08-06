@@ -425,9 +425,10 @@ def test_slack_admin_dm_uses_admin_console_without_worker_roster_entry() -> None
         )
     }
 
-    for attribution in (
-        "<@U0BATRYF16C>",
-        "<@U0BATRYF16C|ChatGPT>",
+    for trailing_metadata in (
+        "*Sent using* <@U0BATRYF16C>",
+        "*Sent using* <@U0BATRYF16C|ChatGPT>",
+        "Connector attribution represented outside the plain-text footer.",
     ):
         asyncio.run(
             runtime.handle_slack_direct_message(
@@ -436,7 +437,7 @@ def test_slack_admin_dm_uses_admin_console_without_worker_roster_entry() -> None
                     "user": "U01SWQKDTBM",
                     "text": (
                         "run presence.attention\n"
-                        f"*Sent using* {attribution}"
+                        f"{trailing_metadata}"
                     ),
                     "ts": "1785859200.0",
                 },
@@ -446,8 +447,10 @@ def test_slack_admin_dm_uses_admin_console_without_worker_roster_entry() -> None
     assert routed == [
         (999, "run presence.attention"),
         (999, "run presence.attention"),
+        (999, "run presence.attention"),
     ]
     assert posted == [
+        ("U01SWQKDTBM", "Admin beta console ready."),
         ("U01SWQKDTBM", "Admin beta console ready."),
         ("U01SWQKDTBM", "Admin beta console ready."),
     ]

@@ -220,6 +220,23 @@ _AUTO_CLOCK_OUT_NOTIFICATION_MESSAGE = (
     "You were automatically clocked out for inactivity. "
     "If you are still working, message me so I can clock you back in."
 )
+
+
+def _normalize_slack_admin_text(value: Any) -> str:
+    text = _SLACK_CHATGPT_ATTRIBUTION_RE.sub("", str(value or "")).strip()
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) > 1:
+        first_line = lines[0]
+        normalized_first_line = first_line.casefold()
+        if (
+            normalized_first_line == "help"
+            or normalized_first_line.startswith("help ")
+            or normalized_first_line.startswith("run ")
+        ):
+            return first_line
+    return text
+
+
 _LUNCH_RETURN_TIME_PATTERN = re.compile(
     r"\b(?:at|since)\s+(\d{1,2})(?:\s*[:.]\s*|\s+)(\d{2})\s*([ap]\.?m\.?)?\b",
     re.IGNORECASE,
@@ -1261,10 +1278,7 @@ class InternManagementRuntime:
             if not self.slack:
                 logger.error("Cannot answer Slack admin DM because Slack is not configured.")
                 return
-            admin_text = _SLACK_CHATGPT_ATTRIBUTION_RE.sub(
-                "",
-                str(event.get("text") or ""),
-            ).strip()
+            admin_text = _normalize_slack_admin_text(event.get("text"))
             response = await self.admin_router.handle_plain_text(
                 client,
                 admin.discord_user_id,
