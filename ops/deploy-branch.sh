@@ -21,19 +21,31 @@ if [[ "$(git branch --show-current)" != "main" ]]; then
   exit 1
 fi
 
-git fetch --prune origin "${branch}"
-candidate="$(git rev-parse --verify FETCH_HEAD)"
-git merge-base --is-ancestor HEAD "${candidate}"
+git fetch --prune origin \
+  "+refs/heads/${branch}:refs/remotes/origin/${branch}" \
+  "+refs/heads/main:refs/remotes/origin/main"
+candidate="$(git rev-parse --verify "refs/remotes/origin/${branch}")"
+origin_main="$(git rev-parse --verify refs/remotes/origin/main)"
+
+# Production temporarily contains five live commits that predate GitHub recovery.
+# Only reconcile histories when both sides descend from the verified GitHub main.
+git merge-base --is-ancestor "${origin_main}" HEAD
+git merge-base --is-ancestor "${origin_main}" "${candidate}"
 
 .venv/bin/python -m agent.backup
-latest_backup="$(find backups -name '*.tar.gz.enc' -type f -print0 | xargs -0 ls -t | head -1)"
+backup_candidates=(backups/*.tar.gz.enc(N.om))
+latest_backup="${backup_candidates[1]:-}"
 if [[ -z "${latest_backup}" ]]; then
   echo "No encrypted backup was created; deployment stopped." >&2
   exit 1
 fi
 .venv/bin/python -m agent.backup --verify "${latest_backup}"
 
-git merge --ff-only "${candidate}"
+if git merge-base --is-ancestor HEAD "${candidate}"; then
+  git merge --ff-only "${candidate}"
+else
+  git merge --no-ff --no-edit "${candidate}"
+fi
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python -m compileall -q agent
 ops/restart-services.sh

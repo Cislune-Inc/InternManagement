@@ -38,5 +38,5 @@ The dashboard should load at `http://192.168.4.87:8765/` over the office VPN. Op
 ## Deployment
 
 - Confirm GitHub checks and review the diff before deploying.
-- From the production checkout, run `ops/deploy-branch.sh agent/<branch>`; it refuses dirty worktrees and non-`agent/*` branches, creates and verifies an encrypted backup, fast-forwards production, installs pinned dependencies, restarts services, and runs health checks.
+- From the production checkout, run `ops/deploy-branch.sh agent/<branch>`; it refuses dirty worktrees and non-`agent/*` branches, creates and verifies an encrypted backup, fast-forwards when possible, safely reconciles the recovered live history only when both sides descend from GitHub `main`, installs pinned dependencies, restarts services, and runs health checks.
 - If deployment verification fails, leave evidence intact and report the exact failed check. Do not reset or discard live data.
