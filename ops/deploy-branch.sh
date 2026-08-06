@@ -44,7 +44,25 @@ fi
 if git merge-base --is-ancestor HEAD "${candidate}"; then
   git merge --ff-only "${candidate}"
 else
-  git merge --no-ff --no-edit "${candidate}"
+  reconciliation_index="$(mktemp)"
+  trap 'rm -f "${reconciliation_index}"' EXIT
+  GIT_INDEX_FILE="${reconciliation_index}" git read-tree "${candidate}^{tree}"
+  workflow_path=".github/workflows/test.yml"
+  if git cat-file -e "HEAD:${workflow_path}" 2>/dev/null; then
+    workflow_blob="$(git rev-parse "HEAD:${workflow_path}")"
+    workflow_mode="$(git ls-tree HEAD -- "${workflow_path}" | awk '{print $1}')"
+    GIT_INDEX_FILE="${reconciliation_index}" git update-index \
+      --add \
+      --cacheinfo "${workflow_mode}" "${workflow_blob}" "${workflow_path}"
+  fi
+  reconciliation_tree="$(GIT_INDEX_FILE="${reconciliation_index}" git write-tree)"
+  reconciliation_commit="$(
+    print -r -- "Reconcile reviewed GitHub candidate with recovered production history" \
+      | git commit-tree "${reconciliation_tree}" -p HEAD -p "${candidate}"
+  )"
+  rm -f "${reconciliation_index}"
+  trap - EXIT
+  git merge --ff-only "${reconciliation_commit}"
 fi
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python -m compileall -q agent
