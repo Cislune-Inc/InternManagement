@@ -139,6 +139,32 @@ def test_stuck_report_uses_friendly_pacific_time() -> None:
     assert "T10:00:00" not in report
 
 
+def test_admin_intervention_report_accepts_legacy_naive_stuck_since(monkeypatch) -> None:
+    runtime = _build_runtime()
+    router = AdminCommandRouter(runtime)
+    snapshot = _build_snapshot(
+        clocked_in_at="2026-05-28T09:00:00",
+        stage="active",
+        stuck_since="2026-05-28T10:00:00",
+        latest_blocker="waiting on approval",
+    )
+
+    class _FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            fixed = datetime.fromisoformat("2026-05-28T14:00:00-07:00")
+            return fixed if tz is None else fixed.astimezone(tz)
+
+    monkeypatch.setattr("agent.admin_commands.datetime", _FixedDateTime)
+
+    report = router._admin_intervention_report([snapshot])
+
+    assert "Admin intervention candidates:" in report
+    assert "Alex: waiting on approval" in report
+    assert "stuck 4.0h" in report
+    assert "today at 10:00 AM PDT" in report
+
+
 def test_manager_report_fallback_uses_friendly_pacific_times() -> None:
     runtime = _build_runtime()
     router = AdminCommandRouter(runtime)

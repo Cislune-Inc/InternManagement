@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .config import parse_agent_config, parse_roster_bytes
 from .models import AgentConfig, BootstrapConfig, LocalWorkspace, SessionState, UserProfile
+from .persistence import atomic_write_text
 
 
 class LocalStore:
@@ -85,9 +86,7 @@ class LocalStore:
         return workspace
 
     def _write_text(self, path: Path, content: str) -> Path:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
-        return path.resolve()
+        return atomic_write_text(path, content)
 
     def _write_bytes(self, path: Path, content: bytes) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)

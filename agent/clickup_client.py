@@ -15,6 +15,8 @@ from .models import AgentConfig, ClickUpContextBundle, MessageRecord, SessionSta
 
 
 logger = logging.getLogger(__name__)
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+_MAX_GET_ATTEMPTS = 3
 
 _PRIORITY_TO_INT = {
     "urgent": 1,
@@ -79,6 +81,10 @@ class ClickUpClient:
         user: UserProfile,
         session: SessionState,
         messages: list[MessageRecord],
+        *,
+        preferred_task_id: str | None = None,
+        preferred_task_name: str | None = None,
+        preferred_selection_reason: str | None = None,
     ) -> ClickUpContextBundle:
         tasks = await self._load_candidate_tasks(user)
         if not tasks:
@@ -93,7 +99,24 @@ class ClickUpClient:
             active_task_id = str(best_task.get("id"))
             active_task_name = best_task.get("name")
             selection_reason = best_reason
-        context = self._format_ranked_context(scored, active_task_id, selection_reason)
+        context_task_id = active_task_id
+        context_selection_reason = selection_reason
+        if preferred_task_id:
+            matched_preferred = next(
+                (
+                    (reason, task)
+                    for _, reason, task in scored
+                    if str(task.get("id") or "") == preferred_task_id
+                ),
+                None,
+            )
+            if matched_preferred is not None:
+                matched_reason, matched_task = matched_preferred
+                context_task_id = str(matched_task.get("id") or preferred_task_id)
+                if preferred_task_name:
+                    matched_task["name"] = preferred_task_name
+                context_selection_reason = preferred_selection_reason or matched_reason
+        context = self._format_ranked_context(scored, context_task_id, context_selection_reason)
         candidate_task_ids = [str(task.get("id")) for _, _, task in scored[:5] if task.get("id")]
         return ClickUpContextBundle(
             context=context,
@@ -125,6 +148,9 @@ class ClickUpClient:
                 self.config.clickup.workspace_id,
             )
         return None
+
+    async def list_workspace_members(self) -> list[dict[str, Any]]:
+        return await self._list_workspace_members()
 
     async def resolve_workspace_member_id(
         self,
@@ -1059,9 +1085,13 @@ class ClickUpClient:
         selection_reason: str | None,
     ) -> str:
         if active_task_id:
-            active_task = next(task for _, _, task in scored if str(task.get("id")) == active_task_id)
-            other_tasks = [task for _, _, task in scored if str(task.get("id")) != active_task_id][:4]
-            return self._format_active_task_context(active_task, selection_reason, other_tasks)
+            active_task = next(
+                (task for _, _, task in scored if str(task.get("id")) == active_task_id),
+                None,
+            )
+            if active_task is not None:
+                other_tasks = [task for _, _, task in scored if str(task.get("id")) != active_task_id][:4]
+                return self._format_active_task_context(active_task, selection_reason, other_tasks)
 
         lines = ["Assigned ClickUp tasks:"]
         for _, _, task in scored[:5]:
@@ -1171,18 +1201,56 @@ class ClickUpClient:
         params: dict[str, Any] | None = None,
         json: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        response = requests.request(
-            method,
-            f"{self.base_url}{path}",
-            headers={
-                "Authorization": self.api_token,
-                "Content-Type": "application/json",
-            },
-            params=params,
-            json=json,
-            timeout=60,
-        )
-        response.raise_for_status()
-        if response.content:
-            return response.json()
-        return {}
+        normalized_method = method.upper()
+        max_attempts = _MAX_GET_ATTEMPTS if normalized_method == "GET" else 1
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = requests.request(
+                    normalized_method,
+                    f"{self.base_url}{path}",
+                    headers={
+                        "Authorization": self.api_token,
+                        "Content-Type": "application/json",
+                    },
+                    params=params,
+                    json=json,
+                    timeout=60,
+                )
+            except requests.RequestException as exc:
+                if attempt >= max_attempts:
+                    raise
+                delay = 0.5 * (2 ** (attempt - 1))
+                logger.warning(
+                    "ClickUp %s %s failed with %s; retrying in %.1fs (%s/%s).",
+                    normalized_method,
+                    path,
+                    type(exc).__name__,
+                    delay,
+                    attempt,
+                    max_attempts,
+                )
+                time.sleep(delay)
+                continue
+            retryable = response.status_code in _RETRYABLE_STATUS_CODES
+            if retryable and attempt < max_attempts:
+                retry_after = response.headers.get("Retry-After")
+                try:
+                    delay = float(retry_after) if retry_after else 0.5 * (2 ** (attempt - 1))
+                except ValueError:
+                    delay = 0.5 * (2 ** (attempt - 1))
+                logger.warning(
+                    "ClickUp %s %s returned HTTP %s; retrying in %.1fs (%s/%s).",
+                    normalized_method,
+                    path,
+                    response.status_code,
+                    delay,
+                    attempt,
+                    max_attempts,
+                )
+                time.sleep(min(max(delay, 0.0), 10.0))
+                continue
+            response.raise_for_status()
+            if response.content:
+                return response.json()
+            return {}
+        raise RuntimeError(f"ClickUp request exhausted retries: {normalized_method} {path}")

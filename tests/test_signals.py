@@ -1,4 +1,4 @@
-from agent.signals import detect_signals
+from agent.signals import detect_signals, is_clock_out_cancellation
 
 
 def test_detect_clock_in() -> None:
@@ -19,6 +19,25 @@ def test_detect_stuck_and_recovered() -> None:
 def test_detect_clock_out() -> None:
     result = detect_signals("I am clocking out now.")
     assert result.clocking_out is True
+
+
+def test_detect_explicit_clock_out_requests() -> None:
+    assert detect_signals("can i clock out?").clocking_out is True
+    assert detect_signals("i have to go can i clock out?").clocking_out is True
+    assert detect_signals("clock out").clocking_out is True
+    assert detect_signals("Clock me out pollo").clocking_out is True
+    assert detect_signals("CLOCK ME OUT DON POLLO").clocking_out is True
+
+
+def test_clock_out_mentions_are_not_treated_as_requests() -> None:
+    assert detect_signals("I will send my status update in the afternoon or when I clock out.").clocking_out is False
+    assert detect_signals("Before I clock out, I need to finish the CAD part.").clocking_out is False
+
+
+def test_detect_clock_out_cancellation() -> None:
+    assert is_clock_out_cancellation("no i did not mean to clock out") is True
+    assert is_clock_out_cancellation("no please i did not mean too") is True
+    assert detect_signals("no i did not mean to clock out").clocking_out is False
 
 
 def test_detect_lunch_start_and_end() -> None:

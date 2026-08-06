@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 
 from .advisor import HeuristicAdvisor
 from .runtime import InternManagementRuntime
+from .ssl_compat import build_aiohttp_connector, ensure_ssl_cert_file
 from .time_utils import resolve_timezone
 
 
@@ -63,7 +64,7 @@ class DemoDM:
         self.client = client
         self.user_id = user_id
 
-    async def send(self, content: str) -> DemoSentMessage:
+    async def send(self, content: str, *, view=None) -> DemoSentMessage:
         message = DemoSentMessage(
             id=next(self.client.message_ids),
             content=content,
@@ -111,6 +112,10 @@ class LiveDemoDiscordClient(discord.Client):
         self.runtime = runtime
         self.user_key = user_key
         self.pace_seconds = pace_seconds
+
+    async def login(self, token: str) -> None:
+        self.http.connector = build_aiohttp_connector()
+        await super().login(token)
 
     async def on_ready(self) -> None:
         try:
@@ -271,6 +276,7 @@ async def run_demo(user_key: str | None) -> Path:
 
 async def run_live_demo(user_key: str, pace_seconds: float) -> None:
     load_dotenv(ROOT / ".env")
+    ensure_ssl_cert_file()
     token = os.environ["DISCORD_BOT_TOKEN"]
     runtime = InternManagementRuntime()
     await runtime.refresh_configuration(force=True)
@@ -306,7 +312,7 @@ async def _user_message(
         created_at=when,
     )
     print(f"[{when.isoformat()}] USER -> {user.display_name}: {content or '[attachment only]'}")
-    message_record = await runtime._build_inbound_record(inbound, session)
+    message_record = await runtime._build_inbound_record(inbound, session, user)
     await runtime.process_inbound_event(client, user, session, message_record, when)
 
 

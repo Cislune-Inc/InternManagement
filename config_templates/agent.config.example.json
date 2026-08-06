@@ -6,7 +6,8 @@
       "name": "George",
       "discord_user_id": "123456789012345678",
       "clickup_user_id": "198031927",
-      "clickup_user_email": "george@cislune.com"
+      "clickup_user_email": "george@cislune.com",
+      "slack_user_id": null
     }
   ],
   "roster_file_name": "roster.csv",
@@ -20,7 +21,8 @@
     "inactivity_minutes": 10,
     "stuck_alert_after_hours": 4,
     "task_onboarding_interval_minutes": 5,
-    "auto_clock_out_after_hours": 6
+    "auto_clock_out_after_hours": 1,
+    "auto_clock_out_warning_minutes": 15
   },
   "clickup": {
     "workspace_id": "123456",
@@ -30,11 +32,85 @@
     "attach_images_to_tasks": false,
     "auto_status_updates": true,
     "create_time_entries": true,
+    "new_task_approval_required": true,
+    "new_task_approver_names": ["Erik", "George"],
     "custom_fields": {
       "last_check_in_at": "",
       "status_summary": "",
       "blockers": ""
     }
+  },
+  "slack": {
+    "enabled": false,
+    "daily_updates_enabled": true,
+    "weekly_recaps_enabled": true,
+    "operational_alerts_enabled": true,
+    "operational_alert_cooldown_minutes": 360,
+    "operational_digest_interval_minutes": 360,
+    "manager_queue_url": "http://127.0.0.1:8765/exceptions",
+    "quarantine_uncertain_routes": true,
+    "thread_daily_updates": true,
+    "feedback_poll_interval_minutes": 360,
+    "feedback_reactions": {
+      "white_check_mark": "useful",
+      "x": "wrong_task_or_channel",
+      "twisted_rightwards_arrows": "wrong_task_or_channel",
+      "repeat": "duplicate",
+      "memo": "too_detailed"
+    },
+    "practice_channel_id": null,
+    "default_channel_id": null,
+    "unmapped_channel_id": null,
+    "post_start_hour": 10,
+    "post_end_hour": 17,
+    "min_post_interval_minutes": 25,
+    "max_images_per_update": 3,
+    "weekly_recap_day": 4,
+    "weekly_recap_hour": 16,
+    "positive_reactions": [
+      "heart",
+      "heart_eyes",
+      "fire",
+      "raised_hands",
+      "clap",
+      "tada",
+      "star-struck",
+      "rocket",
+      "white_check_mark",
+      "thumbsup"
+    ],
+    "project_routes": [
+      {
+        "label": "PERDEX",
+        "channel_id": "C0123456789",
+        "clickup_task_ids": [],
+        "clickup_list_ids": ["123456789"],
+        "clickup_folder_ids": [],
+        "content_patterns": ["fermentation", "wifi dongle"],
+        "task_name_patterns": ["solar", "perdex"],
+        "list_name_patterns": ["PERDEX"],
+        "folder_name_patterns": ["PERDEX"]
+      }
+    ]
+  },
+  "labor": {
+    "enabled": true,
+    "meal_warning_after_hours": 4.5,
+    "meal_auto_pause_after_hours": 5.0,
+    "overtime_limit_hours": 8.0,
+    "overtime_warning_minutes": 30,
+    "auto_clock_out_at_overtime_limit": true,
+    "monday_export_hour": 7,
+    "overhead_task_ids": [],
+    "overhead_name_patterns": [
+      "\\boverhead\\b",
+      "\\badministration\\b",
+      "\\btraining\\b",
+      "\\bshop cleanup\\b",
+      "\\bshop\\b.*\\b(?:cleaning|cleanup|improvement|maintenance|organization)\\b",
+      "\\b(?:cleaning|cleanup|improving|maintaining|organizing)\\b.*\\bshop\\b",
+      "\\bfacilit(?:y|ies)\\b"
+    ]
   },
   "admin_console": {
     "enable_ai_fallback": true,

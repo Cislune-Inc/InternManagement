@@ -1,5 +1,10 @@
 import asyncio
 from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+import requests
 
 from agent.clickup_client import ClickUpClient
 from agent.models import (
@@ -64,6 +69,70 @@ def _build_config() -> AgentConfig:
     )
 
 
+def test_clickup_get_retries_transient_server_failures() -> None:
+    client = ClickUpClient("token", _build_config())
+    responses = [
+        SimpleNamespace(status_code=500, headers={}, content=b"error"),
+        SimpleNamespace(status_code=503, headers={"Retry-After": "0"}, content=b"error"),
+        SimpleNamespace(
+            status_code=200,
+            headers={},
+            content=b'{"tasks":[]}',
+            json=lambda: {"tasks": []},
+            raise_for_status=lambda: None,
+        ),
+    ]
+    for response in responses[:2]:
+        response.raise_for_status = lambda: (_ for _ in ()).throw(RuntimeError("unexpected"))
+
+    with (
+        patch("agent.clickup_client.requests.request", side_effect=responses) as request,
+        patch("agent.clickup_client.time.sleep") as sleep,
+    ):
+        result = client._request("GET", "/team/1/task")
+
+    assert result == {"tasks": []}
+    assert request.call_count == 3
+    assert sleep.call_count == 2
+
+
+def test_clickup_get_retries_connection_reset() -> None:
+    client = ClickUpClient("token", _build_config())
+    success = SimpleNamespace(
+        status_code=200,
+        headers={},
+        content=b'{"teams":[]}',
+        json=lambda: {"teams": []},
+        raise_for_status=lambda: None,
+    )
+
+    with (
+        patch(
+            "agent.clickup_client.requests.request",
+            side_effect=[requests.ConnectionError("connection reset"), success],
+        ) as request,
+        patch("agent.clickup_client.time.sleep") as sleep,
+    ):
+        result = client._request("GET", "/team")
+
+    assert result == {"teams": []}
+    assert request.call_count == 2
+    sleep.assert_called_once_with(0.5)
+
+
+def test_clickup_write_does_not_retry_connection_error() -> None:
+    client = ClickUpClient("token", _build_config())
+
+    with patch(
+        "agent.clickup_client.requests.request",
+        side_effect=requests.ConnectionError("connection reset"),
+    ) as request:
+        with pytest.raises(requests.ConnectionError):
+            client._request("POST", "/task", json={"name": "No duplicate"})
+
+    assert request.call_count == 1
+
+
 def test_clickup_context_prefers_matching_assigned_task() -> None:
     client = FakeClickUpClient(
         {
@@ -117,6 +186,73 @@ def test_clickup_context_prefers_matching_assigned_task() -> None:
     assert bundle.active_task_id == "task-2"
     assert bundle.active_task_name == "Intake form API integration"
     assert "Active ClickUp task candidate" in bundle.context
+
+
+def test_clickup_context_can_center_preferred_authoritative_task() -> None:
+    client = FakeClickUpClient(
+        {
+            (
+                "GET",
+                "/team/9011286053/task",
+            ): {
+                "tasks": [
+                    {
+                        "id": "task-1",
+                        "name": "Plan mechanism for lever automation",
+                        "description": "Ranked highest from ClickUp status and keywords.",
+                        "status": {"status": "in progress"},
+                        "priority": {"priority": "high"},
+                    },
+                    {
+                        "id": "task-2",
+                        "name": "Firmware",
+                        "description": "Stepper motor firmware work.",
+                        "status": {"status": "to do"},
+                        "priority": {"priority": "normal"},
+                    },
+                ]
+            }
+        }
+    )
+    user = UserProfile(
+        user_key="christie",
+        display_name="Christie",
+        discord_user_id=1,
+        discord_username="christie",
+        storage_folder_name="ChristieJackett",
+        clickup_user_id="87438366",
+    )
+    session = SessionState(
+        user_key="christie",
+        session_date="2026-06-15",
+        latest_plan="Continue firmware work on the stepper motor controller.",
+    )
+    messages = [
+        MessageRecord(
+            message_id="1",
+            direction="inbound",
+            author_id=1,
+            created_at=datetime(2026, 6, 15, 9, 15, 0),
+            content="I am still working on the firmware task.",
+            attachments=[],
+        )
+    ]
+
+    bundle = asyncio.run(
+        client.get_context_bundle(
+            user,
+            session,
+            messages,
+            preferred_task_id="task-2",
+            preferred_task_name="Firmware",
+            preferred_selection_reason="Confirmed by intern during task onboarding.",
+        )
+    )
+
+    assert "Active ClickUp task candidate:" in bundle.context
+    assert "- Firmware | id=task-2" in bundle.context
+    assert "Why this task: Confirmed by intern during task onboarding." in bundle.context
+    assert "- Plan mechanism for lever automation | id=task-1" in bundle.context
 
 
 def test_clickup_user_id_can_be_resolved_from_workspace_members() -> None:

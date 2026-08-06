@@ -97,6 +97,15 @@ Handle finished-task reviews and unblocker-task drafts that are waiting on admin
 - `review.rework` - Send rework comments (mutating)
   - Reject closure for now, send comments back to the intern, and reactivate the task.
   - Example: `run review.rework user=Andrew comments="Fix the wiring alignment first."`
+- `review.pending_task_proposals` - Pending new-task proposals (read-only)
+  - List project and overhead task proposals waiting for Erik or George.
+  - Example: `run review.pending_task_proposals`
+- `review.task_proposal_approve` - Approve new-task proposal (mutating)
+  - Approve a project or overhead task proposal and publish it to ClickUp.
+  - Example: `run review.task_proposal_approve user=Andrew`
+- `review.task_proposal_revise` - Request new-task revision (mutating)
+  - Send comments back before a project or overhead task is created.
+  - Example: `run review.task_proposal_revise user=Andrew comments="Tie this to CARVE."`
 - `review.pending_unblockers` - Pending unblocker drafts (read-only)
   - List unblocker tasks that are waiting for admin approval or revision.
   - Example: `run review.pending_unblockers`
@@ -228,6 +237,9 @@ flowchart TD
   scenario_review --> review_pending_tasks["review.pending_tasks"]
   scenario_review --> review_close["review.close"]
   scenario_review --> review_rework["review.rework"]
+  scenario_review --> review_pending_task_proposals["review.pending_task_proposals"]
+  scenario_review --> review_task_proposal_approve["review.task_proposal_approve"]
+  scenario_review --> review_task_proposal_revise["review.task_proposal_revise"]
   scenario_review --> review_pending_unblockers["review.pending_unblockers"]
   scenario_review --> review_unblocker_approve["review.unblocker_approve"]
   scenario_review --> review_unblocker_revise["review.unblocker_revise"]

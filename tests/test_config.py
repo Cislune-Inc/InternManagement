@@ -24,6 +24,7 @@ def test_parse_agent_config_defaults() -> None:
     assert config.clickup.mission_board_list_id == "789"
     assert config.clickup.auto_status_updates is True
     assert config.clickup.create_time_entries is True
+    assert config.slack.enabled is False
     assert config.prompts.lunch_break_check_in == "Are you done with lunch break yet?"
 
 
@@ -84,6 +85,55 @@ def test_parse_agent_config_accepts_admin_console_settings() -> None:
     assert config.admin_console.menu_timeout_minutes == 15
 
 
+def test_parse_agent_config_accepts_slack_settings() -> None:
+    config = parse_agent_config(
+        {
+            "admin_discord_user_id": "123",
+            "clickup": {"workspace_id": "456"},
+            "prompts": {},
+            "slack": {
+                "enabled": True,
+                "practice_channel_id": "CTEST",
+                "default_channel_id": "CDEFAULT",
+                "unmapped_channel_id": "CUNMAPPED",
+                "post_start_hour": 11,
+                "post_end_hour": 16,
+                "min_post_interval_minutes": 30,
+                "project_routes": [
+                    {
+                        "label": "PERDEX",
+                        "channel_id": "CPERDEX",
+                        "clickup_task_ids": ["task-1"],
+                        "clickup_list_ids": ["list-1"],
+                        "clickup_folder_ids": ["folder-1"],
+                        "content_patterns": ["fermentation"],
+                        "task_name_patterns": ["solar"],
+                        "list_name_patterns": ["perdex"],
+                        "folder_name_patterns": ["contract"],
+                    }
+                ],
+            },
+        },
+        "America/Los_Angeles",
+    )
+    assert config.slack.enabled is True
+    assert config.slack.practice_channel_id == "CTEST"
+    assert config.slack.default_channel_id == "CDEFAULT"
+    assert config.slack.unmapped_channel_id == "CUNMAPPED"
+    assert config.slack.post_start_hour == 11
+    assert config.slack.post_end_hour == 16
+    assert config.slack.min_post_interval_minutes == 30
+    route = config.slack.project_routes[0]
+    assert route.channel_id == "CPERDEX"
+    assert route.clickup_task_ids == ["task-1"]
+    assert route.clickup_list_ids == ["list-1"]
+    assert route.clickup_folder_ids == ["folder-1"]
+    assert route.content_patterns == ["fermentation"]
+    assert route.task_name_patterns == ["solar"]
+    assert route.list_name_patterns == ["perdex"]
+    assert route.folder_name_patterns == ["contract"]
+
+
 def test_parse_agent_config_accepts_lunch_prompt() -> None:
     config = parse_agent_config(
         {
@@ -96,12 +146,48 @@ def test_parse_agent_config_accepts_lunch_prompt() -> None:
     assert config.prompts.lunch_break_check_in == "You back from lunch yet?"
 
 
+def test_parse_agent_config_rejects_empty_follow_up_questions() -> None:
+    with pytest.raises(ValueError, match="follow_up_questions"):
+        parse_agent_config(
+            {
+                "admin_discord_user_id": "123",
+                "prompts": {"follow_up_questions": []},
+                "clickup": {"workspace_id": "456"},
+            },
+            "America/Los_Angeles",
+        )
+
+
+def test_parse_agent_config_rejects_blank_only_follow_up_questions() -> None:
+    with pytest.raises(ValueError, match="follow_up_questions"):
+        parse_agent_config(
+            {
+                "admin_discord_user_id": "123",
+                "prompts": {"follow_up_questions": [" ", "\t"]},
+                "clickup": {"workspace_id": "456"},
+            },
+            "America/Los_Angeles",
+        )
+
+
+def test_parse_agent_config_accepts_custom_follow_up_questions() -> None:
+    config = parse_agent_config(
+        {
+            "admin_discord_user_id": "123",
+            "prompts": {"follow_up_questions": ["  What changed?  ", "Any blockers?"]},
+            "clickup": {"workspace_id": "456"},
+        },
+        "America/Los_Angeles",
+    )
+    assert config.prompts.follow_up_questions == ["What changed?", "Any blockers?"]
+
+
 def test_parse_roster_csv() -> None:
     roster = parse_roster_bytes(
         "roster.csv",
         (
-            "user_key,display_name,discord_user_id,discord_username,storage_folder_name,timezone,clickup_user_id,clickup_user_email,active\n"
-            "alex,Alex,123,alexuser,Alex Folder,America/Denver,42,alex@example.com,true\n"
+            "user_key,display_name,discord_user_id,discord_username,storage_folder_name,timezone,clickup_user_id,clickup_user_email,slack_user_id,active\n"
+            "alex,Alex,123,alexuser,Alex Folder,America/Denver,42,alex@example.com,U123456,true\n"
         ).encode("utf-8"),
     )
     assert len(roster) == 1
@@ -109,7 +195,21 @@ def test_parse_roster_csv() -> None:
     assert roster[0].timezone == "America/Denver"
     assert roster[0].clickup_user_id == "42"
     assert roster[0].clickup_user_email == "alex@example.com"
+    assert roster[0].slack_user_id == "U123456"
     assert roster[0].storage_folder_name == "Alex Folder"
+
+
+def test_parse_roster_csv_accepts_utf8_bom_header() -> None:
+    roster = parse_roster_bytes(
+        "roster.csv",
+        (
+            "\ufeffuser_key,display_name,discord_user_id,discord_username,storage_folder_name,timezone,clickup_user_id,clickup_user_email,active\n"
+            "alex,Alex,123,alexuser,Alex Folder,America/Denver,42,alex@example.com,true\n"
+        ).encode("utf-8"),
+    )
+    assert len(roster) == 1
+    assert roster[0].user_key == "alex"
+    assert roster[0].overtime_approval_required is True
 
 
 def test_parse_roster_csv_rejects_username_in_id_column() -> None:
@@ -119,6 +219,41 @@ def test_parse_roster_csv_rejects_username_in_id_column() -> None:
             (
                 "user_key,display_name,discord_user_id,discord_username,storage_folder_name,timezone,clickup_user_id,clickup_user_email,active\n"
                 "alex,Alex,not-a-user-id,alexuser,Alex Folder,America/Los_Angeles,42,alex@example.com,true\n"
+            ).encode("utf-8"),
+        )
+
+
+def test_parse_roster_csv_accepts_slack_only_worker_policy() -> None:
+    roster = parse_roster_bytes(
+        "roster.csv",
+        (
+            "user_key,display_name,discord_user_id,discord_username,storage_folder_name,"
+            "timezone,clickup_user_id,clickup_user_email,slack_user_id,active,"
+            "preferred_transport,worker_type,time_tracking_required,meal_tracking_required,"
+            "overtime_approval_required,expected_daily_hours,check_in_interval_minutes,"
+            "gusto_entity_uuid,labor_cost_rate\n"
+            "sam,Sam,,,Sam,America/Los_Angeles,42,sam@example.com,U123,true,"
+            "slack,employee,true,true,true,8,90,gusto-1,55.5\n"
+        ).encode("utf-8"),
+    )
+
+    assert roster[0].discord_user_id is None
+    assert roster[0].slack_user_id == "U123"
+    assert roster[0].preferred_transport == "slack"
+    assert roster[0].worker_type == "employee"
+    assert roster[0].check_in_interval_minutes == 90
+    assert roster[0].gusto_entity_uuid == "gusto-1"
+    assert roster[0].labor_cost_rate == 55.5
+
+
+def test_parse_roster_csv_requires_one_message_transport() -> None:
+    with pytest.raises(ValueError, match="either a numeric discord_user_id or a Slack user ID"):
+        parse_roster_bytes(
+            "roster.csv",
+            (
+                "user_key,display_name,discord_user_id,discord_username,storage_folder_name,"
+                "timezone,clickup_user_id,clickup_user_email,slack_user_id,active\n"
+                "sam,Sam,,,Sam,America/Los_Angeles,42,sam@example.com,,true\n"
             ).encode("utf-8"),
         )
 
