@@ -22,7 +22,7 @@ except Exception:
   )"
   [[ -n "${lock_pid}" ]]
   grep -q "Slack Socket Mode receiver connected pid=${lock_pid}\." \
-    "/Users/pm/InternManagement/data/launchd.stderr.log"
+    "/Users/pm/InternManagement/data/launchd.stdout.log"
 fi
 test -f "/Users/pm/InternManagement/data/integration_health.json"
 find "/Users/pm/InternManagement/backups" -name '*.tar.gz.enc' -mmin -1560 | grep -q .

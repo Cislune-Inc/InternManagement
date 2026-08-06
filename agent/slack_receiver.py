@@ -64,10 +64,11 @@ class SlackSocketReceiver:
         )
         logger.info("Starting Don Pollo Slack Socket Mode receiver.")
         await self._handler.connect_async()
-        logger.info(
-            "Don Pollo Slack Socket Mode receiver connected pid=%s.",
-            os.getpid(),
+        ready_message = (
+            f"Don Pollo Slack Socket Mode receiver connected pid={os.getpid()}."
         )
+        logger.info(ready_message)
+        print(ready_message, flush=True)
         await asyncio.Event().wait()
 
     async def close(self) -> None:
