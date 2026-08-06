@@ -78,6 +78,10 @@ _TASK_REVIEW_CANCEL_HINTS = (
 _BLOCKER_STATE_KEY = "blocker_state"
 _BLOCKER_HELP_DECISION_AT_KEY = "blocker_help_decision_at"
 _PENDING_FOLLOW_UP_KEY = "pending_follow_up"
+_SLACK_CHATGPT_ATTRIBUTION_RE = re.compile(
+    r"\s*\n+\*Sent using\*\s+<@[^>]+\|ChatGPT>\s*$",
+    flags=re.IGNORECASE,
+)
 _FOLLOW_UP_RESPONSE_AGGREGATION_KEY = "follow_up_response_aggregation"
 _PROGRESS_PROBE_HISTORY_KEY = "progress_probe_history"
 _FOLLOW_UP_PROBE_GRACE_WINDOW = timedelta(minutes=1)
@@ -1254,10 +1258,14 @@ class InternManagementRuntime:
             if not self.slack:
                 logger.error("Cannot answer Slack admin DM because Slack is not configured.")
                 return
+            admin_text = _SLACK_CHATGPT_ATTRIBUTION_RE.sub(
+                "",
+                str(event.get("text") or ""),
+            ).strip()
             response = await self.admin_router.handle_plain_text(
                 client,
                 admin.discord_user_id,
-                str(event.get("text") or ""),
+                admin_text,
             )
             await self.slack.post_message(slack_user_id, response)
             return

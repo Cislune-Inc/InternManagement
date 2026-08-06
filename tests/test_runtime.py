@@ -430,7 +430,10 @@ def test_slack_admin_dm_uses_admin_console_without_worker_roster_entry() -> None
             SimpleNamespace(),
             {
                 "user": "U01SWQKDTBM",
-                "text": "run presence.attention",
+                "text": (
+                    "run presence.attention\n"
+                    "*Sent using* <@U0BATRYF16C|ChatGPT>"
+                ),
                 "ts": "1785859200.0",
             },
         )
