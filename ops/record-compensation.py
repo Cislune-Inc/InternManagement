@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import shutil
@@ -18,6 +19,61 @@ VALID_PLANS = {
     "external",
     "needs_review",
 }
+
+
+def _canonical_roster_keys(path: Path) -> dict[str, str]:
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    canonical: dict[str, str] = {}
+    for row in rows:
+        if str(row.get("active", "true")).strip().lower() in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }:
+            continue
+        user_key = str(row.get("user_key") or "").strip()
+        if not user_key:
+            continue
+        lookup = user_key.casefold()
+        if lookup in canonical and canonical[lookup] != user_key:
+            raise ValueError(
+                f"Roster has ambiguous user keys: {canonical[lookup]} and {user_key}."
+            )
+        canonical[lookup] = user_key
+    return canonical
+
+
+def resolve_reviewed_batch(
+    *,
+    roster_path: Path,
+    hourly_users: list[str],
+    stipend_users: list[str],
+) -> list[tuple[str, str, str]]:
+    canonical = _canonical_roster_keys(roster_path)
+    requested: list[tuple[str, str, str]] = [
+        (user, "cislune_hourly", "owner-confirmed-hourly")
+        for user in hourly_users
+    ] + [
+        (user, "nasa_stipend", "owner-confirmed-stipend-intern")
+        for user in stipend_users
+    ]
+    resolved: list[tuple[str, str, str]] = []
+    plans_by_key: dict[str, str] = {}
+    for requested_key, plan, evidence in requested:
+        normalized = requested_key.strip().casefold()
+        user_key = canonical.get(normalized)
+        if not user_key:
+            raise ValueError(f"Unknown active roster user: {requested_key}")
+        previous_plan = plans_by_key.get(user_key)
+        if previous_plan and previous_plan != plan:
+            raise ValueError(f"Conflicting compensation plans requested for {user_key}.")
+        if previous_plan:
+            continue
+        plans_by_key[user_key] = plan
+        resolved.append((user_key, plan, evidence))
+    return resolved
 
 
 def _load_overrides(path: Path) -> dict[str, dict[str, Any]]:
@@ -108,9 +164,29 @@ def main() -> int:
     )
     parser.add_argument("--user", default="", help="Roster user key.")
     parser.add_argument("--slack-id", default="", help="Slack user ID.")
-    parser.add_argument("--plan", required=True)
-    parser.add_argument("--evidence", required=True, help="Short evidence label, not message text.")
+    parser.add_argument("--plan", default="")
+    parser.add_argument("--evidence", default="", help="Short evidence label, not message text.")
     parser.add_argument("--reviewed-by", required=True)
+    parser.add_argument(
+        "--hourly",
+        action="append",
+        default=[],
+        metavar="USER",
+        help="Case-insensitive roster user key confirmed as Cislune hourly; repeat as needed.",
+    )
+    parser.add_argument(
+        "--stipend",
+        action="append",
+        default=[],
+        metavar="USER",
+        help="Case-insensitive roster user key confirmed as a NASA stipend intern; repeat as needed.",
+    )
+    parser.add_argument("--roster", type=Path, default=Path("config/roster.csv"))
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply all high-confidence classifications to the roster and refresh the review queue.",
+    )
     parser.add_argument(
         "--overrides",
         type=Path,
@@ -120,19 +196,66 @@ def main() -> int:
 
     overrides = _load_overrides(args.overrides)
     reviewed_at = datetime.now(timezone.utc).isoformat()
-    storage_key, overrides = record_classification(
-        overrides,
-        user_key=args.user,
-        slack_user_id=args.slack_id,
-        plan=args.plan,
-        evidence=args.evidence,
-        reviewed_by=args.reviewed_by,
-        reviewed_at=reviewed_at,
+    batch_requested = bool(args.hourly or args.stipend)
+    if batch_requested and any((args.user, args.slack_id, args.plan, args.evidence)):
+        parser.error("Do not combine --hourly/--stipend with single-record options.")
+    if not batch_requested and (not args.plan or not args.evidence):
+        parser.error("Single-record mode requires --plan and --evidence.")
+
+    records = (
+        resolve_reviewed_batch(
+            roster_path=args.roster,
+            hourly_users=args.hourly,
+            stipend_users=args.stipend,
+        )
+        if batch_requested
+        else [(args.user, args.plan, args.evidence)]
     )
+    storage_keys: list[str] = []
+    for user_key, plan, evidence in records:
+        storage_key, overrides = record_classification(
+            overrides,
+            user_key=user_key,
+            slack_user_id=args.slack_id if not batch_requested else "",
+            plan=plan,
+            evidence=evidence,
+            reviewed_by=args.reviewed_by,
+            reviewed_at=reviewed_at,
+        )
+        storage_keys.append(storage_key)
     backup_path = _write_overrides(args.overrides, overrides)
-    print(f"Recorded reviewed compensation classification for {storage_key}.")
+    print(
+        "Recorded reviewed compensation classification for "
+        + ", ".join(storage_keys)
+        + "."
+    )
     if backup_path:
         print(f"Previous overrides: {backup_path}")
+    if args.apply:
+        import runpy
+
+        inference = runpy.run_path(
+            str(Path(__file__).with_name("infer_compensation_plans.py")),
+            run_name="compensation_inference",
+        )
+
+        candidates_path = Path(
+            "storage/dashboard/payroll/workforce_identity_candidates.csv"
+        )
+        review_path = Path(
+            "storage/dashboard/payroll/compensation_classification_review.csv"
+        )
+        fieldnames, roster_rows = inference["_load_csv"](args.roster)
+        _candidate_fields, candidate_rows = inference["_load_csv"](candidates_path)
+        proposals = inference["build_proposals"](
+            roster_rows, candidate_rows, overrides
+        )
+        review_rows = inference["uncertain_proposals"](proposals)
+        inference["_write_csv"](review_path, review_rows)
+        inference["_apply_confident"](
+            args.roster, fieldnames, roster_rows, proposals
+        )
+        print(f"Compensation review queue now contains {len(review_rows)} user(s).")
     return 0
 
 

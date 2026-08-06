@@ -9,6 +9,7 @@ MODULE = runpy.run_path(
     run_name="record_compensation",
 )
 record_classification = MODULE["record_classification"]
+resolve_reviewed_batch = MODULE["resolve_reviewed_batch"]
 
 
 def test_record_classification_normalizes_cli_friendly_values() -> None:
@@ -46,3 +47,39 @@ def test_record_classification_can_use_roster_key_without_slack() -> None:
 
     assert key == "example"
     assert overrides[key]["compensation_plan"] == "nasa_stipend"
+
+
+def test_resolve_reviewed_batch_uses_canonical_roster_case(tmp_path: Path) -> None:
+    roster = tmp_path / "roster.csv"
+    roster.write_text(
+        "user_key,active\nAndrew,true\nAanoalii,true\nNick,true\n",
+        encoding="utf-8",
+    )
+
+    resolved = resolve_reviewed_batch(
+        roster_path=roster,
+        hourly_users=["andrew"],
+        stipend_users=["aanoalii", "nick"],
+    )
+
+    assert resolved == [
+        ("Andrew", "cislune_hourly", "owner-confirmed-hourly"),
+        ("Aanoalii", "nasa_stipend", "owner-confirmed-stipend-intern"),
+        ("Nick", "nasa_stipend", "owner-confirmed-stipend-intern"),
+    ]
+
+
+def test_resolve_reviewed_batch_rejects_unknown_user(tmp_path: Path) -> None:
+    roster = tmp_path / "roster.csv"
+    roster.write_text("user_key,active\nAndrew,true\n", encoding="utf-8")
+
+    try:
+        resolve_reviewed_batch(
+            roster_path=roster,
+            hourly_users=["missing"],
+            stipend_users=[],
+        )
+    except ValueError as exc:
+        assert str(exc) == "Unknown active roster user: missing"
+    else:
+        raise AssertionError("Unknown users must not be silently classified")
