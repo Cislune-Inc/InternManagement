@@ -5,8 +5,19 @@ from types import SimpleNamespace
 
 import discord
 
-from agent.admin_commands import AdminCommandRouter, UserDailySnapshot, _AdminMenuView, _pick_highest_priority_task, _split_message
-from agent.admin_console import build_admin_console_registry, parse_admin_input, render_reference_markdown
+from agent.admin_commands import (
+    AdminCommandRouter,
+    UserDailySnapshot,
+    _AdminMenuView,
+    _pick_highest_priority_task,
+    _split_message,
+)
+from agent.admin_console import (
+    AdminActionPreview,
+    build_admin_console_registry,
+    parse_admin_input,
+    render_reference_markdown,
+)
 from agent.interface_intelligence import AdminCommandMatch
 from agent.models import AdminProfile, MessageRecord, SessionState, UserProfile
 
@@ -422,6 +433,79 @@ def test_mutating_command_requires_confirmation_before_execution() -> None:
     assert 999 in router._pending_actions
     assert any("Preview `task.switch`" in content for content, _view in sent)
     assert any(view is not None for _content, view in sent)
+
+
+def test_plain_text_admin_console_runs_read_only_command() -> None:
+    runtime = _build_runtime()
+    router = AdminCommandRouter(runtime)
+    executed: list[tuple[str, dict[str, str]]] = []
+
+    async def fake_execute(_client, command_id: str, args: dict[str, str]) -> str:
+        executed.append((command_id, args))
+        return "Nobody needs attention right now."
+
+    router._execute_command = fake_execute  # type: ignore[method-assign]
+
+    response = asyncio.run(
+        router.handle_plain_text(
+            SimpleNamespace(),
+            999,
+            "run presence.attention",
+        )
+    )
+
+    assert response == "Nobody needs attention right now."
+    assert executed == [("presence.attention", {})]
+
+
+def test_plain_text_admin_console_requires_token_before_mutating() -> None:
+    runtime = _build_runtime()
+    router = AdminCommandRouter(runtime)
+    executed: list[str] = []
+
+    async def fake_preview(command, args):
+        return AdminActionPreview(
+            title=f"Preview `{command.command_id}`",
+            summary="This would send reminders.",
+            command_id=command.command_id,
+            args=args,
+        )
+
+    async def fake_execute(_client, command_id: str, _args: dict[str, str]) -> str:
+        executed.append(command_id)
+        return "Reminders sent."
+
+    router._build_preview = fake_preview  # type: ignore[method-assign]
+    router._execute_command = fake_execute  # type: ignore[method-assign]
+
+    preview = asyncio.run(
+        router.handle_plain_text(
+            SimpleNamespace(),
+            999,
+            "run presence.remind_clock_in",
+        )
+    )
+    request = router._pending_actions[999]
+
+    assert executed == []
+    assert f"confirm {request.token}" in preview
+    wrong_token = asyncio.run(
+        router.handle_plain_text(SimpleNamespace(), 999, "confirm wrong-token")
+    )
+    assert "does not match" in wrong_token
+    assert executed == []
+
+    result = asyncio.run(
+        router.handle_plain_text(
+            SimpleNamespace(),
+            999,
+            f"confirm {request.token}",
+        )
+    )
+
+    assert result == "Reminders sent."
+    assert executed == ["presence.remind_clock_in"]
+    assert 999 not in router._pending_actions
 
 
 def test_debug_reset_workday_requires_confirmation_before_execution() -> None:

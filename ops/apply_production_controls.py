@@ -36,6 +36,31 @@ CONTROL_VALUES: dict[str, dict[str, Any]] = {
     },
 }
 
+ADMIN_SLACK_USER_IDS = {
+    "erik": "U01SWQKDTBM",
+}
+
+
+def _apply_admin_slack_user_ids(payload: dict[str, Any], changed: list[str]) -> None:
+    admins = payload.get("admins")
+    if isinstance(admins, list) and admins:
+        for index, admin in enumerate(admins):
+            if not isinstance(admin, dict):
+                continue
+            normalized_name = str(admin.get("name") or "").strip().lower()
+            slack_user_id = ADMIN_SLACK_USER_IDS.get(normalized_name)
+            if not slack_user_id or admin.get("slack_user_id") == slack_user_id:
+                continue
+            admin["slack_user_id"] = slack_user_id
+            changed.append(f"admins[{index}].slack_user_id")
+        return
+
+    normalized_name = str(payload.get("admin_display_name") or "").strip().lower()
+    slack_user_id = ADMIN_SLACK_USER_IDS.get(normalized_name)
+    if slack_user_id and payload.get("admin_slack_user_id") != slack_user_id:
+        payload["admin_slack_user_id"] = slack_user_id
+        changed.append("admin_slack_user_id")
+
 
 def apply_controls(payload: dict[str, Any]) -> list[str]:
     changed: list[str] = []
@@ -48,6 +73,7 @@ def apply_controls(payload: dict[str, Any]) -> list[str]:
                 continue
             section[key] = value
             changed.append(f"{section_name}.{key}")
+    _apply_admin_slack_user_ids(payload, changed)
     return changed
 
 

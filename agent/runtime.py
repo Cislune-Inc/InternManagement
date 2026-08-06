@@ -207,13 +207,6 @@ _SELF_LOOKUP_STATUS_REQUEST_PATTERNS = {
     "show my current status",
     "show me my current status",
 }
-_MIDDAY_BREAK_ANNOUNCEMENT_SLOTS = (
-    ("12:30", 12, 30),
-    ("13:00", 13, 0),
-)
-_MIDDAY_BREAK_ANNOUNCEMENT_MESSAGE = (
-    "General reminder: if you have not taken lunch or a short break yet, please do that now."
-)
 _AUTO_CLOCK_OUT_NOTIFICATION_MESSAGE = (
     "You were automatically clocked out for inactivity. "
     "If you are still working, message me so I can clock you back in."
@@ -680,6 +673,19 @@ class InternManagementRuntime:
         if not self.config:
             return []
         return list(self.config.admins)
+
+    def admin_profile_by_slack_user_id(self, slack_user_id: str) -> AdminProfile | None:
+        normalized = str(slack_user_id or "").strip()
+        if not normalized:
+            return None
+        return next(
+            (
+                admin
+                for admin in self.admin_profiles()
+                if str(admin.slack_user_id or "").strip() == normalized
+            ),
+            None,
+        )
 
     def primary_admin_profile(self) -> AdminProfile | None:
         admins = self.admin_profiles()
@@ -1241,6 +1247,18 @@ class InternManagementRuntime:
         if not self.config:
             return
         slack_user_id = str(event.get("user") or "").strip()
+        admin = self.admin_profile_by_slack_user_id(slack_user_id)
+        if admin:
+            if not self.slack:
+                logger.error("Cannot answer Slack admin DM because Slack is not configured.")
+                return
+            response = await self.admin_router.handle_plain_text(
+                client,
+                admin.discord_user_id,
+                str(event.get("text") or ""),
+            )
+            await self.slack.post_message(slack_user_id, response)
+            return
         user = self.roster_by_slack_id.get(slack_user_id)
         if not user:
             logger.warning("Ignoring Slack DM from unmapped user %s.", slack_user_id or "unknown")
@@ -2497,49 +2515,6 @@ class InternManagementRuntime:
         await self._send_dm(client, user, session, self.config.prompts.lunch_break_check_in, now)
         session.metadata["lunch_last_prompt_at"] = now.isoformat()
         session.metadata["lunch_resume_requested_at"] = now.isoformat()
-        return True
-
-    def _midday_break_announcement_slot(self, now: datetime) -> str | None:
-        for slot_key, hour, minute in _MIDDAY_BREAK_ANNOUNCEMENT_SLOTS:
-            if now.hour == hour and now.minute == minute:
-                return slot_key
-        return None
-
-    def _sent_midday_break_announcement_slots(self, session: SessionState) -> set[str]:
-        raw = session.metadata.get("midday_break_announcement_slots")
-        if not isinstance(raw, list):
-            return set()
-        return {
-            str(item).strip()
-            for item in raw
-            if isinstance(item, str) and str(item).strip()
-        }
-
-    async def _maybe_send_midday_break_announcement(
-        self,
-        client: discord.Client,
-        user: UserProfile,
-        session: SessionState,
-        now: datetime,
-    ) -> bool:
-        if not session.clocked_in_at or session.clocked_out_at or session.stage == "on_lunch_break":
-            return False
-        slot_key = self._midday_break_announcement_slot(now)
-        if slot_key is None:
-            return False
-        sent_slots = self._sent_midday_break_announcement_slots(session)
-        if slot_key in sent_slots:
-            return False
-        await self._send_dm(
-            client,
-            user,
-            session,
-            _MIDDAY_BREAK_ANNOUNCEMENT_MESSAGE,
-            now,
-        )
-        sent_slots.add(slot_key)
-        session.metadata["midday_break_announcement_slots"] = sorted(sent_slots)
-        session.metadata["last_midday_break_announcement_at"] = now.isoformat()
         return True
 
     def _default_progress_probe_questions(self) -> list[str]:

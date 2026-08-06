@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 
 
 _MAX_DISCORD_MESSAGE = 1900
+_MAX_SLACK_MESSAGE = 35000
 
 
 @dataclass(slots=True)
@@ -447,6 +448,107 @@ class AdminCommandRouter:
             return True
         finally:
             self._active_admin_user_id = None
+
+    async def handle_plain_text(
+        self,
+        client: discord.Client,
+        admin_user_id: int,
+        text: str,
+    ) -> str:
+        """Run the admin console without Discord-specific menus or buttons."""
+        raw = (text or "").strip()
+        lowered = raw.lower()
+        self._active_admin_user_id = admin_user_id
+        try:
+            if lowered == "confirm" or lowered.startswith("confirm "):
+                result = await self._confirm_plain_text_action(
+                    client,
+                    admin_user_id,
+                    raw,
+                )
+                return result[:_MAX_SLACK_MESSAGE]
+
+            parsed = parse_admin_input(raw, self.registry)
+            if parsed.kind == "help_root":
+                return render_root_help(self.registry)[:_MAX_SLACK_MESSAGE]
+            if parsed.kind == "help_group" and parsed.group_id:
+                return render_group_help(self.registry, parsed.group_id)[:_MAX_SLACK_MESSAGE]
+            if parsed.kind == "flow":
+                return (
+                    "Admin console flow:\n\n"
+                    + render_flow(self.registry)
+                    + "\n\nUse `help` to browse commands."
+                )[:_MAX_SLACK_MESSAGE]
+            if parsed.kind in {"home", "back"}:
+                return render_root_help(self.registry)[:_MAX_SLACK_MESSAGE]
+            if parsed.kind == "cancel":
+                pending = self._pending_actions.pop(admin_user_id, None)
+                if pending:
+                    return f"Cancelled `{pending.command_id}`."
+                return "There is no pending admin action to cancel."
+            if parsed.kind == "invalid":
+                config = getattr(self.runtime, "config", None)
+                if (
+                    config
+                    and getattr(config, "admin_console", None)
+                    and config.admin_console.enable_ai_fallback
+                ):
+                    response = await self._admin_ai_fallback_response(parsed.raw)
+                    if response:
+                        return response[:_MAX_SLACK_MESSAGE]
+                return (
+                    (parsed.error or "I could not parse that command.")
+                    + "\n\n"
+                    + self._grammar_hint()
+                )[:_MAX_SLACK_MESSAGE]
+            if parsed.kind == "run" and parsed.command_id:
+                command = self.registry.command(parsed.command_id)
+                if not command:
+                    return f"I do not know the command `{parsed.command_id}`."
+                if command.confirm_required and not command.read_only:
+                    preview = await self._build_preview(command, parsed.args)
+                    request = AdminActionRequest(
+                        token=self._new_token(),
+                        admin_user_id=admin_user_id,
+                        command_id=parsed.command_id,
+                        args=parsed.args,
+                        preview=preview,
+                    )
+                    self._pending_actions[admin_user_id] = request
+                    return (
+                        self._format_preview(preview)
+                        + f"\n\nReply `confirm {request.token}` to run it, or `cancel`."
+                    )[:_MAX_SLACK_MESSAGE]
+                result = await self._execute_command(
+                    client,
+                    parsed.command_id,
+                    parsed.args,
+                )
+                return result[:_MAX_SLACK_MESSAGE]
+            return self._grammar_hint()[:_MAX_SLACK_MESSAGE]
+        finally:
+            self._active_admin_user_id = None
+
+    async def _confirm_plain_text_action(
+        self,
+        client: discord.Client,
+        admin_user_id: int,
+        text: str,
+    ) -> str:
+        request = self._pending_actions.get(admin_user_id)
+        if not request:
+            return "There is no pending admin action to confirm."
+        if not self._is_pending_action_valid(admin_user_id, request.token):
+            self._pending_actions.pop(admin_user_id, None)
+            return "That confirmation expired. Run the command again if you still want to do it."
+        parts = text.split()
+        supplied_token = parts[1].strip() if len(parts) == 2 else ""
+        if not supplied_token:
+            return f"Include the confirmation token: `confirm {request.token}`."
+        if supplied_token != request.token:
+            return "That confirmation token does not match the pending action. Nothing was changed."
+        self._pending_actions.pop(admin_user_id, None)
+        return await self._execute_command(client, request.command_id, request.args)
 
     async def _send_root_menu(self, client: discord.Client, admin_user_id: int) -> None:
         state = self._new_menu_state(admin_user_id, "root")

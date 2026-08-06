@@ -179,6 +179,12 @@ Don Pollo can run the same clock-in, task selection, ClickUp timer, lunch, statu
 
 The optional roster policy columns are documented in `config_templates/roster.example.csv`. Existing workers default to the current intern-style workflow. `worker_type`, compliance flags, task-aware check-in overrides, Gusto UUIDs, and local labor cost rates only change behavior when explicitly configured.
 
+### Slack Admin Beta
+
+A configured admin can use the deterministic admin console by DMing the Don Pollo Slack app. Add the admin's Slack member ID as `slack_user_id` in the `admins` list in `config/agent.config.json`; do not add the admin to the worker roster. The same `help`, `flow`, and `run <command-id> ...` grammar works in Slack. Read-only commands return immediately. Commands that send messages or change state return a preview and require the exact `confirm <token>` reply; `cancel` abandons the pending action.
+
+Slack admin DMs use the same Socket Mode connection as Slack-only workers, so `SLACK_APP_TOKEN` with `connections:write` and the `message.im` event subscription are required. The production controls map Erik's configured admin profile to Slack member `U01SWQKDTBM` for the beta.
+
 ## Monday Payroll And Project Labor
 
 Generate an approval-first bundle for the prior completed week:
@@ -404,7 +410,7 @@ from silently deleting historical evidence.
 
 ## Admin Console
 
-The admin Discord user ID from `agent.config.json` can DM the bot directly with:
+Any configured admin can DM the bot through Discord, or use the Slack admin beta when their admin profile includes a `slack_user_id`, with:
 
 - `help` or `menu`
 - `flow`

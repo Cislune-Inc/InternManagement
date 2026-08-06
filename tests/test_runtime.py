@@ -389,6 +389,56 @@ def test_slack_only_worker_receives_runtime_dm_through_slack() -> None:
     assert session.last_outbound_at == "2026-07-28T10:00:00-07:00"
 
 
+def test_slack_admin_dm_uses_admin_console_without_worker_roster_entry() -> None:
+    runtime = _build_runtime(
+        admins=[
+            AdminProfile(
+                name="Erik",
+                discord_user_id=999,
+                slack_user_id="U01SWQKDTBM",
+            )
+        ]
+    )
+    posted: list[tuple[str, str]] = []
+    routed: list[tuple[int, str]] = []
+
+    async def refresh_configuration(*_args, **_kwargs):
+        return None
+
+    async def handle_plain_text(_client, admin_user_id: int, text: str) -> str:
+        routed.append((admin_user_id, text))
+        return "Admin beta console ready."
+
+    async def post_message(channel_id: str, message: str) -> dict[str, str]:
+        posted.append((channel_id, message))
+        return {"channel": "DADMIN", "ts": "1.234"}
+
+    runtime.refresh_configuration = refresh_configuration  # type: ignore[method-assign]
+    runtime.admin_router = SimpleNamespace(handle_plain_text=handle_plain_text)
+    runtime.slack = SimpleNamespace(post_message=post_message)
+    runtime.roster_by_slack_id = {
+        "U01SWQKDTBM": UserProfile(
+            user_key="should-not-be-used",
+            display_name="Worker Collision",
+            slack_user_id="U01SWQKDTBM",
+        )
+    }
+
+    asyncio.run(
+        runtime.handle_slack_direct_message(
+            SimpleNamespace(),
+            {
+                "user": "U01SWQKDTBM",
+                "text": "run presence.attention",
+                "ts": "1785859200.0",
+            },
+        )
+    )
+
+    assert routed == [(999, "run presence.attention")]
+    assert posted == [("U01SWQKDTBM", "Admin beta console ready.")]
+
+
 def test_meal_compliance_auto_pauses_worker_and_notifies_admin_at_five_hours() -> None:
     runtime = _build_runtime()
     user_messages: list[str] = []
@@ -436,6 +486,55 @@ def test_meal_compliance_auto_pauses_worker_and_notifies_admin_at_five_hours() -
     assert [event["event_type"] for event in session.metadata["compliance_events"]] == [
         "meal_auto_paused",
     ]
+
+
+def test_meal_compliance_auto_pause_notifies_slack_only_worker() -> None:
+    runtime = _build_runtime()
+    posted: list[tuple[str, str]] = []
+
+    async def post_message(channel_id: str, message: str) -> dict[str, str]:
+        posted.append((channel_id, message))
+        return {"channel": "D123", "ts": str(len(posted))}
+
+    async def safe_admin_notice(*_args, **_kwargs):
+        return None
+
+    runtime.slack = SimpleNamespace(post_message=post_message)
+    runtime._safe_send_compliance_admin_notice = safe_admin_notice  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="sam",
+        display_name="Sam",
+        slack_user_id="U123",
+        preferred_transport="slack",
+        meal_tracking_required=True,
+    )
+    session = SessionState(
+        user_key="sam",
+        session_date="2026-07-28",
+        stage="active",
+        clocked_in_at="2026-07-28T09:00:00-07:00",
+        work_segments=[
+            {
+                "clocked_in_at": "2026-07-28T09:00:00-07:00",
+                "clocked_out_at": None,
+            }
+        ],
+    )
+
+    changed = asyncio.run(
+        runtime._maybe_check_meal_compliance(
+            SimpleNamespace(),
+            user,
+            session,
+            datetime.fromisoformat("2026-07-28T14:00:00-07:00"),
+        )
+    )
+
+    assert changed is True
+    assert session.stage == "on_lunch_break"
+    assert len(posted) == 1
+    assert posted[0][0] == "U123"
+    assert "automatically paused your work time" in posted[0][1]
 
 
 def test_meal_compliance_sends_direct_warning_before_auto_pause() -> None:
@@ -521,6 +620,63 @@ def test_overtime_compliance_auto_clocks_out_at_limit() -> None:
     assert any("Overtime automatic clock-out" in message for message in admin_messages)
     assert session.clocked_out_at == "2026-07-28T17:01:00-07:00"
     assert session.stage == "clocked_out"
+
+
+def test_overtime_compliance_auto_clock_out_notifies_slack_only_worker() -> None:
+    runtime = _build_runtime()
+    posted: list[tuple[str, str]] = []
+
+    async def post_message(channel_id: str, message: str) -> dict[str, str]:
+        posted.append((channel_id, message))
+        return {"channel": "D123", "ts": str(len(posted))}
+
+    async def safe_admin_notice(*_args, **_kwargs):
+        return None
+
+    async def finalize_day(*_args, **_kwargs):
+        return None
+
+    def refresh_summary(session: SessionState, _now: datetime) -> None:
+        session.time_summary["clocked_in_total_seconds"] = 8 * 60 * 60
+
+    runtime.slack = SimpleNamespace(post_message=post_message)
+    runtime._safe_send_compliance_admin_notice = safe_admin_notice  # type: ignore[method-assign]
+    runtime._finalize_clickup_day = finalize_day  # type: ignore[method-assign]
+    runtime._refresh_session_time_summary = refresh_summary  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="sam",
+        display_name="Sam",
+        slack_user_id="U123",
+        preferred_transport="slack",
+        overtime_approval_required=True,
+    )
+    session = SessionState(
+        user_key="sam",
+        session_date="2026-07-28",
+        stage="active",
+        clocked_in_at="2026-07-28T09:00:00-07:00",
+        work_segments=[
+            {
+                "clocked_in_at": "2026-07-28T09:00:00-07:00",
+                "clocked_out_at": None,
+            }
+        ],
+    )
+
+    changed = asyncio.run(
+        runtime._maybe_check_overtime_compliance(
+            SimpleNamespace(),
+            user,
+            session,
+            datetime.fromisoformat("2026-07-28T17:00:00-07:00"),
+        )
+    )
+
+    assert changed is True
+    assert session.stage == "clocked_out"
+    assert len(posted) == 1
+    assert posted[0][0] == "U123"
+    assert "automatically clocked you out" in posted[0][1]
 
 
 def test_overtime_compliance_warns_before_limit_without_clocking_out() -> None:
@@ -2311,130 +2467,6 @@ def test_scheduler_tick_continues_after_one_user_failure(caplog) -> None:
     assert "Scheduler tick failed for user broken (Broken User)" in caplog.text
 
 
-def test_scheduler_tick_skips_midday_break_announcement_on_non_workday() -> None:
-    runtime = _build_runtime()
-    user = UserProfile(
-        user_key="andrew",
-        display_name="Andrew",
-        discord_user_id=1,
-        discord_username="andrew",
-        storage_folder_name="AndrewOre",
-    )
-    session = SessionState(
-        user_key="andrew",
-        session_date="2026-06-06",
-        stage="active",
-        clocked_in_at="2026-06-06T09:00:00-07:00",
-    )
-    fixed_now = datetime.fromisoformat("2026-06-06T12:30:00-07:00")
-    break_attempts: list[str] = []
-
-    async def fake_false(*_args, **_kwargs):
-        return False
-
-    async def fake_break(_client, current_user, _session, _now):
-        break_attempts.append(current_user.user_key)
-        return True
-
-    async def fake_dashboard():
-        return None
-
-    runtime.roster_by_key = {user.user_key: user}
-    runtime.get_user_session_for_moment = lambda current_user, moment=None: (session, fixed_now)  # type: ignore[method-assign]
-    runtime._maybe_send_clock_in = fake_false  # type: ignore[method-assign]
-    runtime._maybe_auto_clock_out_inactive = fake_false  # type: ignore[method-assign]
-    runtime._maybe_prompt_task_onboarding = fake_false  # type: ignore[method-assign]
-    runtime._maybe_send_midday_break_announcement = fake_break  # type: ignore[method-assign]
-    runtime._maybe_send_lunch_break_check_in = fake_false  # type: ignore[method-assign]
-    runtime._maybe_assess_pending_follow_up_probe = fake_false  # type: ignore[method-assign]
-    runtime._maybe_timeout_progress_probe = fake_false  # type: ignore[method-assign]
-    runtime._maybe_send_follow_up = fake_false  # type: ignore[method-assign]
-    runtime._maybe_alert_admin = fake_false  # type: ignore[method-assign]
-    runtime._maybe_flush_clickup = fake_false  # type: ignore[method-assign]
-    runtime.write_dashboard = fake_dashboard  # type: ignore[method-assign]
-
-    asyncio.run(runtime.scheduler_tick(SimpleNamespace()))
-
-    assert break_attempts == []
-
-
-def test_scheduler_tick_does_not_send_fixed_midday_break_announcements() -> None:
-    runtime = _build_runtime()
-    west = UserProfile(
-        user_key="west",
-        display_name="West User",
-        discord_user_id=1,
-        discord_username="west",
-        storage_folder_name="WestUser",
-        timezone="America/Los_Angeles",
-    )
-    east = UserProfile(
-        user_key="east",
-        display_name="East User",
-        discord_user_id=2,
-        discord_username="east",
-        storage_folder_name="EastUser",
-        timezone="America/New_York",
-    )
-    sessions = {
-        west.user_key: SessionState(
-            user_key="west",
-            session_date="2026-06-03",
-            stage="active",
-            clocked_in_at="2026-06-03T09:00:00-07:00",
-        ),
-        east.user_key: SessionState(
-            user_key="east",
-            session_date="2026-06-03",
-            stage="awaiting_admin_review",
-            clocked_in_at="2026-06-03T09:00:00-04:00",
-        ),
-    }
-    local_nows = {
-        west.user_key: datetime.fromisoformat("2026-06-03T12:30:00-07:00"),
-        east.user_key: datetime.fromisoformat("2026-06-03T13:00:00-04:00"),
-    }
-    break_attempts: list[tuple[str, str]] = []
-    persisted: list[tuple[str, list[str]]] = []
-
-    async def fake_false(*_args, **_kwargs):
-        return False
-
-    async def fake_break(_client, current_user, _session, current_now):
-        break_attempts.append((current_user.user_key, current_now.isoformat()))
-        return True
-
-    async def fake_persist(user, _session, *, now, previous_session, trigger, details):
-        del now, previous_session, trigger
-        persisted.append((user.user_key, list(details["reasons"])))
-        return True
-
-    async def fake_dashboard():
-        return None
-
-    runtime.roster_by_key = {west.user_key: west, east.user_key: east}
-    runtime.get_user_session_for_moment = lambda current_user, moment=None: (sessions[current_user.user_key], local_nows[current_user.user_key])  # type: ignore[method-assign]
-    runtime._maybe_send_clock_in = fake_false  # type: ignore[method-assign]
-    runtime._maybe_auto_clock_out_inactive = fake_false  # type: ignore[method-assign]
-    runtime._maybe_prompt_task_onboarding = fake_false  # type: ignore[method-assign]
-    runtime._maybe_send_midday_break_announcement = fake_break  # type: ignore[method-assign]
-    runtime._maybe_send_lunch_break_check_in = fake_false  # type: ignore[method-assign]
-    runtime._maybe_assess_pending_follow_up_probe = fake_false  # type: ignore[method-assign]
-    runtime._maybe_timeout_progress_probe = fake_false  # type: ignore[method-assign]
-    runtime._maybe_send_follow_up = fake_false  # type: ignore[method-assign]
-    runtime._maybe_alert_admin = fake_false  # type: ignore[method-assign]
-    runtime._maybe_flush_clickup = fake_false  # type: ignore[method-assign]
-    runtime._persist_session_state = fake_persist  # type: ignore[method-assign]
-    runtime.write_dashboard = fake_dashboard  # type: ignore[method-assign]
-
-    asyncio.run(runtime.scheduler_tick(SimpleNamespace()))
-
-    assert break_attempts == []
-    assert all(
-        "sent_break_announcement" not in reasons for _user_key, reasons in persisted
-    )
-
-
 def test_refresh_configuration_filters_inactive_roster_users() -> None:
     runtime = InternManagementRuntime.__new__(InternManagementRuntime)
     runtime.bootstrap = SimpleNamespace(default_timezone="America/Los_Angeles")
@@ -2625,133 +2657,6 @@ def test_runtime_lunch_break_check_in_uses_follow_up_interval() -> None:
     assert changed is True
     assert sent == [runtime.config.prompts.lunch_break_check_in]
     assert session.metadata["lunch_resume_requested_at"] == "2026-05-28T12:31:00"
-
-
-def test_runtime_midday_break_announcement_sends_at_1230_for_clocked_in_session() -> None:
-    runtime = _build_runtime()
-    sent: list[str] = []
-
-    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
-        del view
-        sent.append(content)
-
-    runtime._send_dm = fake_send  # type: ignore[method-assign]
-    user = UserProfile(
-        user_key="andrew",
-        display_name="Andrew",
-        discord_user_id=1,
-        discord_username="andrew",
-        storage_folder_name="AndrewOre",
-    )
-    session = SessionState(
-        user_key="andrew",
-        session_date="2026-05-28",
-        stage="active",
-        clocked_in_at="2026-05-28T09:00:00",
-    )
-
-    changed = asyncio.run(
-        runtime._maybe_send_midday_break_announcement(
-            SimpleNamespace(),
-            user,
-            session,
-            datetime.fromisoformat("2026-05-28T12:30:00"),
-        )
-    )
-
-    assert changed is True
-    assert sent == ["General reminder: if you have not taken lunch or a short break yet, please do that now."]
-    assert session.metadata["midday_break_announcement_slots"] == ["12:30"]
-    assert session.metadata["last_midday_break_announcement_at"] == "2026-05-28T12:30:00"
-
-
-def test_runtime_midday_break_announcement_sends_at_1300_once_for_clocked_in_non_active_stage() -> None:
-    runtime = _build_runtime()
-    sent: list[str] = []
-
-    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
-        del view
-        sent.append(content)
-
-    runtime._send_dm = fake_send  # type: ignore[method-assign]
-    user = UserProfile(
-        user_key="andrew",
-        display_name="Andrew",
-        discord_user_id=1,
-        discord_username="andrew",
-        storage_folder_name="AndrewOre",
-    )
-    session = SessionState(
-        user_key="andrew",
-        session_date="2026-05-28",
-        stage="awaiting_admin_review",
-        clocked_in_at="2026-05-28T09:00:00",
-    )
-
-    first_changed = asyncio.run(
-        runtime._maybe_send_midday_break_announcement(
-            SimpleNamespace(),
-            user,
-            session,
-            datetime.fromisoformat("2026-05-28T13:00:00"),
-        )
-    )
-    second_changed = asyncio.run(
-        runtime._maybe_send_midday_break_announcement(
-            SimpleNamespace(),
-            user,
-            session,
-            datetime.fromisoformat("2026-05-28T13:00:00"),
-        )
-    )
-
-    assert first_changed is True
-    assert second_changed is False
-    assert sent == ["General reminder: if you have not taken lunch or a short break yet, please do that now."]
-    assert session.metadata["midday_break_announcement_slots"] == ["13:00"]
-
-
-def test_runtime_midday_break_announcement_skips_ineligible_sessions() -> None:
-    runtime = _build_runtime()
-    sent: list[str] = []
-
-    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
-        del view
-        sent.append(content)
-
-    runtime._send_dm = fake_send  # type: ignore[method-assign]
-    user = UserProfile(
-        user_key="andrew",
-        display_name="Andrew",
-        discord_user_id=1,
-        discord_username="andrew",
-        storage_folder_name="AndrewOre",
-    )
-    now = datetime.fromisoformat("2026-05-28T12:30:00")
-    sessions = [
-        SessionState(user_key="andrew", session_date="2026-05-28", stage="awaiting_clock_in"),
-        SessionState(
-            user_key="andrew",
-            session_date="2026-05-28",
-            stage="clocked_out",
-            clocked_in_at="2026-05-28T09:00:00",
-            clocked_out_at="2026-05-28T12:00:00",
-        ),
-        SessionState(
-            user_key="andrew",
-            session_date="2026-05-28",
-            stage="on_lunch_break",
-            clocked_in_at="2026-05-28T09:00:00",
-        ),
-    ]
-
-    results = [
-        asyncio.run(runtime._maybe_send_midday_break_announcement(SimpleNamespace(), user, session, now))
-        for session in sessions
-    ]
-
-    assert results == [False, False, False]
-    assert sent == []
 
 
 def test_runtime_ambiguous_lunch_mention_prompts_for_confirmation() -> None:
