@@ -425,22 +425,32 @@ def test_slack_admin_dm_uses_admin_console_without_worker_roster_entry() -> None
         )
     }
 
-    asyncio.run(
-        runtime.handle_slack_direct_message(
-            SimpleNamespace(),
-            {
-                "user": "U01SWQKDTBM",
-                "text": (
-                    "run presence.attention\n"
-                    "*Sent using* <@U0BATRYF16C|ChatGPT>"
-                ),
-                "ts": "1785859200.0",
-            },
+    for attribution in (
+        "<@U0BATRYF16C>",
+        "<@U0BATRYF16C|ChatGPT>",
+    ):
+        asyncio.run(
+            runtime.handle_slack_direct_message(
+                SimpleNamespace(),
+                {
+                    "user": "U01SWQKDTBM",
+                    "text": (
+                        "run presence.attention\n"
+                        f"*Sent using* {attribution}"
+                    ),
+                    "ts": "1785859200.0",
+                },
+            )
         )
-    )
 
-    assert routed == [(999, "run presence.attention")]
-    assert posted == [("U01SWQKDTBM", "Admin beta console ready.")]
+    assert routed == [
+        (999, "run presence.attention"),
+        (999, "run presence.attention"),
+    ]
+    assert posted == [
+        ("U01SWQKDTBM", "Admin beta console ready."),
+        ("U01SWQKDTBM", "Admin beta console ready."),
+    ]
 
 
 def test_short_rest_stays_paid_and_requires_return_check_in() -> None:

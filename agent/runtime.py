@@ -78,8 +78,11 @@ _TASK_REVIEW_CANCEL_HINTS = (
 _BLOCKER_STATE_KEY = "blocker_state"
 _BLOCKER_HELP_DECISION_AT_KEY = "blocker_help_decision_at"
 _PENDING_FOLLOW_UP_KEY = "pending_follow_up"
+# Slack events keep mentions as ``<@USER_ID>`` while history readers may enrich
+# the same mention as ``<@USER_ID|ChatGPT>``.  Match either representation of
+# the connector-added footer, but only when it is the final line of an admin DM.
 _SLACK_CHATGPT_ATTRIBUTION_RE = re.compile(
-    r"\s*\n+\*Sent using\*\s+<@[^>]+\|ChatGPT>\s*$",
+    r"\s*\n+\*Sent using\*\s+<@[^>\r\n]+>\s*$",
     flags=re.IGNORECASE,
 )
 _FOLLOW_UP_RESPONSE_AGGREGATION_KEY = "follow_up_response_aggregation"
