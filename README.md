@@ -374,7 +374,7 @@ from silently deleting historical evidence.
 - Can warn and auto-clock out an inactive worker after the configured interval, stopping the local task timer, putting the active ClickUp task on `hold`, and preserving tracked time in the daily log.
 - Keeps overnight activity in the existing `YYYY-MM-DD` folder layout by using a per-user local workday rollover, so work before `03:30` stays in the previous day's folder.
 - Supports multiple clock-in / clock-out segments inside one local workday bucket without re-running the full morning intake every time.
-- Can suggest likely unassigned Mission Board tasks for the next day based on priority plus overlap with the intern's current work context.
+- Can suggest likely unassigned tasks across every Space in the configured ClickUp workspace, showing Space / Folder / List context and ranking options by status, priority, and overlap with the worker's current project context. Assigned tasks remain preferred; choosing an unassigned workspace option assigns it only after the worker confirms the match.
 - Optionally attaches newly received files to the inferred or pinned ClickUp task.
 - Flushes new developments into ClickUp after 10 minutes of user inactivity.
 
@@ -390,7 +390,7 @@ from silently deleting historical evidence.
 - `clickup_task_id` and `clickup_list_id` are no longer supported roster columns. Per-user task/list overrides were removed so task selection stays runtime-driven.
 - `admins` in `agent.config.json` is the preferred way to define named admins for DM escalation and admin-targeted stuck-help prompts. The legacy `admin_discord_user_id` value is still used as the primary fallback.
 - If you want the bot to assign ClickUp tasks directly to an admin, include that admin's `clickup_user_id` or `clickup_user_email` in `admins`. The runtime can also attempt a workspace-member lookup by name, but explicit IDs are more reliable.
-- `clickup.mission_board_list_id` should point at the List where new blocker tasks and next-task suggestions should come from.
+- `clickup.mission_board_list_id` should point at the default List for newly approved top-level and blocker tasks. Existing-task suggestions scan the full configured ClickUp workspace rather than only this List.
 - `slack.enabled` defaults to `false`. When enabling it, configure `SLACK_BOT_TOKEN`, roster `slack_user_id` values, and `slack.project_routes` so updates go to the correct project channels. Use `slack.unmapped_channel_id` for mapping-review posts when a ClickUp task is not confidently routed.
 - ClickUp's assignee timer APIs are permission-sensitive. The bot will query/start assignee-linked timers when allowed by the token and workspace, and otherwise it falls back to local running-timer state plus synced closed time entries.
 - `schedule.auto_clock_out_after_hours` controls when a clocked-in but silent worker is treated as clocked out automatically. `schedule.auto_clock_out_warning_minutes` controls the stateful warning lead time. The production recommendation is `1` hour with a `15` minute warning.

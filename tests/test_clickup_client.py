@@ -561,7 +561,7 @@ def test_create_task_repairs_missing_assignees_after_create() -> None:
 def test_suggest_next_tasks_prefers_unassigned_priority_matches() -> None:
     client = FakeClickUpClient(
         {
-            ("GET", "/list/mission-board/task"): {
+            ("GET", "/team/9011286053/task"): {
                 "tasks": [
                     {
                         "id": "task-1",
@@ -570,6 +570,9 @@ def test_suggest_next_tasks_prefers_unassigned_priority_matches() -> None:
                         "assignees": [],
                         "status": {"status": "to do", "type": "open"},
                         "priority": {"priority": "high"},
+                        "space": {"id": "ops", "name": "Company Operations"},
+                        "folder": {"id": "shop", "name": "Shop Improvements"},
+                        "list": {"id": "cleanup", "name": "Cleanup"},
                     },
                     {
                         "id": "task-2",
@@ -578,6 +581,9 @@ def test_suggest_next_tasks_prefers_unassigned_priority_matches() -> None:
                         "assignees": [],
                         "status": {"status": "to do", "type": "open"},
                         "priority": {"priority": "urgent"},
+                        "space": {"id": "projects", "name": "Flight Projects"},
+                        "folder": {"id": "perdex", "name": "PERDEX"},
+                        "list": {"id": "hardware", "name": "Hardware"},
                     },
                     {
                         "id": "task-3",
@@ -615,6 +621,53 @@ def test_suggest_next_tasks_prefers_unassigned_priority_matches() -> None:
     ]
     suggestions = asyncio.run(client.suggest_next_tasks(user, session, messages, limit=2))
     assert [task["id"] for task in suggestions] == ["task-2", "task-1"]
+    assert all(task["_don_pollo_workspace_option"] is True for task in suggestions)
+    assert client.task_location_label(suggestions[0]) == "Flight Projects / PERDEX / Hardware"
+    assert any(
+        call[0:2] == ("GET", "/team/9011286053/task")
+        for call in client.calls
+    )
+
+
+def test_list_workspace_tasks_paginates_across_space_results() -> None:
+    class PagedClient(ClickUpClient):
+        def __init__(self) -> None:
+            super().__init__("token", _build_config())
+            self.pages: list[int] = []
+
+        def _request(self, method: str, path: str, *, params=None, json=None) -> dict:
+            del json
+            assert method == "GET"
+            assert path == "/team/9011286053/task"
+            page = int((params or {}).get("page") or 0)
+            self.pages.append(page)
+            if page == 0:
+                return {
+                    "tasks": [
+                        {
+                            "id": f"intern-{index}",
+                            "name": f"Intern task {index}",
+                            "space": {"name": "Interns"},
+                        }
+                        for index in range(100)
+                    ]
+                }
+            return {
+                "tasks": [
+                    {
+                        "id": "company-overhead",
+                        "name": "Organize the fabrication shop",
+                        "space": {"name": "Company Operations"},
+                    }
+                ]
+            }
+
+    client = PagedClient()
+    tasks = asyncio.run(client.list_workspace_tasks(limit=250, include_closed=False))
+
+    assert len(tasks) == 101
+    assert tasks[-1]["id"] == "company-overhead"
+    assert client.pages == [0, 1]
 
 
 def test_resolve_task_for_user_matches_by_name_and_id() -> None:

@@ -3707,6 +3707,172 @@ def test_runtime_task_selection_prompt_renders_hierarchy_tree_and_create_escape_
     assert "Reply with the name or ID of an `[assigned]` task" in prompt
 
 
+def test_runtime_task_selection_prompt_shows_ranked_options_across_clickup_spaces() -> None:
+    runtime = _build_runtime()
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28")
+
+    async def fake_list_assigned_tasks(_user, limit=8):
+        del _user, limit
+        return []
+
+    async def fake_suggest_next_tasks(_user, _session, _messages, *, exclude_task_ids=None, limit=3):
+        del _user, _session, _messages, exclude_task_ids, limit
+        return [
+            {
+                "id": "company-overhead",
+                "name": "Organize the fabrication shop",
+                "priority": {"priority": "high"},
+                "space": {"name": "Company Operations"},
+                "folder": {"name": "Shop Improvements"},
+                "list": {"id": "shop-list", "name": "Overhead"},
+                "_don_pollo_workspace_option": True,
+            },
+            {
+                "id": "flight-harness",
+                "name": "Validate the PERDEX harness",
+                "priority": {"priority": "normal"},
+                "space": {"name": "Flight Projects"},
+                "list": {"id": "hardware-list", "name": "Hardware"},
+                "_don_pollo_workspace_option": True,
+            },
+        ]
+
+    runtime.clickup = SimpleNamespace(
+        list_assigned_tasks=fake_list_assigned_tasks,
+        suggest_next_tasks=fake_suggest_next_tasks,
+        task_location_label=lambda task: " / ".join(
+            str(task[key]["name"])
+            for key in ("space", "folder", "list")
+            if isinstance(task.get(key), dict) and task[key].get("name")
+        ),
+    )
+
+    context = asyncio.run(runtime._task_selection_context(user, session))
+
+    assert "Other open options across ClickUp spaces" in context["message"]
+    assert "Company Operations / Shop Improvements / Overhead" in context["message"]
+    assert "Flight Projects / Hardware" in context["message"]
+    assert "company-overhead" in context["message"]
+    assert "[recommended]" in context["message"]
+    assert {item["id"] for item in context["candidate_tasks"]} == {
+        "company-overhead",
+        "flight-harness",
+    }
+
+
+def test_runtime_confirmed_workspace_option_is_assigned_before_onboarding() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+    assigned: list[str] = []
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(
+        user_key="andrew",
+        session_date="2026-05-28",
+        stage="awaiting_task_selection",
+    )
+    prompt = {
+        "type": "task_onboarding",
+        "source": "daily_clock_in",
+        "step": "select_task",
+        "draft": {},
+    }
+    option = {
+        "id": "company-overhead",
+        "name": "Organize the fabrication shop",
+        "assignees": [],
+        "space": {"name": "Company Operations"},
+        "list": {"id": "shop-list", "name": "Overhead"},
+        "_don_pollo_workspace_option": True,
+    }
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del _client, _user, _session, _now, view
+        sent.append(content)
+
+    async def fake_resolve_assigned(_user, _hint, *, include_mission_board=False):
+        del _user, _hint, include_mission_board
+        return None
+
+    async def fake_suggest(_user, _session, _messages, *, exclude_task_ids=None, limit=8):
+        del _user, _session, _messages, exclude_task_ids, limit
+        return [option]
+
+    async def fake_get_task(task_id: str):
+        assert task_id == "company-overhead"
+        return dict(option)
+
+    async def fake_assign(task, _user):
+        assigned.append(str(task["id"]))
+        return True
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    runtime.clickup = SimpleNamespace(
+        resolve_task_for_user=fake_resolve_assigned,
+        suggest_next_tasks=fake_suggest,
+        match_task_hint=lambda tasks, hint: tasks[0] if "shop" in hint.lower() else None,
+        get_task=fake_get_task,
+        ensure_task_assigned_to_user=fake_assign,
+    )
+
+    selected = asyncio.run(
+        runtime._handle_task_onboarding_prompt(
+            object(),
+            user,
+            session,
+            MessageRecord(
+                message_id="choose",
+                direction="inbound",
+                author_id=1,
+                created_at=datetime.fromisoformat("2026-05-28T09:00:00"),
+                content="shop cleanup",
+                attachments=[],
+            ),
+            datetime.fromisoformat("2026-05-28T09:00:00"),
+            prompt,
+        )
+    )
+    assert selected is True
+    assert prompt["candidate_workspace_option"] is True
+    assert assigned == []
+
+    confirmed = asyncio.run(
+        runtime._handle_task_onboarding_prompt(
+            object(),
+            user,
+            session,
+            MessageRecord(
+                message_id="confirm",
+                direction="inbound",
+                author_id=1,
+                created_at=datetime.fromisoformat("2026-05-28T09:01:00"),
+                content="yes",
+                attachments=[],
+            ),
+            datetime.fromisoformat("2026-05-28T09:01:00"),
+            prompt,
+        )
+    )
+
+    assert confirmed is True
+    assert assigned == ["company-overhead"]
+    assert prompt["task_id"] == "company-overhead"
+    assert prompt["step"] == "plan"
+    assert any("Organize the fabrication shop" in message for message in sent)
+
+
 def test_runtime_task_onboarding_create_task_request_starts_creation_flow() -> None:
     runtime = _build_runtime()
     sent: list[str] = []

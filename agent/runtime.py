@@ -1581,6 +1581,18 @@ class InternManagementRuntime:
         session.last_follow_up_at = None
         tasks = await self.clickup.list_assigned_tasks(user, limit=8) if self.clickup else []
         recommended_task = self.clickup.pick_highest_priority_task(tasks) if self.clickup else None
+        if (
+            not recommended_task
+            and self.clickup
+            and hasattr(self.clickup, "suggest_next_tasks")
+        ):
+            workspace_options = await self.clickup.suggest_next_tasks(
+                user,
+                session,
+                self.list_session_messages(user.user_key, session),
+                limit=3,
+            )
+            recommended_task = workspace_options[0] if workspace_options else None
         prompt: dict[str, Any] = {
             "type": "task_onboarding",
             "source": source,
@@ -1591,6 +1603,8 @@ class InternManagementRuntime:
         if recommended_task:
             prompt["recommended_task_id"] = str(recommended_task.get("id") or "")
             prompt["recommended_task_name"] = str(recommended_task.get("name") or "")
+            if recommended_task.get("_don_pollo_workspace_option"):
+                prompt["recommended_workspace_option"] = True
         session.metadata[_CLICKUP_PROMPT_KEY] = prompt
         session.metadata["last_task_onboarding_prompt_at"] = now.isoformat()
         await self._send_dm(
@@ -1623,21 +1637,27 @@ class InternManagementRuntime:
             recommendation_id = str(recommendation.get("id") or "unknown")
             recommendation_name = str(recommendation.get("name") or "Unnamed task")
             recommendation_priority = (recommendation.get("priority") or {}).get("priority") or "none"
+            is_workspace_option = bool(recommendation.get("_don_pollo_workspace_option"))
+            recommendation_basis = (
+                "It is my best open option across the configured ClickUp workspace, ranked by project-context overlap, status, and priority."
+                if is_workspace_option
+                else "It is the highest-priority assigned task I can see right now, using earliest-created as the tie-breaker."
+            )
+            lines.extend(["", f"My recommendation is `{recommendation_name}` ({recommendation_id}).", recommendation_basis])
+            if is_workspace_option:
+                lines.append(f"Location: {self._task_option_location_label(recommendation)}")
             lines.extend(
                 [
-                    "",
-                    f"My recommendation is `{recommendation_name}` ({recommendation_id}).",
-                    "It is the highest-priority assigned task I can see right now, using earliest-created as the tie-breaker.",
                     f"Priority: {recommendation_priority}",
-                    "If that is what you are starting with, reply `yes` or `recommended`. Otherwise reply with a different assigned task name or task ID.",
+                    "If that is what you are starting with, reply `yes` or `recommended`. Otherwise choose another option by task name or ID.",
                 ]
             )
         else:
             lines.extend(
                 [
                     "",
-                    "I could not find an assigned ClickUp task to recommend yet.",
-                    "Reply with the exact assigned task name or task ID you are starting with, or ask admin to assign one.",
+                    "I could not find a strong existing ClickUp task to recommend yet.",
+                    "Reply with an exact task name or ID, or reply `create task` to propose a new one for approval.",
                 ]
             )
         lines.extend(["", await self._task_selection_prompt(user, session, tasks=visible_tasks, recommended_task=recommendation)])
@@ -4964,8 +4984,10 @@ class InternManagementRuntime:
                     task = await self.clickup.get_task(recommended_task_id)
                 except Exception:
                     task = None
+                if task and prompt.get("recommended_workspace_option"):
+                    task = {**task, "_don_pollo_workspace_option": True}
             else:
-                task = await self.clickup.resolve_task_for_user(user, text, include_mission_board=False)
+                task = await self._resolve_intern_task_option(user, session, text)
             if not task:
                 await self._send_dm(
                     client,
@@ -5002,6 +5024,31 @@ class InternManagementRuntime:
             return True
         if step == "confirm_task":
             if self._is_affirmative_reply(text):
+                if prompt.get("candidate_workspace_option"):
+                    candidate_task_id = str(prompt.get("candidate_task_id") or "")
+                    try:
+                        candidate_task = await self.clickup.get_task(candidate_task_id)
+                        assigned = await self.clickup.ensure_task_assigned_to_user(
+                            candidate_task,
+                            user,
+                        )
+                    except Exception:
+                        assigned = False
+                    if not assigned:
+                        self._reset_task_onboarding_prompt_to_select_task(prompt)
+                        session.stage = "awaiting_task_selection"
+                        await self._send_dm(
+                            client,
+                            user,
+                            session,
+                            (
+                                "I found that workspace task, but I could not safely assign it to you. "
+                                "I left it unchanged; choose another option or ask Erik or George to assign it.\n\n"
+                                + await self._task_selection_prompt(user, session)
+                            ),
+                            now,
+                        )
+                        return True
                 self._confirm_task_onboarding_candidate(prompt, session)
                 await self._send_dm(
                     client,
@@ -5032,7 +5079,7 @@ class InternManagementRuntime:
                 session.metadata.pop(_CLICKUP_PROMPT_KEY, None)
                 await self._send_dm(client, user, session, "I cannot resolve tasks right now because ClickUp is unavailable.", now)
                 return True
-            task = await self.clickup.resolve_task_for_user(user, text, include_mission_board=False)
+            task = await self._resolve_intern_task_option(user, session, text)
             if not task:
                 await self._send_dm(
                     client,
@@ -5888,12 +5935,17 @@ class InternManagementRuntime:
     def _set_task_onboarding_candidate(self, prompt: dict[str, Any], task: dict[str, Any]) -> None:
         prompt["candidate_task_id"] = str(task.get("id") or "")
         prompt["candidate_task_name"] = str(task.get("name") or "Unnamed task")
+        if task.get("_don_pollo_workspace_option"):
+            prompt["candidate_workspace_option"] = True
+        else:
+            prompt.pop("candidate_workspace_option", None)
 
     def _confirm_task_onboarding_candidate(self, prompt: dict[str, Any], session: SessionState) -> None:
         prompt["task_id"] = str(prompt.get("candidate_task_id") or "")
         prompt["task_name"] = str(prompt.get("candidate_task_name") or "Unnamed task")
         prompt.pop("candidate_task_id", None)
         prompt.pop("candidate_task_name", None)
+        prompt.pop("candidate_workspace_option", None)
         prompt["step"] = "plan"
         session.stage = "awaiting_plan"
         session.awaiting_start_photo = False
@@ -5908,6 +5960,8 @@ class InternManagementRuntime:
         prompt.pop("task_name", None)
         prompt.pop("candidate_task_id", None)
         prompt.pop("candidate_task_name", None)
+        prompt.pop("candidate_workspace_option", None)
+        prompt.pop("recommended_workspace_option", None)
 
     def _task_onboarding_confirmation_prompt(self, prompt: dict[str, Any]) -> str:
         task_name = str(prompt.get("candidate_task_name") or prompt.get("task_name") or "that task")
@@ -5943,6 +5997,35 @@ class InternManagementRuntime:
                 return ""
         return None
 
+    async def _resolve_intern_task_option(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        task_hint: str,
+    ) -> dict[str, Any] | None:
+        if not self.clickup:
+            return None
+        assigned_task = await self.clickup.resolve_task_for_user(
+            user,
+            task_hint,
+            include_mission_board=False,
+        )
+        if assigned_task:
+            return assigned_task
+        if not hasattr(self.clickup, "suggest_next_tasks") or not hasattr(self.clickup, "match_task_hint"):
+            return None
+        workspace_options = await self.clickup.suggest_next_tasks(
+            user,
+            session,
+            self.list_session_messages(user.user_key, session),
+            exclude_task_ids=self._recently_closed_task_ids(session),
+            limit=8,
+        )
+        matched = self.clickup.match_task_hint(workspace_options, task_hint)
+        if not matched:
+            return None
+        return {**matched, "_don_pollo_workspace_option": True}
+
     async def _restart_task_onboarding_for_correction(
         self,
         client: discord.Client,
@@ -5971,7 +6054,7 @@ class InternManagementRuntime:
             session.metadata.pop(_CLICKUP_PROMPT_KEY, None)
             await self._send_dm(client, user, session, "I cannot resolve tasks right now because ClickUp is unavailable.", now)
             return True
-        task = await self.clickup.resolve_task_for_user(user, correction_hint, include_mission_board=False)
+        task = await self._resolve_intern_task_option(user, session, correction_hint)
         if not task:
             self._reset_task_onboarding_prompt_to_select_task(prompt)
             session.stage = "awaiting_task_selection"
@@ -5999,6 +6082,20 @@ class InternManagementRuntime:
                     f"{await self._task_selection_prompt(user, session)}"
                 ),
                 now,
+            )
+            return True
+        if task.get("_don_pollo_workspace_option"):
+            prompt["draft"] = {}
+            self._set_task_onboarding_candidate(prompt, task)
+            prompt["step"] = "confirm_task"
+            session.stage = "awaiting_task_selection"
+            await self._send_dm(
+                client,
+                user,
+                session,
+                self._task_onboarding_confirmation_prompt(prompt),
+                now,
+                view=self._task_confirmation_view(user),
             )
             return True
         prompt["draft"] = {}
@@ -6134,7 +6231,7 @@ class InternManagementRuntime:
             return
         task = target_task
         if not task and task_hint and self.clickup:
-            task = await self.clickup.resolve_task_for_user(user, task_hint, include_mission_board=False)
+            task = await self._resolve_intern_task_option(user, session, task_hint)
         if task:
             task_id = str(task.get("id") or "")
             if task_id and task_id in self._recently_closed_task_ids(session):
@@ -6383,6 +6480,33 @@ class InternManagementRuntime:
         list_id = str(list_payload.get("id") or "").strip()
         return list_id or None
 
+    def _task_option_location_label(self, task: dict[str, Any]) -> str:
+        if self.clickup and hasattr(self.clickup, "task_location_label"):
+            return str(self.clickup.task_location_label(task))
+        labels: list[str] = []
+        for key in ("space", "folder", "list"):
+            payload = task.get(key)
+            if not isinstance(payload, dict):
+                continue
+            label = str(payload.get("name") or "").strip()
+            if label and label not in labels:
+                labels.append(label)
+        return " / ".join(labels) or "ClickUp workspace"
+
+    def _task_workspace_option_line(self, task: dict[str, Any], *, recommended: bool) -> str:
+        task_id = str(task.get("id") or "unknown")
+        task_name = str(task.get("name") or "Unnamed task")
+        priority = (task.get("priority") or {}).get("priority") or "none"
+        marker = " [recommended]" if recommended else ""
+        line = (
+            f"- `{task_name}` | id={task_id} | {self._task_option_location_label(task)} | "
+            f"priority={priority}{marker}"
+        )
+        reason = str(task.get("_don_pollo_suggestion_reason") or "").strip()
+        if reason:
+            line += f" | why: {reason}"
+        return line
+
     async def _task_selection_context(
         self,
         user: UserProfile,
@@ -6400,6 +6524,7 @@ class InternManagementRuntime:
             }
         assigned_tasks = list(tasks) if tasks is not None else await self.clickup.list_assigned_tasks(user, limit=8)
         hidden_count = 0
+        recently_closed_ids: set[str] = set()
         if session is not None:
             recently_closed_ids = self._recently_closed_task_ids(session)
             if recently_closed_ids:
@@ -6409,10 +6534,24 @@ class InternManagementRuntime:
                     if str(task.get("id") or "") not in recently_closed_ids
                 ]
                 hidden_count = original_count - len(assigned_tasks)
-        if not assigned_tasks:
+        assigned_ids = {
+            str(task.get("id") or "")
+            for task in assigned_tasks
+            if str(task.get("id") or "")
+        }
+        workspace_options: list[dict[str, Any]] = []
+        if session is not None and hasattr(self.clickup, "suggest_next_tasks"):
+            workspace_options = await self.clickup.suggest_next_tasks(
+                user,
+                session,
+                self.list_session_messages(user.user_key, session),
+                exclude_task_ids=assigned_ids | recently_closed_ids,
+                limit=3,
+            )
+        if not assigned_tasks and not workspace_options:
             message = (
-                "I cannot see any assigned ClickUp tasks for you yet. "
-                "Reply `create task` if you need a new one, or ask admin to assign one."
+                "I cannot see any assigned tasks or strong open workspace options yet. "
+                "Reply `create task` to propose a new one for Erik or George to approve."
             )
             if hidden_count:
                 message = "I hid tasks that were already closed today. " + message
@@ -6422,8 +6561,9 @@ class InternManagementRuntime:
                 "candidate_tasks": [],
                 "hidden_count": hidden_count,
             }
-        raw_tasks_by_id: dict[str, dict[str, Any]]
-        if hasattr(self.clickup, "build_assigned_task_hierarchy") and hasattr(self.clickup, "render_assigned_task_hierarchy"):
+        raw_tasks_by_id: dict[str, dict[str, Any]] = {}
+        tree_text = ""
+        if assigned_tasks and hasattr(self.clickup, "build_assigned_task_hierarchy") and hasattr(self.clickup, "render_assigned_task_hierarchy"):
             hierarchy = await self.clickup.build_assigned_task_hierarchy(
                 user,
                 tasks=assigned_tasks,
@@ -6436,7 +6576,7 @@ class InternManagementRuntime:
             )
             raw_tasks_by_id = hierarchy.get("tasks_by_id")
             raw_tasks_by_id = raw_tasks_by_id if isinstance(raw_tasks_by_id, dict) else {}
-        else:
+        elif assigned_tasks:
             raw_tasks_by_id = {
                 str(task.get("id") or ""): task
                 for task in assigned_tasks
@@ -6457,12 +6597,34 @@ class InternManagementRuntime:
             for task_id, task in raw_tasks_by_id.items()
             if str(task_id).strip()
         ]
-        lines = [
-            "I need to confirm your active ClickUp task before you continue. Reply with the task name or ID.",
-            "",
-            "Assigned task tree:",
-            tree_text,
-        ]
+        candidate_tasks.extend(
+            {
+                "id": str(task.get("id") or ""),
+                "name": str(task.get("name") or "Unnamed task"),
+                "parent_task_id": self._extract_task_parent_id(task) or "",
+                "list_id": self._extract_task_list_id(task) or "",
+                "workspace_option": True,
+                "location": self._task_option_location_label(task),
+            }
+            for task in workspace_options
+            if str(task.get("id") or "")
+        )
+        lines = ["I need to confirm your active ClickUp task before you continue. Reply with the task name or ID."]
+        if assigned_tasks:
+            lines.extend(["", "Assigned task tree:", tree_text])
+        if workspace_options:
+            recommendation_id = str((recommended_task or {}).get("id") or "")
+            lines.extend(["", "Other open options across ClickUp spaces:"])
+            lines.extend(
+                self._task_workspace_option_line(
+                    task,
+                    recommended=(
+                        str(task.get("id") or "") == recommendation_id
+                        or (not recommendation_id and index == 0)
+                    ),
+                )
+                for index, task in enumerate(workspace_options)
+            )
         if hidden_count:
             lines.extend(
                 [
@@ -6473,7 +6635,7 @@ class InternManagementRuntime:
         lines.extend(
             [
                 "",
-                "Reply with the name or ID of an `[assigned]` task to choose one, or reply `create task` if none of these fit.",
+                "Reply with the name or ID of an `[assigned]` task or a shown workspace option, or reply `create task` if none of these fit. New tasks still require Erik or George approval.",
             ]
         )
         return {
@@ -6541,12 +6703,35 @@ class InternManagementRuntime:
 
     def _task_creation_placement_prompt(self, prompt: dict[str, Any]) -> str:
         tree_text = str(prompt.get("tree_text") or "").strip()
+        candidates = prompt.get("placement_candidates")
+        candidates = candidates if isinstance(candidates, list) else []
+        workspace_options = [
+            candidate
+            for candidate in candidates
+            if isinstance(candidate, dict) and candidate.get("workspace_option")
+        ]
+        sections: list[str] = []
         if tree_text:
+            sections.extend(
+                [
+                    "Here is the current assigned task hierarchy I can see:",
+                    tree_text,
+                ]
+            )
+        if workspace_options:
+            option_lines = ["Other possible parent tasks across ClickUp spaces:"]
+            option_lines.extend(
+                f"- `{candidate.get('name') or candidate.get('id')}` | "
+                f"id={candidate.get('id')} | {candidate.get('location') or 'ClickUp workspace'}"
+                for candidate in workspace_options
+            )
+            sections.append("\n".join(option_lines))
+        if sections:
             return (
                 "Okay, let's create a new task.\n\n"
-                "Here is the current task hierarchy I can see:\n\n"
-                f"{tree_text}\n\n"
-                "Reply with a shown parent task name or ID if the new task belongs under it, or reply `top level` if it does not fit anywhere in this hierarchy."
+                + "\n\n".join(sections)
+                + "\n\nReply with a shown parent task name or ID if the new task belongs under it, "
+                "or reply `top level` if it does not fit anywhere shown."
             )
         return (
             "Okay, let's create a new task.\n\n"

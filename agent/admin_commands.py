@@ -2092,11 +2092,8 @@ class AdminCommandRouter:
     async def _unowned_task_report(self, snapshots: list[UserDailySnapshot]) -> str:
         if not self.runtime.clickup:
             return "ClickUp is not configured."
-        mission_board_id = self.runtime.config.clickup.mission_board_list_id if self.runtime.config else None
-        if not mission_board_id:
-            return "Mission Board is not configured in ClickUp."
         task_lines: list[str] = []
-        tasks = await self.runtime.clickup.list_list_tasks(mission_board_id, limit=100, include_closed=False)
+        tasks = await self.runtime.clickup.list_workspace_tasks(limit=500, include_closed=False)
         active_task_ids = {snapshot.active_clickup_task_id for snapshot in snapshots if snapshot.active_clickup_task_id}
         for task in tasks:
             task_id = str(task.get("id") or "")
@@ -2104,13 +2101,14 @@ class AdminCommandRouter:
                 continue
             if task.get("assignees"):
                 continue
+            location = self.runtime.clickup.task_location_label(task)
             task_lines.append(
-                f"- {task.get('name')} | status={(task.get('status') or {}).get('status') or 'unknown'} | "
+                f"- {task.get('name')} | {location} | status={(task.get('status') or {}).get('status') or 'unknown'} | "
                 f"priority={(task.get('priority') or {}).get('priority') or 'none'}"
             )
         if not task_lines:
-            return "I did not find any unassigned Mission Board tasks outside the active intern focus set."
-        return "Mission Board tasks with no intern actively focused on them right now:\n" + "\n".join(task_lines[:20])
+            return "I did not find any unassigned tasks across the configured ClickUp workspace outside the active focus set."
+        return "Workspace tasks with no worker actively focused on them right now:\n" + "\n".join(task_lines[:20])
 
     async def _post_summary_comments(self, snapshots: list[UserDailySnapshot]) -> str:
         if not self.runtime.config:
