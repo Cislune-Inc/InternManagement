@@ -10,7 +10,8 @@ print -r -- "$(date -u +%Y-%m-%dT%H:%M:%SZ) user=${USER:-unknown} command=${orig
 
 case "${original_command}" in
   health)
-    exec curl --fail --silent --show-error "http://127.0.0.1:8765/api/health"
+    cd "${repo_root}"
+    exec .venv/bin/python ops/print-health-summary.py
     ;;
   status)
     cd "${repo_root}"
