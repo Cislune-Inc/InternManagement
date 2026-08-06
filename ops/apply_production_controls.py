@@ -30,6 +30,7 @@ CONTROL_VALUES: dict[str, dict[str, Any]] = {
     "slack": {
         "operational_digest_interval_minutes": 360,
         "manager_queue_url": "http://192.168.4.87:8765/exceptions",
+        "practice_channel_id": None,
         "quarantine_uncertain_routes": True,
         "thread_daily_updates": True,
     },
