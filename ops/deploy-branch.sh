@@ -48,6 +48,7 @@ else
 fi
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python -m compileall -q agent
+.venv/bin/python ops/apply_production_controls.py --apply
 ops/restart-services.sh
 
 echo "Deployed ${branch} at ${candidate}."

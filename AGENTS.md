@@ -5,7 +5,7 @@
 - GitHub is the durable source of truth. The production checkout is `/Users/pm/InternManagement` on the office Mac mini.
 - Work on an `agent/*` branch, run tests, and publish a pull request. Do not hand-edit tracked production files over SMB.
 - Preserve local-only `.env`, `bootstrap.local.json`, `config/`, `data/`, `storage/`, `backups/`, and `secrets/`. Never print their secrets or add them to Git.
-- The live configuration and roster are intentionally not tracked. Update them only as an explicit deployment step after validating their parsed form.
+- The live configuration and roster are intentionally not tracked. `ops/deploy-branch.sh` applies the reviewed control values with `ops/apply_production_controls.py`, which backs up the prior config first. Make other local-config changes only as an explicit deployment step after validating their parsed form.
 
 ## Safety invariants
 
