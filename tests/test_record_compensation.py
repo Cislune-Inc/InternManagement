@@ -59,7 +59,7 @@ def test_resolve_reviewed_batch_uses_canonical_roster_case(tmp_path: Path) -> No
     resolved = resolve_reviewed_batch(
         roster_path=roster,
         hourly_users=["andrew"],
-        stipend_users=["aanoalii", "nick"],
+        stipend_users=["aan", "nick"],
     )
 
     assert resolved == [
@@ -67,6 +67,25 @@ def test_resolve_reviewed_batch_uses_canonical_roster_case(tmp_path: Path) -> No
         ("Aanoalii", "nasa_stipend", "owner-confirmed-stipend-intern"),
         ("Nick", "nasa_stipend", "owner-confirmed-stipend-intern"),
     ]
+
+
+def test_resolve_reviewed_batch_rejects_ambiguous_prefix(tmp_path: Path) -> None:
+    roster = tmp_path / "roster.csv"
+    roster.write_text(
+        "user_key,active\nAndrew,true\nAndrea,true\n",
+        encoding="utf-8",
+    )
+
+    try:
+        resolve_reviewed_batch(
+            roster_path=roster,
+            hourly_users=["andr"],
+            stipend_users=[],
+        )
+    except ValueError as exc:
+        assert str(exc) == "Ambiguous active roster prefix andr: Andrea, Andrew"
+    else:
+        raise AssertionError("Ambiguous prefixes must not be silently classified")
 
 
 def test_resolve_reviewed_batch_rejects_unknown_user(tmp_path: Path) -> None:

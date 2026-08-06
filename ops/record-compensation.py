@@ -64,6 +64,19 @@ def resolve_reviewed_batch(
     for requested_key, plan, evidence in requested:
         normalized = requested_key.strip().casefold()
         user_key = canonical.get(normalized)
+        if not user_key and len(normalized) >= 3:
+            matches = [
+                candidate
+                for lookup, candidate in canonical.items()
+                if lookup.startswith(normalized)
+            ]
+            if len(matches) == 1:
+                user_key = matches[0]
+            elif len(matches) > 1:
+                raise ValueError(
+                    f"Ambiguous active roster prefix {requested_key}: "
+                    + ", ".join(sorted(matches))
+                )
         if not user_key:
             raise ValueError(f"Unknown active roster user: {requested_key}")
         previous_plan = plans_by_key.get(user_key)
