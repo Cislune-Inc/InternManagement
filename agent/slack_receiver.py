@@ -1,10 +1,21 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 from typing import Any
+
+from .ssl_compat import build_ssl_context
 
 
 logger = logging.getLogger(__name__)
+
+
+def build_slack_web_client(bot_token: str) -> Any:
+    """Build Slack's async client with the same verified CA bundle as Discord."""
+    from slack_sdk.web.async_client import AsyncWebClient
+
+    return AsyncWebClient(token=bot_token, ssl=build_ssl_context())
 
 
 class SlackSocketReceiver:
@@ -26,7 +37,8 @@ class SlackSocketReceiver:
         from slack_bolt.async_app import AsyncApp
         from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 
-        app = AsyncApp(token=self.bot_token)
+        web_client = build_slack_web_client(self.bot_token)
+        app = AsyncApp(client=web_client)
 
         @app.event("message")
         async def handle_message(event: dict[str, Any]) -> None:
@@ -45,9 +57,18 @@ class SlackSocketReceiver:
                     event.get("event_ts") or event.get("ts") or "unknown",
                 )
 
-        self._handler = AsyncSocketModeHandler(app, self.app_token)
+        self._handler = AsyncSocketModeHandler(
+            app,
+            self.app_token,
+            web_client=web_client,
+        )
         logger.info("Starting Don Pollo Slack Socket Mode receiver.")
-        await self._handler.start_async()
+        await self._handler.connect_async()
+        logger.info(
+            "Don Pollo Slack Socket Mode receiver connected pid=%s.",
+            os.getpid(),
+        )
+        await asyncio.Event().wait()
 
     async def close(self) -> None:
         if self._handler is not None:
