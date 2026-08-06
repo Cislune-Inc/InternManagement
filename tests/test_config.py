@@ -229,11 +229,11 @@ def test_parse_roster_csv_accepts_slack_only_worker_policy() -> None:
         (
             "user_key,display_name,discord_user_id,discord_username,storage_folder_name,"
             "timezone,clickup_user_id,clickup_user_email,slack_user_id,active,"
-            "preferred_transport,worker_type,time_tracking_required,meal_tracking_required,"
+            "preferred_transport,worker_type,compensation_plan,time_tracking_required,meal_tracking_required,"
             "overtime_approval_required,expected_daily_hours,check_in_interval_minutes,"
             "gusto_entity_uuid,labor_cost_rate\n"
             "sam,Sam,,,Sam,America/Los_Angeles,42,sam@example.com,U123,true,"
-            "slack,employee,true,true,true,8,90,gusto-1,55.5\n"
+            "slack,employee,cislune_hourly,true,true,true,8,90,gusto-1,55.5\n"
         ).encode("utf-8"),
     )
 
@@ -241,9 +241,33 @@ def test_parse_roster_csv_accepts_slack_only_worker_policy() -> None:
     assert roster[0].slack_user_id == "U123"
     assert roster[0].preferred_transport == "slack"
     assert roster[0].worker_type == "employee"
+    assert roster[0].compensation_plan == "cislune_hourly"
     assert roster[0].check_in_interval_minutes == 90
     assert roster[0].gusto_entity_uuid == "gusto-1"
     assert roster[0].labor_cost_rate == 55.5
+
+
+def test_parse_roster_csv_rejects_invalid_compensation_plan() -> None:
+    with pytest.raises(ValueError, match="Invalid compensation_plan"):
+        parse_roster_bytes(
+            "roster.csv",
+            (
+                "user_key,display_name,discord_user_id,slack_user_id,compensation_plan,active\n"
+                "sam,Sam,123,,cash_maybe,true\n"
+            ).encode("utf-8"),
+        )
+
+
+def test_parse_roster_csv_does_not_infer_nasa_stipend_from_intern_label() -> None:
+    roster = parse_roster_bytes(
+        "roster.csv",
+        (
+            "user_key,display_name,discord_user_id,slack_user_id,worker_type,active\n"
+            "sam,Sam,123,,intern,true\n"
+        ).encode("utf-8"),
+    )
+
+    assert roster[0].compensation_plan == "needs_review"
 
 
 def test_parse_roster_csv_requires_one_message_transport() -> None:

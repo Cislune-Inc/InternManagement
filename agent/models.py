@@ -207,6 +207,7 @@ class UserProfile:
     active: bool = True
     preferred_transport: str = "auto"
     worker_type: str = "intern"
+    compensation_plan: str = "needs_review"
     time_tracking_required: bool = True
     meal_tracking_required: bool = True
     overtime_approval_required: bool = False

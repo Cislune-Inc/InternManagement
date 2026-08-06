@@ -96,18 +96,21 @@ def render_payroll_dashboard_html(payload: dict[str, Any]) -> str:
 <body><main>
   <header>
     <h1>Payroll and Project Labor Review</h1>
-    <p>Approval-first weekly timecards, project budget rollups, compliance events, and NASA-ready labor detail.</p>
+    <p>Approval-first weekly timecards, compensation-plan separation, project budget rollups, compliance events, and NASA-ready labor detail.</p>
     <nav><a href="/time">Time tracking</a><a href="/work">Work dashboard</a><a href="/payroll">Payroll</a><a href="/exceptions">Manager queue</a><a href="/health">System health</a></nav>
   </header>
   <section class="metrics">
     {_metric("Week ending", summary.get("week_ending") or "No export yet")}
-    {_metric("Paid hours", summary.get("paid_hours") or 0)}
+    {_metric("Tracked hours", summary.get("tracked_hours") or 0)}
+    {_metric("Hourly payroll hours", summary.get("hourly_payroll_hours") or 0)}
+    {_metric("NASA stipend effort", summary.get("stipend_effort_hours") or 0)}
+    {_metric("Unclassified hours", summary.get("unclassified_hours") or 0)}
     {_metric("Worker days", summary.get("worker_days") or 0)}
     {_metric("Needs review", summary.get("requires_review_days") or 0)}
     {_metric("Compliance events", summary.get("compliance_events") or 0)}
   </section>
   <section class="panel"><h2>Project Labor</h2>{_table(project_rows, ["project","labor_code","hours","budget_hours","remaining_budget_hours","estimated_labor_cost"])}</section>
-  <section class="panel"><h2>Payroll Review</h2><p>Gusto mapping is informational and does not block review. Resolutions reopen automatically if the underlying hours change.</p>{_payroll_review_table(payroll_rows)}</section>
+  <section class="panel"><h2>Time and Compensation Review</h2><p>Everyone remains in tracked-time and project-labor reporting. Only workers explicitly classified as Cislune hourly can enter the Gusto bundle; NASA stipend effort remains separate. Resolutions reopen automatically if the underlying hours change.</p>{_payroll_review_table(payroll_rows)}</section>
   <section class="panel"><h2>Compliance</h2>{_table(compliance_rows, ["display_name","session_date","event_type","recorded_at","worked_hours"])}</section>
   <section class="panel"><h2>Downloads</h2><p>{''.join(_download(name) for name in files) or 'Run the Monday payroll export to create the first bundle.'}</p></section>
   <dialog id="review-dialog">
@@ -202,10 +205,12 @@ def _payroll_review_table(rows: list[dict[str, Any]]) -> str:
         return "<p>No rows are available for the latest completed export.</p>"
     columns = [
         "display_name",
+        "compensation_plan",
         "session_date",
-        "paid_hours",
+        "tracked_hours",
+        "hourly_payroll_hours",
+        "unpaid_meal_hours",
         "task_tracked_hours",
-        "regular_hours",
         "overtime_hours",
         "review_status",
         "warnings",

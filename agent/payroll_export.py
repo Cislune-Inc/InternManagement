@@ -22,6 +22,10 @@ from .time_utils import resolve_timezone
 _PAYROLL_ROOT = Path("dashboard") / "payroll"
 
 
+def _is_hourly_payroll_worker(user: UserProfile) -> bool:
+    return user.compensation_plan == "cislune_hourly"
+
+
 class PayrollExporter:
     def __init__(self, runtime: InternManagementRuntime) -> None:
         self.runtime = runtime
@@ -87,14 +91,16 @@ class PayrollExporter:
         for row in review_rows:
             weekly_totals[str(row["user_key"])] += int(row["paid_seconds"])
         for row in review_rows:
-            row["weekly_paid_hours"] = _hours(weekly_totals[str(row["user_key"])])
+            weekly_hours = _hours(weekly_totals[str(row["user_key"])])
+            row["weekly_tracked_hours"] = weekly_hours
+            row["weekly_paid_hours"] = weekly_hours
             if weekly_totals[str(row["user_key"])] > 40 * 60 * 60:
                 review_codes = _decode_review_codes(row.get("review_codes"))
                 review_codes.append("weekly_overtime")
                 row["review_codes"] = json.dumps(sorted(set(review_codes)))
                 row["warnings"] = _join_warning(
                     str(row.get("warnings") or ""),
-                    "Weekly paid time exceeds 40 hours; overtime classification requires payroll review.",
+                    "Weekly tracked work exceeds 40 hours; overtime classification requires review.",
                 )
                 row["requires_review"] = True
         apply_review_state(
@@ -106,7 +112,7 @@ class PayrollExporter:
             (str(row["user_key"]), str(row["session_date"])): row for row in review_rows
         }
         for user in self.runtime.roster_by_key.values():
-            if not user.gusto_entity_uuid:
+            if not _is_hourly_payroll_worker(user) or not user.gusto_entity_uuid:
                 continue
             for session_date in _date_range(week_start, week_ending):
                 review = review_by_day.get((user.user_key, session_date.isoformat()))
@@ -131,12 +137,21 @@ class PayrollExporter:
                         {
                             str(row["display_name"])
                             for row in review_rows
+                            if str(row.get("compensation_plan") or "") == "cislune_hourly"
                             if not str(row.get("gusto_entity_uuid") or "").strip()
                         }
                     ),
+                    "excluded_non_hourly_workers": sorted(
+                        {
+                            str(row["display_name"])
+                            for row in review_rows
+                            if str(row.get("compensation_plan") or "") != "cislune_hourly"
+                        }
+                    ),
                     "note": (
-                        "Review and approve this bundle before entering or syncing data to Gusto. "
-                        "Production API submission is intentionally disabled."
+                        "Only workers explicitly classified as cislune_hourly and mapped to Gusto "
+                        "are included. Review and approve this bundle before entering or syncing "
+                        "data to Gusto. Production API submission is intentionally disabled."
                     ),
                 },
                 indent=2,
@@ -144,19 +159,39 @@ class PayrollExporter:
             ),
             encoding="utf-8",
         )
+        hourly_payroll_seconds = sum(
+            int(row["hourly_payroll_seconds"]) for row in review_rows
+        )
+        stipend_effort_seconds = sum(
+            int(row["paid_seconds"])
+            for row in review_rows
+            if str(row.get("compensation_plan") or "") == "nasa_stipend"
+        )
+        unclassified_seconds = sum(
+            int(row["paid_seconds"])
+            for row in review_rows
+            if str(row.get("compensation_plan") or "") == "needs_review"
+        )
         summary = {
             "generated_at": datetime.now(tz=timezone.utc).isoformat(),
             "week_start": week_start.isoformat(),
             "week_ending": week_ending.isoformat(),
             "worker_days": len(review_rows),
             "workers": len({str(row["user_key"]) for row in review_rows}),
-            "paid_hours": _hours(sum(int(row["paid_seconds"]) for row in review_rows)),
+            "tracked_hours": _hours(
+                sum(int(row["paid_seconds"]) for row in review_rows)
+            ),
+            "hourly_payroll_hours": _hours(hourly_payroll_seconds),
+            "stipend_effort_hours": _hours(stipend_effort_seconds),
+            "unclassified_hours": _hours(unclassified_seconds),
+            "paid_hours": _hours(hourly_payroll_seconds),
             "task_hours": _hours(sum(int(row["seconds"]) for row in labor_rows)),
             "requires_review_days": sum(bool(row.get("requires_review")) for row in review_rows),
             "missing_gusto_mappings": len(
                 {
                     str(row["user_key"])
                     for row in review_rows
+                    if str(row.get("compensation_plan") or "") == "cislune_hourly"
                     if not str(row.get("gusto_entity_uuid") or "").strip()
                 }
             ),
@@ -183,6 +218,7 @@ class PayrollExporter:
         gross_seconds = int(session.time_summary.get("gross_clocked_in_total_seconds") or 0)
         meal_seconds = int(session.time_summary.get("unpaid_lunch_deducted_seconds") or 0)
         task_seconds = int(session.time_summary.get("task_tracked_total_seconds") or 0)
+        hourly_payroll_seconds = paid_seconds if _is_hourly_payroll_worker(user) else 0
         regular_seconds = min(paid_seconds, 8 * 60 * 60)
         overtime_seconds = min(max(0, paid_seconds - regular_seconds), 4 * 60 * 60)
         double_overtime_seconds = max(0, paid_seconds - regular_seconds - overtime_seconds)
@@ -190,8 +226,17 @@ class PayrollExporter:
         warnings: list[str] = []
         review_codes: list[str] = []
         integration_notes: list[str] = []
-        if user.time_tracking_required and not user.gusto_entity_uuid:
+        if user.compensation_plan == "needs_review":
+            warnings.append(
+                "Compensation plan is unclassified; choose Cislune hourly, NASA stipend, salary, or external."
+            )
+            review_codes.append("compensation_plan_unclassified")
+        elif _is_hourly_payroll_worker(user) and not user.gusto_entity_uuid:
             integration_notes.append("Not mapped to Gusto; included in parallel local reporting only.")
+        elif user.compensation_plan == "nasa_stipend":
+            integration_notes.append(
+                "NASA stipend effort: excluded from Cislune hourly payroll and retained in project labor reporting."
+            )
         if paid_seconds and not starts:
             warnings.append("Paid time exists without a complete work segment.")
             review_codes.append("incomplete_work_segment")
@@ -214,6 +259,7 @@ class PayrollExporter:
             "user_key": user.user_key,
             "display_name": user.display_name,
             "worker_type": user.worker_type,
+            "compensation_plan": user.compensation_plan,
             "session_date": session.session_date,
             "timezone": self.runtime.resolve_user_timezone_name(user),
             "shift_started_at": min(starts).astimezone(timezone.utc).isoformat() if starts else "",
@@ -224,6 +270,10 @@ class PayrollExporter:
             "unpaid_meal_hours": _hours(meal_seconds),
             "paid_seconds": paid_seconds,
             "paid_hours": _hours(paid_seconds),
+            "tracked_seconds": paid_seconds,
+            "tracked_hours": _hours(paid_seconds),
+            "hourly_payroll_seconds": hourly_payroll_seconds,
+            "hourly_payroll_hours": _hours(hourly_payroll_seconds),
             "task_tracked_seconds": task_seconds,
             "task_tracked_hours": _hours(task_seconds),
             "regular_hours": _hours(regular_seconds),
@@ -340,6 +390,7 @@ class PayrollExporter:
             "user_key": user.user_key,
             "display_name": user.display_name,
             "worker_type": user.worker_type,
+            "compensation_plan": user.compensation_plan,
             "session_date": session.session_date,
             "task_id": task_id,
             "task_name": task_name,
@@ -415,6 +466,7 @@ class PayrollExporter:
                 "user_key": user.user_key,
                 "display_name": user.display_name,
                 "worker_type": user.worker_type,
+                "compensation_plan": user.compensation_plan,
                 "session_date": session.session_date,
                 "event_type": str(event.get("event_type") or ""),
                 "recorded_at": str(event.get("recorded_at") or ""),

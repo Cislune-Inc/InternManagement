@@ -74,6 +74,7 @@ def _runtime(tmp_path: Path) -> tuple[InternManagementRuntime, UserProfile]:
         discord_username="alex",
         storage_folder_name="Alex",
         worker_type="employee",
+        compensation_plan="cislune_hourly",
         gusto_entity_uuid="gusto-alex",
         labor_cost_rate=50,
     )
@@ -226,6 +227,75 @@ def test_missing_gusto_is_informational_and_review_resolution_can_learn_variance
     )
     assert gusto["time_sheets"] == []
     assert gusto["unmapped_workers"] == ["Alex"]
+
+
+def test_nasa_stipend_effort_stays_in_projects_but_out_of_hourly_payroll(
+    tmp_path: Path,
+) -> None:
+    runtime, _hourly_user = _runtime(tmp_path)
+    stipend_user = UserProfile(
+        user_key="nasa-intern",
+        display_name="NASA Intern",
+        discord_user_id=2,
+        storage_folder_name="NASA Intern",
+        worker_type="intern",
+        compensation_plan="nasa_stipend",
+        gusto_entity_uuid="must-not-be-used",
+    )
+    runtime.roster_by_key = {stipend_user.user_key: stipend_user}
+    session = SessionState(
+        user_key=stipend_user.user_key,
+        session_date="2026-07-27",
+        stage="clocked_out",
+        clocked_in_at="2026-07-27T09:00:00-07:00",
+        clocked_out_at="2026-07-27T13:00:00-07:00",
+        work_segments=[
+            {
+                "clocked_in_at": "2026-07-27T09:00:00-07:00",
+                "clocked_out_at": "2026-07-27T13:00:00-07:00",
+            }
+        ],
+        metadata={
+            "clickup_time_tracking_history": [
+                {
+                    "task_id": "task-1",
+                    "task_name": "CARVE controls",
+                    "started_at": "2026-07-27T09:00:00-07:00",
+                    "closed_at": "2026-07-27T13:00:00-07:00",
+                    "duration_seconds": 14400,
+                    "source": "local",
+                }
+            ]
+        },
+    )
+    session_path = (
+        runtime.bootstrap.storage_root_path
+        / "people"
+        / stipend_user.storage_folder_name
+        / session.session_date
+        / "session.json"
+    )
+    session_path.parent.mkdir(parents=True)
+    session_path.write_text(json.dumps(asdict(session)), encoding="utf-8")
+
+    summary = asyncio.run(PayrollExporter(runtime).export(date(2026, 8, 2)))
+    latest = runtime.bootstrap.storage_root_path / "dashboard" / "payroll" / "latest"
+    gusto = json.loads((latest / "gusto_time_sheets.json").read_text(encoding="utf-8"))
+    with (latest / "project_labor.csv").open(encoding="utf-8", newline="") as handle:
+        labor_rows = list(csv.DictReader(handle))
+    with (latest / "payroll_review.csv").open(encoding="utf-8", newline="") as handle:
+        review_rows = list(csv.DictReader(handle))
+
+    assert summary["tracked_hours"] == 4.0
+    assert summary["hourly_payroll_hours"] == 0.0
+    assert summary["stipend_effort_hours"] == 4.0
+    assert gusto["time_sheets"] == []
+    assert gusto["unmapped_workers"] == []
+    assert gusto["excluded_non_hourly_workers"] == ["NASA Intern"]
+    assert labor_rows[0]["compensation_plan"] == "nasa_stipend"
+    assert labor_rows[0]["hours"] == "4.0"
+    assert review_rows[0]["hourly_payroll_hours"] == "0.0"
+    assert "excluded from Cislune hourly payroll" in review_rows[0]["integration_notes"]
 
 
 def test_payroll_review_flags_long_lunch_and_missing_return(tmp_path: Path) -> None:

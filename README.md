@@ -177,7 +177,18 @@ Don Pollo can run the same clock-in, task selection, ClickUp timer, lunch, statu
 4. Keep `SLACK_BOT_TOKEN` configured with DM/message and file permissions.
 5. Add the worker to `config/roster.csv` with `slack_user_id` and `preferred_transport=slack`. `discord_user_id` may be blank for Slack-only workers.
 
-The optional roster policy columns are documented in `config_templates/roster.example.csv`. Existing workers default to the current intern-style workflow. `worker_type`, compliance flags, task-aware check-in overrides, Gusto UUIDs, and local labor cost rates only change behavior when explicitly configured.
+The optional roster policy columns are documented in `config_templates/roster.example.csv`. Every active roster member is migrated to time and meal tracking when the reviewed production branch is deployed. `worker_type`, compensation plan, task-aware check-in overrides, Gusto UUIDs, and local labor cost rates remain separate controls.
+
+Use `compensation_plan` to prevent project effort from becoming an accidental payroll instruction:
+
+- `cislune_hourly`: tracked work is eligible for the approval-first Cislune/Gusto bundle.
+- `nasa_stipend`: tracked work stays in project and NASA labor reporting but is excluded from Cislune hourly payroll.
+- `salary` or `external`: tracked work remains available for project reporting and is excluded from hourly payroll.
+- `needs_review`: tracked work is retained but the weekly review is blocked until an operator classifies the plan.
+
+Do not infer `nasa_stipend` merely from `worker_type=intern`; funding source and legal worker classification are different questions. Deployment preserves explicit plans, infers Cislune hourly only from an existing Gusto mapping, and sends all other uncertain records to `needs_review`.
+
+Time policy is deliberately conservative: a recorded, duty-free meal pauses the task timer and is excluded from tracked work and hourly payroll. Short rest periods stay on the clock and allocated to the active project; they are not silently deducted. The bot warns before the configured meal and overtime thresholds, automatically starts lunch at the meal deadline, and automatically clocks nonexempt workers out at the unapproved overtime limit while notifying the worker and admins.
 
 ### Slack Admin Beta
 
@@ -210,7 +221,7 @@ The bundle is written under `storage/dashboard/payroll/<week-ending>/` and copie
 
 Open `http://127.0.0.1:8765/payroll` for the human-readable review page and downloads. Review rows can be resolved there with a required reviewer name and note. Resolutions are tied to an evidence fingerprint, so changing the underlying hours automatically reopens the row. Optional learned resolution is deliberately limited to same-worker task-time variances; meal, overtime, compliance, and incomplete-segment reviews are never learned away.
 
-Missing Gusto mappings are informational and do not block local review. Only mapped workers are included in `gusto_time_sheets.json`; everyone remains visible in the local payroll and project exports. The installed macOS LaunchAgent runs the exporter each Monday at 7:00 AM. Gusto production submission remains disabled until the company has an approved integration and an operator has reviewed the bundle.
+Missing Gusto mappings are informational for workers explicitly classified as `cislune_hourly`; they remain in the review queue but cannot enter the Gusto bundle. Only mapped Cislune-hourly workers are included in `gusto_time_sheets.json`; everyone remains visible in tracked-time and project-labor exports. The dashboard separately shows all tracked hours, hourly-payroll hours, NASA-stipend effort, and unclassified hours. The installed macOS LaunchAgent runs the exporter each Monday at 7:00 AM. Gusto production submission remains disabled until the company has an approved integration and an operator has reviewed the bundle.
 
 Generate a read-only Slack/ClickUp identity proposal without changing the live roster:
 

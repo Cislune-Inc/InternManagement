@@ -25,6 +25,13 @@ from .models import (
 from .time_utils import parse_local_clock_time, resolve_timezone
 
 _UNSUPPORTED_ROSTER_COLUMNS = {"clickup_task_id", "clickup_list_id"}
+_COMPENSATION_PLANS = {
+    "cislune_hourly",
+    "nasa_stipend",
+    "salary",
+    "external",
+    "needs_review",
+}
 _DEFAULT_FOLLOW_UP_QUESTIONS = [
     "How is the project going? Are you stuck?",
     "What progress have you made since the last check-in?",
@@ -165,6 +172,23 @@ def parse_user_profile(row: dict[str, Any], source: str = "roster") -> UserProfi
         )
     worker_type = str(row.get("worker_type") or "intern").strip().lower()
     gusto_entity_uuid = _clean_optional(row.get("gusto_entity_uuid"))
+    default_compensation_plan = "needs_review"
+    if worker_type in {"salaried", "exempt"}:
+        default_compensation_plan = "salary"
+    elif worker_type in {"external", "contractor"}:
+        default_compensation_plan = "external"
+    elif gusto_entity_uuid:
+        default_compensation_plan = "cislune_hourly"
+    compensation_plan = str(
+        row.get("compensation_plan")
+        or default_compensation_plan
+    ).strip().lower()
+    if compensation_plan not in _COMPENSATION_PLANS:
+        choices = ", ".join(sorted(_COMPENSATION_PLANS))
+        raise ValueError(
+            f"Invalid compensation_plan {compensation_plan!r} in {source}. "
+            f"Use one of: {choices}."
+        )
     return UserProfile(
         user_key=str(row["user_key"]).strip(),
         display_name=str(row.get("display_name") or row["user_key"]).strip(),
@@ -183,11 +207,12 @@ def parse_user_profile(row: dict[str, Any], source: str = "roster") -> UserProfi
         active=_parse_bool(row.get("active", True)),
         preferred_transport=preferred_transport,
         worker_type=worker_type,
+        compensation_plan=compensation_plan,
         time_tracking_required=_parse_bool_default(row.get("time_tracking_required"), True),
         meal_tracking_required=_parse_bool_default(row.get("meal_tracking_required"), True),
         overtime_approval_required=_parse_bool_default(
             row.get("overtime_approval_required"),
-            worker_type not in {"salaried", "exempt", "external"},
+            worker_type not in {"salaried", "exempt", "external", "contractor"},
         ),
         expected_daily_hours=_parse_float_default(row.get("expected_daily_hours"), 8.0),
         check_in_interval_minutes=_parse_optional_positive_int(
