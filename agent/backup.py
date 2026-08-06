@@ -41,20 +41,27 @@ def create_backup(
 
     with tempfile.TemporaryDirectory(prefix=".backup-", dir=destination) as temp_name:
         temp_root = Path(temp_name)
-        sqlite_snapshot = temp_root / "data" / "agent_state.sqlite3"
+        snapshot_root = temp_root / "snapshot"
+        sqlite_snapshot = snapshot_root / "data" / "agent_state.sqlite3"
         sqlite_snapshot.parent.mkdir(parents=True, exist_ok=True)
         bootstrap = _read_bootstrap_paths(workspace_root / "bootstrap.local.json")
         state_db_path = Path(bootstrap.get("state_db_path", "data/agent_state.sqlite3"))
         storage_root_path = Path(bootstrap.get("storage_root_path", "storage"))
         _snapshot_sqlite(workspace_root / state_db_path, sqlite_snapshot)
 
-        sources = list(
+        live_sources = list(
             _iter_backup_sources(
                 workspace_root,
                 storage_root=workspace_root / storage_root_path,
                 include_images=include_images,
             )
         )
+        sources: list[tuple[Path, Path]] = []
+        for source_path, archive_path in live_sources:
+            snapshot_path = snapshot_root / archive_path
+            snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_path, snapshot_path)
+            sources.append((snapshot_path, archive_path))
         sources.append((sqlite_snapshot, Path("data/agent_state.sqlite3")))
         manifest_files = [
             {

@@ -4,9 +4,11 @@ import json
 import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
+import agent.backup as backup_module
 from agent.backup import create_backup, prune_backups, restore_backup, verify_backup
 
 
@@ -80,6 +82,33 @@ def test_image_backup_is_explicit_and_restore_destination_must_be_empty(tmp_path
     assert (restore / "storage" / "people" / "Alex" / "2026-07-30" / "images" / "photo.jpg").exists()
     with pytest.raises(ValueError, match="must be empty"):
         restore_backup(backup_path, key_path=key, destination=restore)
+
+
+def test_backup_uses_staged_files_when_live_storage_changes(tmp_path, monkeypatch):
+    workspace = _workspace(tmp_path)
+    backups = tmp_path / "backups"
+    key = tmp_path / "key"
+    live_session = (
+        workspace / "storage" / "people" / "Alex" / "2026-07-30" / "session.json"
+    )
+    original_sha256_path = backup_module._sha256_path
+    mutated = False
+
+    def mutate_live_file_after_snapshot_hash(path):
+        nonlocal mutated
+        digest = original_sha256_path(path)
+        if path.name == "session.json" and not mutated:
+            live_session.write_text('{"stage":"clocked_in"}', encoding="utf-8")
+            mutated = True
+        return digest
+
+    monkeypatch.setattr(backup_module, "_sha256_path", mutate_live_file_after_snapshot_hash)
+
+    created = create_backup(workspace, destination=backups, key_path=key)
+    backup_path = backups / Path(created["backup_path"]).name
+
+    assert mutated is True
+    assert verify_backup(backup_path, key_path=key)["valid"] is True
 
 
 def test_prune_backups_only_removes_expired_encrypted_bundles(tmp_path):
