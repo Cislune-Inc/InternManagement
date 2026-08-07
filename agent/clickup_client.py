@@ -412,7 +412,7 @@ class ClickUpClient:
                 params={
                     "page": page,
                     "order_by": "updated",
-                    "reverse": "true",
+                    "reverse": "false",
                     "include_closed": str(include_closed).lower(),
                     "subtasks": "true",
                 },
@@ -831,7 +831,7 @@ class ClickUpClient:
             params: dict[str, Any] = {
                 "page": 0,
                 "order_by": "updated",
-                "reverse": "true",
+                "reverse": "false",
                 "include_closed": "false",
                 "subtasks": "true",
                 "assignees[]": [clickup_user_id],

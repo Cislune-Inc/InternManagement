@@ -639,6 +639,8 @@ def test_list_workspace_tasks_paginates_across_space_results() -> None:
             del json
             assert method == "GET"
             assert path == "/team/9011286053/task"
+            assert (params or {}).get("order_by") == "updated"
+            assert (params or {}).get("reverse") == "false"
             page = int((params or {}).get("page") or 0)
             self.pages.append(page)
             if page == 0:
