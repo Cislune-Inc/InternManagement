@@ -42,6 +42,7 @@ CONTROL_VALUES: dict[str, dict[str, Any]] = {
 
 ADMIN_SLACK_USER_IDS = {
     "erik": "U01SWQKDTBM",
+    "george": "U0AEC5J2SJD",
 }
 
 

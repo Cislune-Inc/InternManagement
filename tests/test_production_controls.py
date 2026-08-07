@@ -37,7 +37,7 @@ def test_production_controls_schedule_daily_pacific_digest_and_meal_minimum() ->
     assert "slack.operational_digest_hour" in changed
 
 
-def test_production_controls_configure_erik_as_slack_admin_beta_tester() -> None:
+def test_production_controls_configure_management_slack_admins() -> None:
     payload = {
         "admins": [
             {"name": "George", "discord_user_id": 100},
@@ -47,8 +47,9 @@ def test_production_controls_configure_erik_as_slack_admin_beta_tester() -> None
 
     changed = apply_controls(payload)
 
-    assert payload["admins"][0].get("slack_user_id") is None
+    assert payload["admins"][0]["slack_user_id"] == "U0AEC5J2SJD"
     assert payload["admins"][1]["slack_user_id"] == "U01SWQKDTBM"
+    assert "admins[0].slack_user_id" in changed
     assert "admins[1].slack_user_id" in changed
 
 
