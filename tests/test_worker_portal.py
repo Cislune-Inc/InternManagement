@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
-from agent.models import AdminProfile, SlackConfig, UserProfile
+from agent.models import AdminProfile, MessageRecord, SlackConfig, UserProfile
 from agent.state_store import StateStore
 from agent.worker_portal import (
     WorkerPortalService,
@@ -290,10 +291,188 @@ def test_portal_task_request_and_summary_are_sent_only_to_beta_slack_user(tmp_pa
             },
         )
     )
-    assert result["task_requests"][0]["status"] == "beta pending"
+    assert result["task_requests"][0]["status"] == "pending approval"
     assert slack.messages[0][0] == "UERIK"
     assert "no ClickUp task created" in slack.messages[0][1]
 
     asyncio.run(service.apply_action(token, {"action": "share_slack"}))
     assert len(slack.messages) == 2
-    assert "preview only" in slack.messages[1][1]
+    assert "admin-preview summary" in slack.messages[1][1]
+
+
+class _LiveRuntime:
+    def __init__(self, tmp_path) -> None:
+        self.state_store = StateStore(tmp_path / "live-state.sqlite3")
+        self.slack = _FakeSlack()
+        self.clickup = _FakeClickUp()
+        self.config = SimpleNamespace(
+            slack=SlackConfig(
+                manager_queue_url="http://192.168.4.87:8765/exceptions",
+                worker_portal_beta_slack_user_ids=["UAJ"],
+            ),
+            labor=SimpleNamespace(meal_minimum_minutes=30),
+        )
+        self.user = UserProfile(
+            user_key="AJ",
+            display_name="AJ Torres",
+            slack_user_id="UAJ",
+            clickup_user_id="456",
+            preferred_transport="slack",
+            worker_type="contractor",
+            compensation_plan="cislune_hourly",
+        )
+        self.roster_by_slack_id = {"UAJ": self.user}
+        self.admin_profile_by_slack_user_id = lambda _slack_user_id: None
+        self._lock = asyncio.Lock()
+        self.dashboard_writes = 0
+
+    def get_user_session_for_moment(self, user):
+        now = datetime.now(timezone.utc)
+        return self.state_store.get_session(user.user_key, now.date().isoformat()), now
+
+    def _user_session_lock(self, _user_key):
+        return self._lock
+
+    @staticmethod
+    def _clone_session_state(session):
+        return deepcopy(session)
+
+    @staticmethod
+    def _active_short_rest_break(session):
+        value = session.metadata.get("short_rest_active")
+        return value if isinstance(value, dict) else None
+
+    @staticmethod
+    def _overtime_restart_blocked(session):
+        return bool(session.metadata.get("overtime_blocked"))
+
+    @staticmethod
+    def _active_task_id(session):
+        return session.metadata.get("active_clickup_task_id")
+
+    @staticmethod
+    async def _pause_current_task_tracking(_user, session, now, **_kwargs):
+        tracking = session.metadata.pop("clickup_time_tracking", None)
+        if tracking:
+            tracking["closed_at"] = now.isoformat()
+            session.metadata.setdefault("clickup_time_tracking_history", []).append(tracking)
+
+    @staticmethod
+    def _clear_clock_out_state(session):
+        session.clocked_out_at = None
+
+    @staticmethod
+    def _clear_auto_clock_out_metadata(session):
+        session.metadata.pop("auto_clock_out_reason", None)
+
+    @staticmethod
+    def _start_new_work_segment(session, now):
+        if not session.work_segments or session.work_segments[-1].get("clocked_out_at"):
+            session.work_segments.append({"clocked_in_at": now.isoformat(), "clocked_out_at": None})
+
+    @staticmethod
+    def _close_current_work_segment(session, now):
+        if session.work_segments and not session.work_segments[-1].get("clocked_out_at"):
+            session.work_segments[-1]["clocked_out_at"] = now.isoformat()
+
+    @staticmethod
+    async def _activate_clickup_task(_user, session, now, task_id, task_name):
+        session.metadata["active_clickup_task_id"] = task_id
+        session.metadata["active_clickup_task_name"] = task_name
+        session.metadata.setdefault(
+            "clickup_time_tracking",
+            {"task_id": task_id, "task_name": task_name, "started_at": now.isoformat()},
+        )
+
+    @staticmethod
+    def _stable_external_author_id(_value):
+        return 42
+
+    @staticmethod
+    def _touch_inbound_session(session, now):
+        session.last_user_message_at = now.isoformat()
+        session.pending_clickup_sync = True
+
+    async def _send_dm(self, _client, user, session, content, now):
+        posted = await self.slack.post_message(user.slack_user_id, content)
+        return MessageRecord(
+            message_id=f"slack:{posted['ts']}",
+            direction="outbound",
+            author_id=99,
+            created_at=now,
+            content=content,
+        )
+
+    async def _persist_session_state(self, _user, session, **_kwargs):
+        self.state_store.save_session(session)
+        return True
+
+    async def write_dashboard(self):
+        self.dashboard_writes += 1
+
+    @staticmethod
+    async def _maybe_check_short_rest_break(_client, _user, _session, _now):
+        return False
+
+    @staticmethod
+    async def _finalize_clickup_day(_user, session, now, **_kwargs):
+        tracking = session.metadata.pop("clickup_time_tracking", None)
+        if tracking:
+            tracking["closed_at"] = now.isoformat()
+            session.metadata.setdefault("clickup_time_tracking_history", []).append(tracking)
+        return "Task timer stopped."
+
+
+def test_roster_worker_portal_uses_one_live_session_and_idempotent_timer(tmp_path) -> None:
+    runtime = _LiveRuntime(tmp_path)
+    token = _token_from_link(build_worker_portal_link(runtime, runtime.user))
+    service = WorkerPortalService(runtime)
+
+    selected = asyncio.run(
+        service.apply_action(
+            token,
+            {
+                "action": "select_task",
+                "task_id": "assigned",
+                "task_name": "Build test fixture",
+                "task_location": "Hardware / Flight fixture",
+            },
+        )
+    )
+    assert selected["live"] is True
+
+    start = {
+        "action": "start",
+        "outcome": "A tested fixture assembly with the alignment measurements recorded for review",
+        "first_step": "Measure the fixture base and record the first alignment datum in the build sheet",
+        "estimate": "1 hour",
+        "checkpoint": "60 minutes",
+    }
+    first = asyncio.run(service.apply_action(token, start))
+    second = asyncio.run(service.apply_action(token, start))
+
+    assert first["work"]["status"] == "active"
+    assert second["work"]["status"] == "active"
+    assert "no duplicate time" in second["message"]
+    live_session, _ = runtime.get_user_session_for_moment(runtime.user)
+    assert len(live_session.work_segments) == 1
+    assert live_session.metadata["clickup_time_tracking"]["task_id"] == "assigned"
+    assert live_session.metadata.get("clickup_time_tracking_history", []) == []
+
+    clocked_out = asyncio.run(
+        service.apply_action(
+            token,
+            {
+                "action": "clock_out",
+                "progress": "Completed the fixture assembly and recorded all alignment measurements in the build sheet",
+                "blocker": "",
+            },
+        )
+    )
+    assert clocked_out["work"]["status"] == "clocked_out"
+    live_session, _ = runtime.get_user_session_for_moment(runtime.user)
+    assert live_session.work_segments[0]["clocked_out_at"]
+    assert len(live_session.metadata["clickup_time_tracking_history"]) == 1
+    assert any("Live work started" in message for _, message in runtime.slack.messages)
+    assert any("clocked out" in message.lower() for _, message in runtime.slack.messages)
+    assert runtime.dashboard_writes == 2

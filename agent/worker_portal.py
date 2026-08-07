@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 import base64
+import csv
 import hashlib
 import hmac
+import io
 import json
 import re
 import secrets
+import shutil
+import stat
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, TypeAlias
 from urllib.parse import quote, urlsplit
 
-from .models import AdminProfile, UserProfile
+from .config import parse_roster_bytes
+from .models import AdminProfile, MessageRecord, SessionState, UserProfile
+from .persistence import atomic_write_text
 
 
 _PORTAL_SECRET_STATE_KEY = "worker_portal_signing_secret"
@@ -170,7 +176,11 @@ class WorkerPortalService:
         if actor is None:
             raise ValueError("The beta tester is no longer configured.")
         state = self._load_state(slack_user_id, actor)
-        self._advance_deadlines(state)
+        if self._live_enabled(actor):
+            await self._enforce_live_deadlines(actor)
+            self._sync_state_from_live_session(actor, state)
+        else:
+            self._advance_deadlines(state)
         self._save_state(slack_user_id, state)
         tasks, task_warning = await self._load_task_options(actor, state)
         return self._payload(actor, state, tasks, task_warning)
@@ -181,12 +191,22 @@ class WorkerPortalService:
         if actor is None:
             raise ValueError("The beta tester is no longer configured.")
         state = self._load_state(slack_user_id, actor)
-        self._advance_deadlines(state)
+        live = self._live_enabled(actor)
+        if live:
+            await self._enforce_live_deadlines(actor)
+            self._sync_state_from_live_session(actor, state)
+        else:
+            self._advance_deadlines(state)
         action = str(payload.get("action") or "").strip().lower()
         message = ""
         if action == "save_profile":
             self._save_profile(state, payload)
-            message = "Profile saved. Don Pollo can now use this context when ranking work and timing prompts."
+            if live:
+                await self._save_live_profile(actor, state["profile"])
+                actor = resolve_worker_portal_actor(self.runtime, slack_user_id) or actor
+                message = "Schedule and worker context saved to the live Don Pollo roster."
+            else:
+                message = "Profile saved. Don Pollo can now use this context when ranking work and timing prompts."
         elif action == "select_task":
             task_id = _clean_text(payload.get("task_id"), limit=100)
             task_name = _clean_text(payload.get("task_name"), limit=240)
@@ -200,31 +220,59 @@ class WorkerPortalService:
             message = await self._claim_task(actor, state, payload)
         elif action == "start":
             try:
-                message = self._start_work(state, payload)
+                message = (
+                    await self._start_live_work(actor, state, payload)
+                    if live
+                    else self._start_work(state, payload)
+                )
             except ValueError as exc:
                 self._record_history(state, "start_rejected", str(exc))
                 self._save_state(slack_user_id, state)
                 raise
         elif action == "check_in":
-            message = self._check_in(state, payload)
+            message = (
+                await self._check_in_live_work(actor, state, payload)
+                if live
+                else self._check_in(state, payload)
+            )
         elif action == "short_rest":
-            message = self._start_short_rest(state)
+            message = (
+                await self._start_live_short_rest(actor)
+                if live
+                else self._start_short_rest(state)
+            )
         elif action == "lunch":
-            message = self._start_lunch(state)
+            message = (
+                await self._start_live_lunch(actor)
+                if live
+                else self._start_lunch(state)
+            )
         elif action == "back":
-            message = self._return_from_break(state)
+            message = (
+                await self._return_from_live_break(actor)
+                if live
+                else self._return_from_break(state)
+            )
         elif action == "clock_out":
-            message = self._clock_out(state)
+            message = (
+                await self._clock_out_live(actor, payload)
+                if live
+                else self._clock_out(state)
+            )
         elif action == "request_task":
             message = await self._request_task(slack_user_id, state, payload)
         elif action == "share_slack":
             message = await self._share_to_slack(slack_user_id, state)
         elif action == "reset_beta":
+            if live:
+                raise ValueError("Live time records cannot be reset from the worker portal. Ask a manager for a correction.")
             state = self._default_state(actor)
             message = "Beta workday reset. No live workforce records were changed."
         else:
             raise ValueError("Unsupported portal action.")
         self._record_history(state, action, message)
+        if live:
+            self._sync_state_from_live_session(actor, state)
         self._save_state(slack_user_id, state)
         tasks, task_warning = await self._load_task_options(actor, state)
         result = self._payload(actor, state, tasks, task_warning)
@@ -603,6 +651,464 @@ class WorkerPortalService:
             }
         )
 
+    def _live_enabled(self, actor: PortalActor) -> bool:
+        return isinstance(actor, UserProfile) and callable(
+            getattr(self.runtime, "get_user_session_for_moment", None)
+        )
+
+    async def _save_live_profile(
+        self,
+        actor: PortalActor,
+        profile: dict[str, Any],
+    ) -> None:
+        if not isinstance(actor, UserProfile):
+            return
+        bootstrap = getattr(self.runtime, "bootstrap", None)
+        config = getattr(self.runtime, "config", None)
+        config_path = getattr(bootstrap, "agent_config_path", None)
+        roster_file_name = str(getattr(config, "roster_file_name", "") or "")
+        if config_path is None or not roster_file_name:
+            self._update_actor_profile(actor, profile)
+            return
+        roster_path = config_path.parent / roster_file_name
+        if roster_path.suffix.lower() != ".csv":
+            raise ValueError("Live worker-context editing currently requires a CSV roster.")
+        raw = roster_path.read_bytes()
+        rows = list(csv.DictReader(raw.decode("utf-8-sig").splitlines()))
+        if not rows:
+            raise ValueError("The live roster has no worker rows to update.")
+        fieldnames = list(rows[0].keys())
+        row = next(
+            (item for item in rows if str(item.get("user_key") or "").strip() == actor.user_key),
+            None,
+        )
+        if row is None:
+            raise ValueError("This worker is no longer present in the live roster.")
+        updates = {
+            "weekly_target_hours": str(profile["weekly_target_hours"]),
+            "regular_workdays": ";".join(profile["regular_workdays"]),
+            "typical_start_time": str(profile["typical_start_time"]),
+            "typical_end_time": str(profile["typical_end_time"]),
+            "planned_time_off": ";".join(profile["planned_time_off"]),
+            "interests": ";".join(profile["interests"]),
+            "skills": ";".join(profile["skills"]),
+        }
+        missing = sorted(set(updates) - set(fieldnames))
+        if missing:
+            raise ValueError("The live roster is missing fields needed by the portal: " + ", ".join(missing))
+        row.update(updates)
+        output = io.StringIO(newline="")
+        writer = csv.DictWriter(output, fieldnames=fieldnames, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+        encoded = output.getvalue().encode("utf-8")
+        parse_roster_bytes(roster_path.name, encoded)
+        prior_mode = stat.S_IMODE(roster_path.stat().st_mode)
+        shutil.copy2(roster_path, roster_path.with_suffix(roster_path.suffix + ".portal.bak"))
+        atomic_write_text(roster_path, output.getvalue())
+        roster_path.chmod(prior_mode)
+        refresh = getattr(self.runtime, "refresh_configuration", None)
+        if callable(refresh):
+            await refresh(force=True)
+        else:
+            self._update_actor_profile(actor, profile)
+
+    @staticmethod
+    def _update_actor_profile(actor: UserProfile, profile: dict[str, Any]) -> None:
+        actor.weekly_target_hours = float(profile["weekly_target_hours"])
+        actor.regular_workdays = list(profile["regular_workdays"])
+        actor.typical_start_time = str(profile["typical_start_time"])
+        actor.typical_end_time = str(profile["typical_end_time"])
+        actor.planned_time_off = list(profile["planned_time_off"])
+        actor.interests = list(profile["interests"])
+        actor.skills = list(profile["skills"])
+
+    def _live_session(self, actor: UserProfile) -> tuple[SessionState, datetime]:
+        session, now = self.runtime.get_user_session_for_moment(actor)
+        return session, now
+
+    async def _start_live_work(
+        self,
+        actor: PortalActor,
+        state: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> str:
+        if not isinstance(actor, UserProfile):
+            raise ValueError("This portal account is not attached to a live worker record.")
+        work = state["work"]
+        task_id = str(work.get("selected_task_id") or "").strip()
+        task_name = str(work.get("selected_task_name") or "").strip()
+        if not task_id or not task_name:
+            raise ValueError("Choose a task before starting work.")
+        outcome = _clean_text(payload.get("outcome"), limit=800)
+        first_step = _clean_text(payload.get("first_step"), limit=500)
+        estimate = _clean_text(payload.get("estimate"), limit=40).lower()
+        checkpoint = _clean_text(payload.get("checkpoint"), limit=40).lower()
+        if estimate not in _VALID_ESTIMATES or checkpoint not in _VALID_CHECKPOINTS:
+            raise ValueError("Choose a time estimate and a checkpoint from the available options.")
+        today = datetime.now(timezone.utc).date().isoformat()
+        quality = state["quality"]
+        if quality.get("date") != today:
+            quality.update({"date": today, "weak_attempts": 0, "last_rejected_fingerprint": ""})
+        issues, fingerprint = validate_work_commitment(
+            outcome,
+            first_step,
+            previous_fingerprint=str(quality.get("last_rejected_fingerprint") or ""),
+        )
+        if issues:
+            quality["weak_attempts"] = int(quality.get("weak_attempts") or 0) + 1
+            quality["last_rejected_fingerprint"] = fingerprint
+            attempts = int(quality["weak_attempts"])
+            prefix = "A little more detail will make this useful."
+            if attempts >= 2:
+                prefix = "I’m seeing another vague or repeated answer."
+            if attempts >= 3:
+                prefix = "This is the third incomplete attempt today; manager approval is required before starting."
+            raise ValueError(
+                prefix
+                + " Clear details create a finish line and make handoffs possible. "
+                + " ".join(issues)
+            )
+
+        # Starting an open task is also the deliberate claim action. Existing co-owners remain assigned.
+        await self._claim_task(actor, state, {"task_id": task_id})
+        task_name = str(state["work"].get("selected_task_name") or task_name)
+        lock = self.runtime._user_session_lock(actor.user_key)
+        async with lock:
+            session, now = self._live_session(actor)
+            if session.stage == "on_lunch_break":
+                raise ValueError("Finish the unpaid lunch period before resuming work.")
+            if self.runtime._active_short_rest_break(session):
+                raise ValueError("Check back in from the short rest before changing work.")
+            if self.runtime._overtime_restart_blocked(session):
+                raise ValueError("The overtime limit was reached. A manager must approve more time before work restarts.")
+            prior_task_id = self.runtime._active_task_id(session)
+            if (
+                session.stage == "active"
+                and not session.clocked_out_at
+                and prior_task_id == task_id
+                and str(session.metadata.get("task_onboarding_tangible_result") or "") == outcome
+                and str(session.metadata.get("task_onboarding_plan") or "") == first_step
+            ):
+                return "This live task and plan are already running; no duplicate time or Slack update was created."
+            previous = self.runtime._clone_session_state(session)
+            if prior_task_id and prior_task_id != task_id:
+                await self.runtime._pause_current_task_tracking(
+                    actor,
+                    session,
+                    now,
+                    set_hold=True,
+                    end_reason="portal_task_switch",
+                )
+            if not session.clocked_in_at:
+                session.clocked_in_at = now.isoformat()
+            if session.clocked_out_at or session.stage == "clocked_out":
+                self.runtime._clear_clock_out_state(session)
+                self.runtime._clear_auto_clock_out_metadata(session)
+            self.runtime._start_new_work_segment(session, now)
+            session.stage = "active"
+            session.first_sign_of_life_at = session.first_sign_of_life_at or now.isoformat()
+            session.intake_completed_at = session.intake_completed_at or now.isoformat()
+            session.latest_plan = f"Result: {outcome}\nFirst move: {first_step}"
+            session.metadata.update(
+                {
+                    "task_onboarding_tangible_result": outcome,
+                    "task_onboarding_plan": first_step,
+                    "task_onboarding_estimate": estimate,
+                    "task_onboarding_checkpoint": checkpoint,
+                    "clickup_selection_reason": "Selected in live worker portal",
+                    "portal_last_started_at": now.isoformat(),
+                }
+            )
+            await self.runtime._activate_clickup_task(actor, session, now, task_id, task_name)
+            self._append_live_event(
+                actor,
+                session,
+                now,
+                f"Started {task_name}. Result: {outcome} First move: {first_step} Estimate: {estimate}; checkpoint: {checkpoint}.",
+            )
+            await self._notify_live(
+                actor,
+                session,
+                now,
+                f"Live work started on `{task_name}`. Your ClickUp task timer is running. Planned result: {outcome}",
+            )
+            await self._persist_live_action(actor, session, previous, now, "portal_start")
+        quality["strong_plans"] = int(quality.get("strong_plans") or 0) + 1
+        quality["last_rejected_fingerprint"] = ""
+        return "Live work started. The durable time record and ClickUp task timer are running."
+
+    async def _check_in_live_work(
+        self,
+        actor: PortalActor,
+        state: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> str:
+        if not isinstance(actor, UserProfile):
+            raise ValueError("This portal account is not attached to a live worker record.")
+        progress = _clean_text(payload.get("progress"), limit=800)
+        blocker = _clean_text(payload.get("blocker"), limit=500)
+        issue, _ = validate_meaningful_work_detail(progress, purpose="progress update")
+        if issue:
+            raise ValueError(issue)
+        lock = self.runtime._user_session_lock(actor.user_key)
+        async with lock:
+            session, now = self._live_session(actor)
+            if session.stage != "active" or session.clocked_out_at:
+                raise ValueError("Start or resume live work before posting a checkpoint.")
+            previous = self.runtime._clone_session_state(session)
+            session.latest_status = progress
+            session.latest_blocker = blocker or None
+            self._append_live_event(
+                actor,
+                session,
+                now,
+                f"Checkpoint: {progress}" + (f" Blocker: {blocker}" if blocker else ""),
+            )
+            await self._persist_live_action(actor, session, previous, now, "portal_checkpoint")
+        return "Checkpoint saved to the durable work record and queued for ClickUp sync."
+
+    async def _start_live_short_rest(self, actor: PortalActor) -> str:
+        if not isinstance(actor, UserProfile):
+            raise ValueError("This portal account is not attached to a live worker record.")
+        lock = self.runtime._user_session_lock(actor.user_key)
+        async with lock:
+            session, now = self._live_session(actor)
+            previous = self.runtime._clone_session_state(session)
+            if session.stage != "active":
+                raise ValueError("Short rest is available only while actively working.")
+            await self.runtime._maybe_start_short_rest_break(None, actor, session, now)
+            await self._persist_live_action(actor, session, previous, now, "portal_short_rest")
+        return "Paid short rest started. Check back in within 10 minutes or Don Pollo will clock you out at the cutoff."
+
+    async def _start_live_lunch(self, actor: PortalActor) -> str:
+        if not isinstance(actor, UserProfile):
+            raise ValueError("This portal account is not attached to a live worker record.")
+        lock = self.runtime._user_session_lock(actor.user_key)
+        async with lock:
+            session, now = self._live_session(actor)
+            previous = self.runtime._clone_session_state(session)
+            if session.stage != "active":
+                raise ValueError("Lunch is available only while actively working.")
+            await self.runtime._maybe_start_lunch_break(None, actor, session, now)
+            await self._persist_live_action(actor, session, previous, now, "portal_lunch")
+        return "Unpaid lunch started. Work and ClickUp time are paused for at least 30 minutes."
+
+    async def _return_from_live_break(self, actor: PortalActor) -> str:
+        if not isinstance(actor, UserProfile):
+            raise ValueError("This portal account is not attached to a live worker record.")
+        lock = self.runtime._user_session_lock(actor.user_key)
+        async with lock:
+            session, now = self._live_session(actor)
+            previous = self.runtime._clone_session_state(session)
+            if self.runtime._active_short_rest_break(session):
+                self.runtime._finish_short_rest_break(session, now, outcome="returned_via_portal")
+                await self._notify_live(
+                    actor,
+                    session,
+                    now,
+                    "Welcome back. Your paid short rest ended and live task time continues.",
+                )
+                result = "Checked back in. Live task time continues."
+            elif session.stage == "on_lunch_break":
+                await self.runtime._end_lunch_break(None, actor, session, now)
+                if session.stage == "on_lunch_break":
+                    raise ValueError("The unpaid lunch minimum has not ended yet. Don Pollo sent the remaining time in Slack.")
+                result = "Checked back in. Live work and ClickUp task time resumed."
+            else:
+                raise ValueError("There is no active break to return from.")
+            await self._persist_live_action(actor, session, previous, now, "portal_break_return")
+        return result
+
+    async def _clock_out_live(self, actor: PortalActor, payload: dict[str, Any]) -> str:
+        if not isinstance(actor, UserProfile):
+            raise ValueError("This portal account is not attached to a live worker record.")
+        lock = self.runtime._user_session_lock(actor.user_key)
+        async with lock:
+            session, now = self._live_session(actor)
+            if session.stage == "clocked_out" or session.clocked_out_at:
+                raise ValueError("You are already clocked out.")
+            progress = _clean_text(payload.get("progress"), limit=800) or str(session.latest_status or "")
+            blocker = _clean_text(payload.get("blocker"), limit=500) or str(session.latest_blocker or "")
+            issue, _ = validate_meaningful_work_detail(progress, purpose="clock-out result")
+            if issue:
+                raise ValueError("Before clocking out, " + issue[0].lower() + issue[1:])
+            previous = self.runtime._clone_session_state(session)
+            session.latest_status = progress
+            session.latest_blocker = blocker or None
+            if self.runtime._active_short_rest_break(session):
+                self.runtime._finish_short_rest_break(session, now, outcome="manual_clock_out_via_portal")
+            note = await self.runtime._finalize_clickup_day(
+                actor,
+                session,
+                now,
+                allow_status_completion=False,
+                include_next_task_suggestion=False,
+                pause_reason="portal_clock_out",
+            )
+            session.clocked_out_at = now.isoformat()
+            self.runtime._close_current_work_segment(session, now)
+            session.stage = "clocked_out"
+            session.awaiting_clock_out_photo = False
+            session.awaiting_clock_out_summary = False
+            session.pending_clickup_sync = True
+            session.metadata["clock_out_source"] = "worker_portal"
+            self._append_live_event(
+                actor,
+                session,
+                now,
+                f"Clocked out. Result: {progress}" + (f" Blocker: {blocker}" if blocker else ""),
+            )
+            await self._notify_live(
+                actor,
+                session,
+                now,
+                "You are clocked out. Your result is saved and the task timer is stopped."
+                + (f"\n\n{note}" if note else ""),
+            )
+            await self._persist_live_action(actor, session, previous, now, "portal_clock_out")
+        return "Clocked out. The durable time record and task timer are closed."
+
+    async def _enforce_live_deadlines(self, actor: PortalActor) -> None:
+        if not isinstance(actor, UserProfile):
+            return
+        lock = self.runtime._user_session_lock(actor.user_key)
+        async with lock:
+            session, now = self._live_session(actor)
+            previous = self.runtime._clone_session_state(session)
+            changed = await self.runtime._maybe_check_short_rest_break(None, actor, session, now)
+            if changed:
+                await self._persist_live_action(
+                    actor,
+                    session,
+                    previous,
+                    now,
+                    "portal_short_rest_deadline",
+                )
+
+    def _sync_state_from_live_session(
+        self,
+        actor: PortalActor,
+        state: dict[str, Any],
+    ) -> None:
+        if not isinstance(actor, UserProfile):
+            return
+        session, _ = self._live_session(actor)
+        work = state["work"]
+        active_short_rest = self.runtime._active_short_rest_break(session)
+        if session.stage == "on_lunch_break":
+            status_value = "lunch"
+        elif active_short_rest:
+            status_value = "short_rest"
+        elif session.stage == "clocked_out" or session.clocked_out_at:
+            status_value = "clocked_out"
+        elif session.stage == "active" and session.clocked_in_at:
+            status_value = "active"
+        else:
+            status_value = "ready"
+        active_task_id = str(self.runtime._active_task_id(session) or "")
+        active_task_name = str(session.metadata.get("active_clickup_task_name") or "")
+        lunch_started = str(session.metadata.get("lunch_started_at") or "")
+        minimum_end = ""
+        if lunch_started:
+            parsed = _parse_datetime(lunch_started)
+            if parsed:
+                minimum_end = (
+                    parsed + timedelta(minutes=self.runtime.config.labor.meal_minimum_minutes)
+                ).isoformat()
+        work.update(
+            {
+                "status": status_value,
+                "selected_task_id": (
+                    active_task_id
+                    if status_value in {"active", "short_rest", "lunch"}
+                    else work.get("selected_task_id", "")
+                ),
+                "selected_task_name": (
+                    active_task_name
+                    if status_value in {"active", "short_rest", "lunch"}
+                    else work.get("selected_task_name", "")
+                ),
+                "outcome": str(session.metadata.get("task_onboarding_tangible_result") or work.get("outcome") or ""),
+                "first_step": str(session.metadata.get("task_onboarding_plan") or work.get("first_step") or ""),
+                "estimate": str(session.metadata.get("task_onboarding_estimate") or work.get("estimate") or "1 hour"),
+                "checkpoint": str(session.metadata.get("task_onboarding_checkpoint") or work.get("checkpoint") or "60 minutes"),
+                "started_at": str(session.clocked_in_at or ""),
+                "break_started_at": str((active_short_rest or {}).get("started_at") or lunch_started),
+                "break_cutoff_at": str((active_short_rest or {}).get("deadline_at") or ""),
+                "break_minimum_end_at": minimum_end,
+                "latest_progress": str(session.latest_status or ""),
+                "latest_blocker": str(session.latest_blocker or ""),
+                "notice": self._live_notice(status_value),
+            }
+        )
+
+    @staticmethod
+    def _live_notice(status_value: str) -> str:
+        return {
+            "active": "Live work and ClickUp task time are running.",
+            "short_rest": "Paid short rest is live. Check back in before the 10-minute cutoff.",
+            "lunch": "Unpaid lunch is live. Work and ClickUp time are paused.",
+            "clocked_out": "You are clocked out; task time is stopped.",
+        }.get(status_value, "Choose a task and write a concrete result to begin live work.")
+
+    def _append_live_event(
+        self,
+        actor: UserProfile,
+        session: SessionState,
+        now: datetime,
+        content: str,
+    ) -> None:
+        author_id = self.runtime._stable_external_author_id(
+            f"portal:{actor.slack_user_id or actor.user_key}"
+        )
+        self.runtime.state_store.append_message(
+            actor.user_key,
+            session.session_date,
+            MessageRecord(
+                message_id=f"portal:{secrets.token_hex(12)}",
+                direction="inbound",
+                author_id=author_id,
+                created_at=now,
+                content=content,
+                attachments=[],
+            ),
+        )
+        self.runtime._touch_inbound_session(session, now)
+        session.first_sign_of_life_at = session.first_sign_of_life_at or now.isoformat()
+
+    async def _notify_live(
+        self,
+        actor: UserProfile,
+        session: SessionState,
+        now: datetime,
+        message: str,
+    ) -> None:
+        try:
+            await self.runtime._send_dm(None, actor, session, message, now)
+        except Exception as exc:
+            session.metadata["portal_slack_notification_error"] = str(exc)[:300]
+
+    async def _persist_live_action(
+        self,
+        actor: UserProfile,
+        session: SessionState,
+        previous: SessionState,
+        now: datetime,
+        trigger: str,
+    ) -> None:
+        await self.runtime._persist_session_state(
+            actor,
+            session,
+            now=now,
+            previous_session=previous,
+            trigger=trigger,
+            details={"source": "worker_portal"},
+        )
+        write_dashboard = getattr(self.runtime, "write_dashboard", None)
+        if callable(write_dashboard):
+            await write_dashboard()
+
     def _start_work(self, state: dict[str, Any], payload: dict[str, Any]) -> str:
         work = state["work"]
         if not work.get("selected_task_id"):
@@ -750,25 +1256,27 @@ class WorkerPortalService:
             "title": title,
             "reason": reason,
             "task_type": task_type,
-            "status": "beta pending",
+            "status": "pending approval",
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         state["task_requests"] = [request] + list(state.get("task_requests") or [])[:9]
         await self._post_slack(
             slack_user_id,
             (
-                f"Don Pollo web beta task request (no ClickUp task created)\n"
+                f"Don Pollo portal task request (pending approval; no ClickUp task created yet)\n"
                 f"• {title}\n• Type: {task_type}\n• Why: {reason}\n"
-                "This demonstrates the future Erik/George approval handoff."
+                "Erik or George can approve this before it becomes tracked work."
             ),
         )
-        return "Beta task request saved and sent to your Slack DM for approval-flow review."
+        return "Task request saved and sent to Slack for Erik or George to approve."
 
     async def _share_to_slack(self, slack_user_id: str, state: dict[str, Any]) -> str:
         work = state["work"]
         task_name = str(work.get("selected_task_name") or "No task selected")
+        actor = resolve_worker_portal_actor(self.runtime, slack_user_id)
+        live = actor is not None and self._live_enabled(actor)
         lines = [
-            "Don Pollo web beta summary (preview only)",
+            "Don Pollo live work summary" if live else "Don Pollo admin-preview summary",
             f"• Task: {task_name}",
             f"• Intended result: {work.get('outcome') or 'not entered'}",
             f"• First step: {work.get('first_step') or 'not entered'}",
@@ -778,13 +1286,16 @@ class WorkerPortalService:
             lines.append(f"• Progress: {work['latest_progress']}")
         if work.get("latest_blocker"):
             lines.append(f"• Blocker: {work['latest_blocker']}")
-        lines.append("No live time or payroll records were changed; only an explicit Claim action can add the tester as a ClickUp assignee.")
+        if live:
+            lines.append("This reflects the same durable work session and ClickUp timer used by Don Pollo in Slack.")
+        else:
+            lines.append("Admin preview only: no live time or payroll record was changed.")
         await self._post_slack(slack_user_id, "\n".join(lines))
-        return "A concise beta summary was sent to your Slack DM."
+        return "A concise live summary was sent to your Slack DM." if live else "A preview summary was sent to Slack."
 
     async def _post_slack(self, slack_user_id: str, message: str) -> None:
         if not self.runtime.slack:
-            raise ValueError("Slack is unavailable right now; the beta state was not sent.")
+            raise ValueError("Slack is unavailable right now; the portal update was not sent.")
         await self.runtime.slack.post_message(slack_user_id, message)
 
     def _advance_deadlines(self, state: dict[str, Any]) -> None:
@@ -816,6 +1327,7 @@ class WorkerPortalService:
         cutoff = _parse_datetime(work.get("break_cutoff_at"))
         return {
             "beta": True,
+            "live": self._live_enabled(actor),
             "actor": {"name": _actor_name(actor), "slack_user_id": actor.slack_user_id},
             "profile": state["profile"],
             "work": work,
@@ -957,7 +1469,7 @@ def _portal_template() -> str:
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
-  <title>Don Pollo Workday Beta</title>
+  <title>Don Pollo Workday</title>
   <style>
     :root { --ink:#152821; --muted:#607069; --paper:#f5f1e8; --card:#fffdf8; --line:#d8ded8; --teal:#176e64; --teal-dark:#0d4f48; --orange:#e47d35; --soft:#e8f2ef; --danger:#a83f32; }
     * { box-sizing:border-box; }
@@ -1058,7 +1570,7 @@ def _portal_template() -> str:
   <main class="shell">
     <header class="topbar">
       <div class="brand"><div class="mark">DP</div><div><div class="eyebrow">Cislune work system</div><h1>Don Pollo Workday</h1></div></div>
-      <div class="status"><span class="pill beta">Erik-only beta</span><span class="pill" id="clock-pill">Ready</span><span class="pill">Slack connected</span></div>
+      <div class="status"><span class="pill beta" id="mode-pill">Portal</span><span class="pill" id="clock-pill">Ready</span><span class="pill">Slack connected</span></div>
     </header>
     <section class="panel work-now" id="work-now">
       <div class="section-head"><div><div class="eyebrow">Work now</div><h2>Start or continue useful work</h2></div><span class="pill" id="quality-pill">0 strong plans</span></div>
@@ -1070,8 +1582,8 @@ def _portal_template() -> str:
         <label>Rough estimate<select id="estimate"><option>30 minutes</option><option selected>1 hour</option><option>2 hours</option><option>half day</option><option>full day</option><option>multi-day</option></select></label>
         <label>Reconsider / ask for help after<select id="checkpoint"><option>30 minutes</option><option selected>60 minutes</option><option>90 minutes</option><option>2 hours</option></select></label>
       </div>
-      <div class="actions"><button class="button primary" data-action="start">Start beta work</button><button class="button orange" id="claim-selected" data-action="claim-task">Claim in ClickUp</button><button class="button subtle" data-action="short-rest">Short rest</button><button class="button subtle" data-action="lunch">Lunch</button><button class="button subtle" data-action="back">Back</button><button class="button danger subtle" data-action="clock-out">Clock out</button></div>
-      <p class="muted" style="margin:12px 0 0">A recognizable result and concrete first move are required. Beta time and payroll stay isolated; only the clearly labeled Claim action changes ClickUp by adding you as an assignee.</p>
+      <div class="actions"><button class="button primary" id="start-button" data-action="start">Start work</button><button class="button orange" id="claim-selected" data-action="claim-task">Claim in ClickUp</button><button class="button subtle" data-action="short-rest">Short rest</button><button class="button subtle" data-action="lunch">Lunch</button><button class="button subtle" data-action="back">Back</button><button class="button danger subtle" data-action="clock-out">Clock out</button></div>
+      <p class="muted" id="mode-note" style="margin:12px 0 0">A recognizable result and concrete first move are required.</p>
     </section>
     <section class="panel section-space">
       <details class="chooser-details" id="recommended-details" open>
@@ -1082,7 +1594,7 @@ def _portal_template() -> str:
     <section class="panel section-space">
       <details class="chooser-details" id="catalog-details" open>
         <summary class="chooser-summary"><span><span class="eyebrow">Explore Cislune work</span><br><h2>Browse all potential tasks</h2></span><span class="pill" id="task-total">0 open tasks</span></summary>
-        <div class="chooser-body"><p class="muted">Open ClickUp work organized by contract or program, then space and list.</p><div class="catalog-tools"><label>Search tasks, contracts, or spaces<input id="task-search" type="search" placeholder="Search all open work"></label><label class="inline-check"><input id="assigned-only" type="checkbox"> Assigned to me only</label></div><div class="catalog" id="task-catalog"></div><details><summary>Nothing fits? Propose work for approval</summary><div class="form-grid" style="margin-top:12px"><label>Task title<input id="request-title" placeholder="Label and organize the electronics bench"></label><label>Type<select id="request-type"><option value="project">Project</option><option value="overhead">Overhead / shop</option></select></label><label style="grid-column:1/-1">Why this should be done<textarea id="request-reason" placeholder="What result or problem does this address?"></textarea></label></div><div class="actions"><button class="button" data-action="request-task">Send beta approval request to Slack</button></div></details></div>
+        <div class="chooser-body"><p class="muted">Open ClickUp work organized by contract or program, then space and list.</p><div class="catalog-tools"><label>Search tasks, contracts, or spaces<input id="task-search" type="search" placeholder="Search all open work"></label><label class="inline-check"><input id="assigned-only" type="checkbox"> Assigned to me only</label></div><div class="catalog" id="task-catalog"></div><details><summary>Nothing fits? Propose work for approval</summary><div class="form-grid" style="margin-top:12px"><label>Task title<input id="request-title" placeholder="Label and organize the electronics bench"></label><label>Type<select id="request-type"><option value="project">Project</option><option value="overhead">Overhead / shop</option></select></label><label style="grid-column:1/-1">Why this should be done<textarea id="request-reason" placeholder="What result or problem does this address?"></textarea></label></div><div class="actions"><button class="button" data-action="request-task">Request approval in Slack</button></div></details></div>
       </details>
     </section>
     <div class="layout">
@@ -1090,12 +1602,12 @@ def _portal_template() -> str:
         <section class="panel">
           <div class="eyebrow">Checkpoint</div><h2>Say what changed, not just that you worked.</h2>
           <div class="form-grid"><label>Meaningful progress<textarea id="progress" placeholder="What now exists, changed, passed, failed, or was learned?"></textarea></label><label>Blocker or help needed<textarea id="blocker" placeholder="Optional. Name the decision, dependency, or failed approach."></textarea></label></div>
-          <div class="actions"><button class="button primary" data-action="check-in">Save checkpoint</button><button class="button" data-action="share-slack">Send concise beta summary to Slack</button></div>
+          <div class="actions"><button class="button primary" data-action="check-in">Save checkpoint</button><button class="button" data-action="share-slack">Send concise summary to Slack</button></div>
         </section>
       </div>
       <aside class="stack">
         <section class="panel"><div class="eyebrow">Worker context</div><h2 id="welcome">Welcome</h2><p class="muted" id="schedule-line"></p><div class="profile-summary"><div class="fact"><small>Skills</small><span id="skills-line">—</span></div><div class="fact"><small>Interests</small><span id="interests-line">—</span></div></div><details id="profile-details" open><summary id="profile-summary-label">Set schedule & fit</summary><div style="margin-top:12px" class="stack"><label>Weekly target hours<input id="weekly-hours" type="number" min="1" max="80" step="0.5"></label><label>Regular workdays<div class="days" id="workdays"></div></label><div class="form-grid"><label>Typical start<input id="start-time" type="time"></label><label>Typical end<input id="end-time" type="time"></label></div><label>Planned time off<input id="time-off" placeholder="2026-08-21, 2026-08-24"></label><label>Interests<input id="interests" placeholder="robotics, fabrication, flight testing"></label><label>Skills<input id="skills" placeholder="CAD, Python, assembly"></label><button class="button" data-action="save-profile">Save worker context</button></div></details></section>
-        <section class="panel"><div class="section-head"><div><div class="eyebrow">Recent beta activity</div><h2>Audit trail</h2></div></div><div class="history" id="history"></div><div class="actions"><button class="button subtle danger" data-action="reset-beta">Reset beta</button></div></section>
+        <section class="panel"><div class="section-head"><div><div class="eyebrow" id="history-eyebrow">Recent portal activity</div><h2>Audit trail</h2></div></div><div class="history" id="history"></div><div class="actions"><button class="button subtle danger" id="reset-beta" data-action="reset-beta">Reset preview</button></div></section>
       </aside>
     </div>
   </main>
@@ -1141,7 +1653,16 @@ def _portal_template() -> str:
     }
     function render() {
       const work = data.work || {}, profile = data.profile || {}, quality = data.quality || {};
-      $('welcome').textContent = `Welcome, ${(data.actor || {}).name || 'beta tester'}`;
+      const live = Boolean(data.live);
+      $('welcome').textContent = `Welcome, ${(data.actor || {}).name || 'worker'}`;
+      $('mode-pill').textContent = live ? 'Live workday' : 'Admin preview';
+      $('mode-pill').classList.toggle('running', live);
+      $('start-button').textContent = live ? 'Start / update live work' : 'Start preview work';
+      $('mode-note').textContent = live
+        ? 'This is the official work record. Starting also claims the task without removing co-owners, clocks you in, and runs the ClickUp timer. Slack uses this same session—never a duplicate.'
+        : 'Admin preview only: time and payroll stay isolated. The explicit Claim action can still add you as a ClickUp assignee.';
+      $('history-eyebrow').textContent = live ? 'Recent live activity' : 'Recent preview activity';
+      $('reset-beta').hidden = live;
       $('clock-pill').textContent = String(work.status || 'ready').replaceAll('_',' ');
       $('clock-pill').classList.toggle('running', work.status === 'active');
       $('work-notice').innerHTML = work.notice ? `<div class="notice">${esc(work.notice)}</div>` : '';
@@ -1179,7 +1700,7 @@ def _portal_template() -> str:
         $('catalog-details').open = !work.selected_task_id;
         chooserInitialized = true;
       }
-      $('history').innerHTML = (data.history || []).length ? (data.history || []).map(item => `<article><strong>${esc(String(item.action || '').replaceAll('_',' '))}</strong><br>${esc(item.message)}<br><time>${new Date(item.at).toLocaleString()}</time></article>`).join('') : '<p class="muted">No beta actions yet.</p>';
+      $('history').innerHTML = (data.history || []).length ? (data.history || []).map(item => `<article><strong>${esc(String(item.action || '').replaceAll('_',' '))}</strong><br>${esc(item.message)}<br><time>${new Date(item.at).toLocaleString()}</time></article>`).join('') : '<p class="muted">No portal actions yet.</p>';
       document.querySelector('[data-action="back"]').disabled = !['short_rest','lunch'].includes(work.status);
       document.querySelector('[data-action="short-rest"]').disabled = work.status !== 'active';
       document.querySelector('[data-action="lunch"]').disabled = work.status !== 'active';
@@ -1191,6 +1712,7 @@ def _portal_template() -> str:
     function actionPayload(action) {
       if (action === 'start') return {action, outcome:$('outcome').value, first_step:$('first-step').value, estimate:$('estimate').value, checkpoint:$('checkpoint').value};
       if (action === 'check-in') return {action, progress:$('progress').value, blocker:$('blocker').value};
+      if (action === 'clock-out') return {action:'clock_out', progress:$('progress').value, blocker:$('blocker').value};
       if (action === 'claim-task') return {action:'claim_task', task_id:(data.work || {}).selected_task_id};
       if (action === 'save-profile') return {action:'save_profile', weekly_target_hours:$('weekly-hours').value, regular_workdays:[...document.querySelectorAll('#workdays input:checked')].map(node => node.value), typical_start_time:$('start-time').value, typical_end_time:$('end-time').value, planned_time_off:$('time-off').value, interests:$('interests').value, skills:$('skills').value};
       if (action === 'request-task') return {action:'request_task', title:$('request-title').value, task_type:$('request-type').value, reason:$('request-reason').value};
