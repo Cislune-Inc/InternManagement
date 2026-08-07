@@ -16,6 +16,7 @@ from .models import AdminProfile, UserProfile
 
 _PORTAL_SECRET_STATE_KEY = "worker_portal_signing_secret"
 _PORTAL_STATE_PREFIX = "worker_portal_beta:"
+_PORTAL_BETA_ADMIN_NAMES = {"erik"}
 _GENERIC_WORK_REPLIES = {
     "continue",
     "continue working",
@@ -42,6 +43,8 @@ def build_worker_portal_link(
 ) -> str:
     if not admin.slack_user_id:
         raise ValueError("The beta tester needs a Slack member ID.")
+    if admin.name.strip().casefold() not in _PORTAL_BETA_ADMIN_NAMES:
+        raise ValueError("The worker portal is still limited to the current beta tester.")
     reference = now or datetime.now(timezone.utc)
     token = _issue_token(runtime, admin.slack_user_id, reference, ttl_hours=ttl_hours)
     manager_url = str(runtime.config.slack.manager_queue_url or "http://127.0.0.1:8765/exceptions")
@@ -73,7 +76,8 @@ def validate_worker_portal_token(
     reference = now or datetime.now(timezone.utc)
     if not subject or int(reference.timestamp()) >= expires_at:
         raise ValueError("This portal link expired. DM `portal` to Don Pollo in Slack for a fresh link.")
-    if runtime.admin_profile_by_slack_user_id(subject) is None:
+    admin = runtime.admin_profile_by_slack_user_id(subject)
+    if admin is None or admin.name.strip().casefold() not in _PORTAL_BETA_ADMIN_NAMES:
         raise ValueError("This beta link is not assigned to a current Don Pollo administrator.")
     return subject
 

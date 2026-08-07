@@ -105,6 +105,14 @@ def test_signed_portal_link_is_vpn_scoped_and_expires(tmp_path) -> None:
         validate_worker_portal_token(runtime, token, now=now + timedelta(hours=3))
 
 
+def test_worker_portal_remains_limited_to_erik_during_beta(tmp_path) -> None:
+    runtime, _admin, _slack = _runtime(tmp_path)
+    george = AdminProfile(name="George", discord_user_id=998, slack_user_id="UGEORGE")
+
+    with pytest.raises(ValueError, match="current beta tester"):
+        build_worker_portal_link(runtime, george)
+
+
 def test_work_commitment_rejects_vague_and_repeated_answers() -> None:
     issues, fingerprint = validate_work_commitment("make progress", "continue")
     assert len(issues) == 2
