@@ -8,7 +8,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from dotenv import load_dotenv
 
@@ -31,11 +31,13 @@ from .time_tracking_dashboard import (
 )
 from .time_utils import resolve_timezone
 from .work_dashboard import build_work_dashboard_payload, render_work_dashboard_html
+from .worker_portal import WorkerPortalService
 
 
 class HoursEditorService:
     def __init__(self, runtime: InternManagementRuntime) -> None:
         self.runtime = runtime
+        self.worker_portal = WorkerPortalService(runtime)
 
     def _reference_now(self) -> datetime:
         return datetime.now(tz=resolve_timezone(self.runtime.runtime_timezone_name()))
@@ -97,6 +99,19 @@ class HoursEditorService:
         return render_manager_exceptions_html(
             self.build_manager_exceptions_payload()
         )
+
+    def build_worker_portal_payload(self, token: str) -> dict[str, Any]:
+        return asyncio.run(self.worker_portal.build_payload(token))
+
+    def render_worker_portal_html(self, token: str) -> str:
+        return self.worker_portal.render_html(self.build_worker_portal_payload(token))
+
+    def apply_worker_portal_action(
+        self,
+        token: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return asyncio.run(self.worker_portal.apply_action(token, payload))
 
     def resolve_operational_issue(self, payload: dict[str, Any]) -> dict[str, Any]:
         fingerprint = str(payload.get("fingerprint") or "").strip()
@@ -232,6 +247,8 @@ def build_request_handler(service: HoursEditorService) -> type[BaseHTTPRequestHa
 
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
+            query = parse_qs(parsed.query)
+            token = str((query.get("token") or [""])[0])
             if parsed.path in {"/", "/time"}:
                 self._respond_html(service.render_dashboard_html())
                 return
@@ -246,6 +263,12 @@ def build_request_handler(service: HoursEditorService) -> type[BaseHTTPRequestHa
                 return
             if parsed.path == "/exceptions":
                 self._respond_html(service.render_manager_exceptions_html())
+                return
+            if parsed.path == "/portal":
+                try:
+                    self._respond_html(service.render_worker_portal_html(token), no_store=True)
+                except ValueError as exc:
+                    self._respond_error(HTTPStatus.FORBIDDEN, str(exc))
                 return
             if parsed.path == "/api/dashboard-data":
                 self._respond_json(service.build_dashboard_payload())
@@ -262,6 +285,12 @@ def build_request_handler(service: HoursEditorService) -> type[BaseHTTPRequestHa
             if parsed.path == "/api/exceptions":
                 self._respond_json(service.build_manager_exceptions_payload())
                 return
+            if parsed.path == "/api/portal-data":
+                try:
+                    self._respond_json(service.build_worker_portal_payload(token), no_store=True)
+                except ValueError as exc:
+                    self._respond_error(HTTPStatus.FORBIDDEN, str(exc))
+                return
             if parsed.path.startswith("/payroll/files/"):
                 filename = parsed.path.rsplit("/", 1)[-1]
                 download = service.payroll_download(filename)
@@ -274,6 +303,8 @@ def build_request_handler(service: HoursEditorService) -> type[BaseHTTPRequestHa
 
         def do_POST(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
+            query = parse_qs(parsed.query)
+            token = str((query.get("token") or [""])[0])
             if parsed.path not in {
                 "/api/edit-preview",
                 "/api/edit-apply",
@@ -281,6 +312,7 @@ def build_request_handler(service: HoursEditorService) -> type[BaseHTTPRequestHa
                 "/api/issues/resolve",
                 "/api/routes/resolve",
                 "/api/work-assignment/resolve",
+                "/api/portal/action",
             }:
                 self._respond_error(HTTPStatus.NOT_FOUND, "Not found.")
                 return
@@ -288,6 +320,8 @@ def build_request_handler(service: HoursEditorService) -> type[BaseHTTPRequestHa
                 payload = self._read_json_body()
                 if parsed.path == "/api/edit-preview":
                     result = service.preview_edit(payload)
+                elif parsed.path == "/api/portal/action":
+                    result = service.apply_worker_portal_action(token, payload)
                 elif parsed.path == "/api/payroll-review-resolve":
                     result = service.resolve_payroll_review(payload)
                 elif parsed.path == "/api/issues/resolve":
@@ -320,18 +354,23 @@ def build_request_handler(service: HoursEditorService) -> type[BaseHTTPRequestHa
                 raise ValueError("Request body must be a JSON object.")
             return loaded
 
-        def _respond_html(self, html: str) -> None:
+        def _respond_html(self, html: str, *, no_store: bool = False) -> None:
             encoded = html.encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            if no_store:
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Referrer-Policy", "no-referrer")
             self.send_header("Content-Length", str(len(encoded)))
             self.end_headers()
             self.wfile.write(encoded)
 
-        def _respond_json(self, payload: dict[str, Any]) -> None:
+        def _respond_json(self, payload: dict[str, Any], *, no_store: bool = False) -> None:
             encoded = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            if no_store:
+                self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(encoded)))
             self.end_headers()
             self.wfile.write(encoded)

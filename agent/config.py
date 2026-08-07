@@ -217,6 +217,14 @@ def parse_user_profile(row: dict[str, Any], source: str = "roster") -> UserProfi
             worker_type not in {"salaried", "exempt", "external", "contractor"},
         ),
         expected_daily_hours=_parse_float_default(row.get("expected_daily_hours"), 8.0),
+        weekly_target_hours=_parse_float_default(row.get("weekly_target_hours"), 40.0),
+        regular_workdays=_parse_semicolon_list(row.get("regular_workdays"))
+        or ["monday", "tuesday", "wednesday", "thursday", "friday"],
+        typical_start_time=str(row.get("typical_start_time") or "09:00").strip(),
+        typical_end_time=str(row.get("typical_end_time") or "17:00").strip(),
+        planned_time_off=_parse_semicolon_list(row.get("planned_time_off")),
+        interests=_parse_semicolon_list(row.get("interests")),
+        skills=_parse_semicolon_list(row.get("skills")),
         check_in_interval_minutes=_parse_optional_positive_int(
             row.get("check_in_interval_minutes"),
             source,
@@ -252,6 +260,10 @@ def _clean_optional(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _parse_semicolon_list(value: Any) -> list[str]:
+    return [item.strip() for item in str(value or "").split(";") if item.strip()]
 
 
 def _parse_bool(value: Any) -> bool:

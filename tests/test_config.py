@@ -198,6 +198,24 @@ def test_parse_roster_csv() -> None:
     assert roster[0].clickup_user_email == "alex@example.com"
     assert roster[0].slack_user_id == "U123456"
     assert roster[0].storage_folder_name == "Alex Folder"
+    assert roster[0].weekly_target_hours == 40.0
+    assert roster[0].regular_workdays == ["monday", "tuesday", "wednesday", "thursday", "friday"]
+
+
+def test_parse_roster_csv_worker_context_fields() -> None:
+    roster = parse_roster_bytes(
+        "roster.csv",
+        (
+            "user_key,display_name,discord_user_id,slack_user_id,active,weekly_target_hours,regular_workdays,typical_start_time,typical_end_time,planned_time_off,interests,skills\n"
+            "alex,Alex,123,U123,true,24,monday;wednesday;friday,10:00,16:00,2026-08-21;2026-08-24,robotics;space systems,CAD;Python\n"
+        ).encode(),
+    )
+
+    assert roster[0].weekly_target_hours == 24.0
+    assert roster[0].regular_workdays == ["monday", "wednesday", "friday"]
+    assert roster[0].planned_time_off == ["2026-08-21", "2026-08-24"]
+    assert roster[0].interests == ["robotics", "space systems"]
+    assert roster[0].skills == ["CAD", "Python"]
 
 
 def test_parse_roster_csv_accepts_utf8_bom_header() -> None:

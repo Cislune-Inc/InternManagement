@@ -218,6 +218,15 @@ class UserProfile:
     meal_tracking_required: bool = True
     overtime_approval_required: bool = False
     expected_daily_hours: float = 8.0
+    weekly_target_hours: float = 40.0
+    regular_workdays: list[str] = field(
+        default_factory=lambda: ["monday", "tuesday", "wednesday", "thursday", "friday"]
+    )
+    typical_start_time: str = "09:00"
+    typical_end_time: str = "17:00"
+    planned_time_off: list[str] = field(default_factory=list)
+    interests: list[str] = field(default_factory=list)
+    skills: list[str] = field(default_factory=list)
     check_in_interval_minutes: int | None = None
     gusto_entity_uuid: str | None = None
     labor_cost_rate: float | None = None

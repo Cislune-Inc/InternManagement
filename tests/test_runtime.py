@@ -460,6 +460,50 @@ def test_slack_admin_dm_uses_admin_console_without_worker_roster_entry() -> None
     ]
 
 
+def test_slack_admin_portal_command_returns_signed_vpn_beta_link(tmp_path: Path) -> None:
+    runtime = _build_runtime(
+        admins=[
+            AdminProfile(
+                name="Erik",
+                discord_user_id=999,
+                slack_user_id="U01SWQKDTBM",
+            )
+        ]
+    )
+    posted: list[tuple[str, str]] = []
+    routed: list[str] = []
+
+    async def refresh_configuration(*_args, **_kwargs):
+        return None
+
+    async def handle_plain_text(_client, _admin_user_id: int, text: str) -> str:
+        routed.append(text)
+        return "unexpected"
+
+    async def post_message(channel_id: str, message: str) -> dict[str, str]:
+        posted.append((channel_id, message))
+        return {"channel": "DADMIN", "ts": "1.234"}
+
+    runtime.config.slack.manager_queue_url = "http://192.168.4.87:8765/exceptions"
+    runtime.state_store = StateStore(tmp_path / "state.sqlite3")
+    runtime.refresh_configuration = refresh_configuration  # type: ignore[method-assign]
+    runtime.admin_router = SimpleNamespace(handle_plain_text=handle_plain_text)
+    runtime.slack = SimpleNamespace(post_message=post_message)
+    runtime.roster_by_slack_id = {}
+
+    asyncio.run(
+        runtime.handle_slack_direct_message(
+            SimpleNamespace(),
+            {"user": "U01SWQKDTBM", "text": "portal", "ts": "1785859200.0"},
+        )
+    )
+
+    assert routed == []
+    assert posted[0][0] == "U01SWQKDTBM"
+    assert "http://192.168.4.87:8765/portal?token=" in posted[0][1]
+    assert "isolated" in posted[0][1]
+
+
 def test_short_rest_stays_paid_and_requires_return_check_in() -> None:
     runtime = _build_runtime()
     sent: list[str] = []
@@ -1946,6 +1990,121 @@ def test_runtime_scheduler_skips_progress_automation_during_clock_out_artifacts(
     assert stored.stage == "awaiting_clock_out_artifacts"
     assert stored.clocked_out_at is None
     assert "auto_clock_out_at" not in stored.metadata
+
+
+def test_worker_schedule_and_planned_time_off_control_proactive_prompts() -> None:
+    runtime = _build_runtime()
+    user = UserProfile(
+        user_key="alex",
+        display_name="Alex",
+        discord_user_id=1,
+        timezone="America/Los_Angeles",
+        regular_workdays=["monday", "wednesday", "friday"],
+        planned_time_off=["2026-06-22", "2026-07-01..2026-07-03"],
+    )
+
+    assert runtime.is_user_scheduled_to_work(
+        user, datetime.fromisoformat("2026-06-24T10:00:00-07:00")
+    ) is True
+    assert runtime.is_user_scheduled_to_work(
+        user, datetime.fromisoformat("2026-06-23T10:00:00-07:00")
+    ) is False
+    assert runtime.is_user_scheduled_to_work(
+        user, datetime.fromisoformat("2026-06-22T10:00:00-07:00")
+    ) is False
+    assert runtime.is_user_scheduled_to_work(
+        user, datetime.fromisoformat("2026-07-03T10:00:00-07:00")
+    ) is False
+
+
+def test_worker_typical_start_time_controls_clock_in_window() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+    user = UserProfile(
+        user_key="alex",
+        display_name="Alex",
+        discord_user_id=1,
+        timezone="America/Los_Angeles",
+        typical_start_time="10:30",
+        typical_end_time="16:00",
+    )
+    session = SessionState(user_key="alex", session_date="2026-06-22")
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None):
+        del view
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+
+    before = asyncio.run(
+        runtime._maybe_send_clock_in(
+            SimpleNamespace(), user, session, datetime.fromisoformat("2026-06-22T10:15:00-07:00")
+        )
+    )
+    inside = asyncio.run(
+        runtime._maybe_send_clock_in(
+            SimpleNamespace(), user, session, datetime.fromisoformat("2026-06-22T10:30:00-07:00")
+        )
+    )
+
+    assert before is False
+    assert inside is True
+    assert sent == ["clock in"]
+
+
+def test_meal_and_overtime_enforcement_still_run_when_worker_is_clocked_in_off_schedule() -> None:
+    runtime = _build_runtime()
+    user = UserProfile(
+        user_key="alex",
+        display_name="Alex",
+        discord_user_id=1,
+        timezone="America/Los_Angeles",
+        regular_workdays=["monday"],
+    )
+    session = SessionState(
+        user_key="alex",
+        session_date="2026-06-27",
+        stage="active",
+        clocked_in_at="2026-06-27T09:00:00-07:00",
+        work_segments=[{"clocked_in_at": "2026-06-27T09:00:00-07:00", "clocked_out_at": None}],
+    )
+    runtime.state_store.save_session(session)
+    called: list[str] = []
+
+    async def fake_false(*_args, **_kwargs):
+        return False
+
+    async def fake_meal(*_args, **_kwargs):
+        called.append("meal")
+        return False
+
+    async def fake_overtime(*_args, **_kwargs):
+        called.append("overtime")
+        return False
+
+    for name in (
+        "_maybe_send_auto_clock_out_warning",
+        "_maybe_auto_clock_out_inactive",
+        "_maybe_prompt_task_onboarding",
+        "_maybe_send_lunch_break_check_in",
+        "_maybe_assess_pending_follow_up_probe",
+        "_maybe_timeout_progress_probe",
+        "_maybe_send_follow_up",
+        "_maybe_alert_admin",
+        "_maybe_flush_clickup",
+        "_maybe_post_slack_daily_update",
+    ):
+        setattr(runtime, name, fake_false)
+    runtime._maybe_check_meal_compliance = fake_meal  # type: ignore[method-assign]
+    runtime._maybe_check_overtime_compliance = fake_overtime  # type: ignore[method-assign]
+
+    asyncio.run(
+        runtime._run_scheduler_for_user(
+            SimpleNamespace(), user, datetime.fromisoformat("2026-06-27T14:00:00-07:00")
+        )
+    )
+
+    assert called == ["meal", "overtime"]
 
 
 def test_runtime_clock_out_artifacts_finalize_before_later_scheduler_tick() -> None:
@@ -3648,6 +3807,49 @@ def test_runtime_task_onboarding_accepts_recommended_reply_for_daily_clock_in() 
     assert any("formalize project tree" in item for item in sent)
 
 
+def test_runtime_task_onboarding_accepts_numbered_task_choice() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="awaiting_task_selection")
+    prompt = {
+        "type": "task_onboarding",
+        "step": "select_task",
+        "source": "daily_clock_in",
+        "draft": {},
+    }
+    inbound = MessageRecord(
+        message_id="msg-option-two",
+        direction="inbound",
+        author_id=1,
+        created_at=datetime.fromisoformat("2026-05-28T14:01:00"),
+        content="2",
+        attachments=[],
+    )
+
+    handled = asyncio.run(
+        runtime._handle_task_onboarding_prompt(
+            SimpleNamespace(), user, session, inbound, inbound.created_at, prompt
+        )
+    )
+
+    assert handled is True
+    assert prompt["candidate_task_id"] == "868jun6qh"
+    assert prompt["candidate_task_name"] == "secondary cleanup"
+    assert prompt["step"] == "confirm_task"
+
+
 def test_runtime_task_onboarding_confirmation_yes_advances_to_plan() -> None:
     runtime = _build_runtime()
     sent: list[str] = []
@@ -3746,7 +3948,7 @@ def test_runtime_task_onboarding_confirmation_no_returns_to_task_selection() -> 
     assert prompt["step"] == "select_task"
     assert "candidate_task_id" not in prompt
     assert session.stage == "awaiting_task_selection"
-    assert any("Assigned task tree:" in item for item in sent)
+    assert any("Choose one option by replying with its number" in item for item in sent)
 
 
 def test_runtime_task_onboarding_confirmation_re_resolves_corrected_task() -> None:
@@ -3831,11 +4033,10 @@ def test_runtime_task_selection_prompt_renders_hierarchy_tree_and_create_escape_
 
     prompt = asyncio.run(runtime._task_selection_prompt(user))
 
-    assert "Assigned task tree:" in prompt
-    assert "Robot Build" in prompt
-    assert "Harness Validation" in prompt
-    assert "reply `create task` if none of these fit" in prompt
-    assert "Reply with the name or ID of an `[assigned]` task" in prompt
+    assert "Choose one option by replying with its number, name, or ID" in prompt
+    assert "formalize project tree" in prompt
+    assert "reply `create task` if none fit" in prompt.lower()
+    assert "1. `formalize project tree`" in prompt
 
 
 def test_runtime_task_selection_prompt_shows_ranked_options_across_clickup_spaces() -> None:
@@ -3887,7 +4088,7 @@ def test_runtime_task_selection_prompt_shows_ranked_options_across_clickup_space
 
     context = asyncio.run(runtime._task_selection_context(user, session))
 
-    assert "Other open options across ClickUp spaces" in context["message"]
+    assert "Choose one option by replying with its number, name, or ID" in context["message"]
     assert "Company Operations / Shop Improvements / Overhead" in context["message"]
     assert "Flight Projects / Hardware" in context["message"]
     assert "company-overhead" in context["message"]
@@ -3896,6 +4097,58 @@ def test_runtime_task_selection_prompt_shows_ranked_options_across_clickup_space
         "company-overhead",
         "flight-harness",
     }
+
+
+def test_runtime_task_selection_is_numbered_and_limited_to_five() -> None:
+    runtime = _build_runtime()
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28")
+
+    async def fake_list_assigned_tasks(_user, limit=8):
+        return [
+            {
+                "id": f"assigned-{index}",
+                "name": f"Assigned task {index}",
+                "status": {"status": "to do"},
+                "priority": {"priority": "normal"},
+                "list": {"id": "list-1", "name": "Assigned"},
+            }
+            for index in range(limit)
+        ]
+
+    async def fake_suggest(_user, _session, _messages, *, exclude_task_ids=None, limit=5):
+        del exclude_task_ids
+        return [
+            {
+                "id": "workspace-1",
+                "name": "Improve shop layout",
+                "status": {"status": "to do"},
+                "priority": {"priority": "high"},
+                "space": {"name": "Operations"},
+                "list": {"id": "shop", "name": "Shop"},
+                "_don_pollo_workspace_option": True,
+            }
+        ][:limit]
+
+    runtime.clickup.list_assigned_tasks = fake_list_assigned_tasks  # type: ignore[method-assign]
+    runtime.clickup.suggest_next_tasks = fake_suggest  # type: ignore[method-assign]
+
+    context = asyncio.run(runtime._task_selection_context(user, session))
+
+    assert len(context["candidate_tasks"]) == 5
+    assert [line.split(".", 1)[0] for line in context["message"].splitlines() if line[:1].isdigit()] == [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+    ]
+    assert context["candidate_tasks"][-1]["id"] == "workspace-1"
 
 
 def test_runtime_confirmed_workspace_option_is_assigned_before_onboarding() -> None:
@@ -4425,7 +4678,7 @@ def test_runtime_task_creation_go_back_from_placement_returns_to_task_selection(
     assert session.stage == "awaiting_task_selection"
     assert session.metadata["pending_intern_task_switch"]["previous_task_id"] == "868jun6qg"
     assert any("go back to your task tree" in item.lower() for item in sent)
-    assert any("Assigned task tree:" in item for item in sent)
+    assert any("Choose one option by replying with its number" in item for item in sent)
 
 
 def test_runtime_task_creation_go_back_from_title_returns_to_placement() -> None:
@@ -4649,6 +4902,53 @@ def test_runtime_task_onboarding_collects_interactive_plan_before_photo() -> Non
     assert sent[-1] == "Perfect. `formalize project tree` is active in ClickUp and task tracking is running."
 
 
+def test_runtime_task_onboarding_rejects_vague_repeated_plan_before_advancing() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None) -> None:
+        del view
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(user_key="andrew", session_date="2026-05-28", stage="awaiting_plan")
+    prompt = {
+        "type": "task_onboarding",
+        "step": "plan",
+        "source": "daily_clock_in",
+        "task_id": "868jun6qg",
+        "task_name": "formalize project tree",
+        "draft": {},
+    }
+    inbound = MessageRecord(
+        message_id="msg-vague-plan",
+        direction="inbound",
+        author_id=1,
+        created_at=datetime.fromisoformat("2026-05-28T14:02:00"),
+        content="make progress",
+        attachments=[],
+    )
+
+    for _ in range(2):
+        handled = asyncio.run(
+            runtime._handle_task_onboarding_prompt(
+                SimpleNamespace(), user, session, inbound, inbound.created_at, prompt
+            )
+        )
+        assert handled is True
+        assert prompt["step"] == "plan"
+
+    assert "finish line" in sent[0]
+    assert "same pattern again" in sent[1]
+    assert prompt["draft"]["weak_plan_attempts"] == 2
+
+
 def test_runtime_task_onboarding_midstream_switch_task_restarts_on_corrected_task() -> None:
     runtime = _build_runtime()
     sent: list[str] = []
@@ -4753,7 +5053,7 @@ def test_runtime_task_onboarding_wrong_task_without_hint_returns_to_selection() 
     assert "task_id" not in prompt
     assert prompt["draft"] == {}
     assert session.stage == "awaiting_task_selection"
-    assert any("Assigned task tree:" in item for item in sent)
+    assert any("Choose one option by replying with its number" in item for item in sent)
 
 
 def test_runtime_task_onboarding_fallback_plan_mentions_switch_without_triggering_correction() -> None:
@@ -4926,7 +5226,7 @@ def test_runtime_task_onboarding_photo_step_switch_request_returns_to_selection(
     assert session.latest_plan is None
     assert session.latest_feedback is None
     assert any("switch tasks before this one officially starts" in item.lower() for item in sent)
-    assert any("Assigned task tree:" in item for item in sent)
+    assert any("Choose one option by replying with its number" in item for item in sent)
 
 
 def test_runtime_task_onboarding_photo_step_url_requires_attachment() -> None:
@@ -5061,7 +5361,7 @@ def test_runtime_task_onboarding_deleted_task_404_returns_to_selection() -> None
     assert "active_clickup_task_name" not in session.metadata
     assert session.metadata["progress_photo_paths"] == ["C:/tmp/previous.jpg"]
     assert any("That ClickUp task no longer exists" in item for item in sent)
-    assert any("Assigned task tree:" in item for item in sent)
+    assert any("Choose one option by replying with its number" in item for item in sent)
 
 
 def test_runtime_task_onboarding_completion_message_does_not_claim_clickup_status_without_confirmation() -> None:

@@ -771,6 +771,42 @@ class InternManagementRuntime:
         base_moment = moment or datetime.now(tz=resolve_timezone(self.runtime_timezone_name()))
         return localize_datetime(base_moment, self.resolve_user_timezone_name(user))
 
+    def is_user_scheduled_to_work(self, user: UserProfile, now: datetime) -> bool:
+        local_now = localize_datetime(now, self.resolve_user_timezone_name(user))
+        local_date = local_now.date()
+        for item in user.planned_time_off:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            if ".." in text:
+                start_text, end_text = text.split("..", 1)
+                try:
+                    if date.fromisoformat(start_text.strip()) <= local_date <= date.fromisoformat(end_text.strip()):
+                        return False
+                except ValueError:
+                    continue
+            try:
+                if date.fromisoformat(text) == local_date:
+                    return False
+            except ValueError:
+                continue
+        weekday_names = {
+            "monday": 0,
+            "tuesday": 1,
+            "wednesday": 2,
+            "thursday": 3,
+            "friday": 4,
+            "saturday": 5,
+            "sunday": 6,
+        }
+        configured_days = {
+            weekday_names[str(item).strip().lower()]
+            for item in user.regular_workdays
+            if str(item).strip().lower() in weekday_names
+        }
+        fallback_days = set(self.config.schedule.workdays) if self.config else {0, 1, 2, 3, 4}
+        return local_now.weekday() in (configured_days or fallback_days)
+
     def resolve_user_workday_date(
         self,
         user: UserProfile,
@@ -1287,6 +1323,25 @@ class InternManagementRuntime:
                 logger.error("Cannot answer Slack admin DM because Slack is not configured.")
                 return
             admin_text = _normalize_slack_admin_text(event.get("text"))
+            if admin_text.lower() in {
+                "portal",
+                "beta portal",
+                "worker portal",
+                "workday beta",
+            }:
+                from .worker_portal import build_worker_portal_link
+
+                portal_url = build_worker_portal_link(self, admin)
+                await self.slack.post_message(
+                    slack_user_id,
+                    (
+                        "Open the Erik-only Don Pollo Workday beta:\n"
+                        f"{portal_url}\n\n"
+                        "The signed link expires in 72 hours. This beta uses live read-only ClickUp options, "
+                        "but its clock, profile, and workday actions are isolated from worker, payroll, and ClickUp records."
+                    ),
+                )
+                return
             response = await self.admin_router.handle_plain_text(
                 client,
                 admin.discord_user_id,
@@ -1819,7 +1874,7 @@ class InternManagementRuntime:
     ) -> None:
         async with self._user_session_lock(user.user_key):
             session, now = self.get_user_session_for_moment(user, base_now)
-            is_workday = now.weekday() in self.config.schedule.workdays
+            is_workday = self.is_user_scheduled_to_work(user, now)
             previous_session = self._clone_session_state(session)
             normalized_changed = self._normalize_session_state(session, user=user)
             changed = False
@@ -1887,16 +1942,16 @@ class InternManagementRuntime:
             if await self._maybe_auto_clock_out_inactive(client, user, session, now):
                 changed = True
                 reasons.append("auto_clock_out_inactive")
-            if is_workday and await self._maybe_prompt_task_onboarding(client, user, session, now):
+            if session.clocked_in_at and await self._maybe_prompt_task_onboarding(client, user, session, now):
                 changed = True
                 reasons.append("prompted_task_onboarding")
-            if is_workday and await self._maybe_send_lunch_break_check_in(client, user, session, now):
+            if session.clocked_in_at and await self._maybe_send_lunch_break_check_in(client, user, session, now):
                 changed = True
                 reasons.append("sent_lunch_check_in")
-            if is_workday and await self._maybe_check_meal_compliance(client, user, session, now):
+            if session.clocked_in_at and await self._maybe_check_meal_compliance(client, user, session, now):
                 changed = True
                 reasons.append("meal_compliance_event")
-            if is_workday and await self._maybe_check_overtime_compliance(client, user, session, now):
+            if session.clocked_in_at and await self._maybe_check_overtime_compliance(client, user, session, now):
                 changed = True
                 reasons.append("overtime_compliance_event")
             if await self._maybe_assess_pending_follow_up_probe(client, user, session, now):
@@ -1905,7 +1960,7 @@ class InternManagementRuntime:
             if await self._maybe_timeout_progress_probe(client, user, session, now):
                 changed = True
                 reasons.append("timed_out_progress_probe")
-            if is_workday and await self._maybe_send_follow_up(client, user, session, now):
+            if session.clocked_in_at and await self._maybe_send_follow_up(client, user, session, now):
                 changed = True
                 reasons.append("sent_follow_up")
             if await self._maybe_alert_admin(client, user, session, now):
@@ -2100,7 +2155,16 @@ class InternManagementRuntime:
     ) -> bool:
         if session.clocked_in_at:
             return False
-        if now.hour < self.config.schedule.clock_in_hour or now.hour > self.config.schedule.clock_in_cutoff_hour:
+        try:
+            start_hour, start_minute = [int(part) for part in user.typical_start_time.split(":", 1)]
+            end_hour, end_minute = [int(part) for part in user.typical_end_time.split(":", 1)]
+            start_at = now.replace(hour=start_hour, minute=start_minute, second=0, microsecond=0)
+            end_at = now.replace(hour=end_hour, minute=end_minute, second=0, microsecond=0)
+            cutoff_at = min(start_at + timedelta(hours=4), end_at)
+        except (TypeError, ValueError):
+            start_at = now.replace(hour=self.config.schedule.clock_in_hour, minute=0, second=0, microsecond=0)
+            cutoff_at = now.replace(hour=self.config.schedule.clock_in_cutoff_hour, minute=59, second=59, microsecond=0)
+        if now < start_at or now > cutoff_at:
             return False
         timezone_name = self.resolve_user_timezone_name(user)
         should_send = False
@@ -3505,7 +3569,7 @@ class InternManagementRuntime:
         slack_client = getattr(self, "slack", None)
         if not self.config or not slack_client or not self.config.slack.daily_updates_enabled:
             return False
-        if now.weekday() not in self.config.schedule.workdays:
+        if not self.is_user_scheduled_to_work(user, now) and not session.clocked_in_at:
             return False
         if not (self.config.slack.post_start_hour <= now.hour < self.config.slack.post_end_hour):
             return False
@@ -5548,6 +5612,33 @@ class InternManagementRuntime:
                 await self._send_dm(client, user, session, self._task_onboarding_missing_text(prompt, step), now)
                 return True
             draft = self._task_onboarding_draft(prompt)
+            from .worker_portal import validate_meaningful_work_detail
+
+            issue, fingerprint = validate_meaningful_work_detail(
+                text,
+                purpose="first move and intended approach",
+                previous_fingerprint=str(draft.get("last_rejected_plan_fingerprint") or ""),
+            )
+            if issue:
+                draft["last_rejected_plan_fingerprint"] = fingerprint
+                draft["weak_plan_attempts"] = int(draft.get("weak_plan_attempts") or 0) + 1
+                attempts = int(draft["weak_plan_attempts"])
+                lead = (
+                    "I’m seeing the same pattern again. "
+                    if attempts >= 2
+                    else "A little more detail will make this useful. "
+                )
+                await self._send_dm(
+                    client,
+                    user,
+                    session,
+                    lead
+                    + issue
+                    + " Clear plans give the project a finish line and let me help when work gets stuck.",
+                    now,
+                )
+                return True
+            draft.pop("last_rejected_plan_fingerprint", None)
             draft["plan"] = text
             prompt["step"] = "tangible_result"
             session.stage = "awaiting_plan"
@@ -5564,6 +5655,33 @@ class InternManagementRuntime:
                 await self._send_dm(client, user, session, self._task_onboarding_missing_text(prompt, step), now)
                 return True
             draft = self._task_onboarding_draft(prompt)
+            from .worker_portal import validate_meaningful_work_detail
+
+            issue, fingerprint = validate_meaningful_work_detail(
+                text,
+                purpose="tangible result",
+                previous_fingerprint=str(draft.get("last_rejected_result_fingerprint") or ""),
+            )
+            if issue:
+                draft["last_rejected_result_fingerprint"] = fingerprint
+                draft["weak_result_attempts"] = int(draft.get("weak_result_attempts") or 0) + 1
+                attempts = int(draft["weak_result_attempts"])
+                lead = (
+                    "I’m seeing another vague or repeated result. "
+                    if attempts >= 2
+                    else "That result is still too vague to start cleanly. "
+                )
+                await self._send_dm(
+                    client,
+                    user,
+                    session,
+                    lead
+                    + issue
+                    + " This detail makes progress visible without requiring a long status report.",
+                    now,
+                )
+                return True
+            draft.pop("last_rejected_result_fingerprint", None)
             draft["tangible_result"] = text
             prompt["step"] = "necessity"
             session.stage = "awaiting_plan"
@@ -6433,6 +6551,31 @@ class InternManagementRuntime:
     ) -> dict[str, Any] | None:
         if not self.clickup:
             return None
+        numeric_match = re.fullmatch(r"(?:option\s*)?([1-5])", task_hint.strip(), flags=re.IGNORECASE)
+        if numeric_match:
+            context = await self._task_selection_context(user, session)
+            visible_options = context.get("candidate_tasks")
+            visible_options = visible_options if isinstance(visible_options, list) else []
+            option_index = int(numeric_match.group(1)) - 1
+            if option_index < len(visible_options):
+                selected = visible_options[option_index]
+                if isinstance(selected, dict):
+                    task_id = str(selected.get("id") or "")
+                    if selected.get("workspace_option"):
+                        workspace_options = await self.clickup.suggest_next_tasks(
+                            user,
+                            session,
+                            self.list_session_messages(user.user_key, session),
+                            exclude_task_ids=self._recently_closed_task_ids(session),
+                            limit=8,
+                        )
+                        matched = self.clickup.match_task_hint(workspace_options, task_id)
+                        return {**matched, "_don_pollo_workspace_option": True} if matched else None
+                    return await self.clickup.resolve_task_for_user(
+                        user,
+                        task_id,
+                        include_mission_board=False,
+                    )
         assigned_task = await self.clickup.resolve_task_for_user(
             user,
             task_hint,
@@ -6974,7 +7117,7 @@ class InternManagementRuntime:
                 session,
                 self.list_session_messages(user.user_key, session),
                 exclude_task_ids=assigned_ids | recently_closed_ids,
-                limit=3,
+                limit=5,
             )
         if not assigned_tasks and not workspace_options:
             message = (
@@ -6989,25 +7132,34 @@ class InternManagementRuntime:
                 "candidate_tasks": [],
                 "hidden_count": hidden_count,
             }
+        recommended_task_id = str((recommended_task or {}).get("id") or "")
+        if recommended_task_id:
+            assigned_tasks = sorted(
+                assigned_tasks,
+                key=lambda task: str(task.get("id") or "") != recommended_task_id,
+            )
+        assigned_visible_limit = 4 if workspace_options else 5
+        assigned_visible = assigned_tasks[:assigned_visible_limit]
+        workspace_visible = workspace_options[: max(0, 5 - len(assigned_visible))]
+
         raw_tasks_by_id: dict[str, dict[str, Any]] = {}
         tree_text = ""
-        if assigned_tasks and hasattr(self.clickup, "build_assigned_task_hierarchy") and hasattr(self.clickup, "render_assigned_task_hierarchy"):
+        if assigned_visible and hasattr(self.clickup, "build_assigned_task_hierarchy") and hasattr(self.clickup, "render_assigned_task_hierarchy"):
             hierarchy = await self.clickup.build_assigned_task_hierarchy(
                 user,
-                tasks=assigned_tasks,
-                limit=max(len(assigned_tasks), 8),
+                tasks=assigned_visible,
+                limit=max(len(assigned_visible), 5),
             )
-            recommended_task_id = str((recommended_task or {}).get("id") or "") or None
             tree_text = self.clickup.render_assigned_task_hierarchy(
                 hierarchy,
-                recommended_task_id=recommended_task_id,
+                recommended_task_id=recommended_task_id or None,
             )
             raw_tasks_by_id = hierarchy.get("tasks_by_id")
             raw_tasks_by_id = raw_tasks_by_id if isinstance(raw_tasks_by_id, dict) else {}
-        elif assigned_tasks:
+        elif assigned_visible:
             raw_tasks_by_id = {
                 str(task.get("id") or ""): task
-                for task in assigned_tasks
+                for task in assigned_visible
                 if str(task.get("id") or "").strip()
             }
             tree_lines = [
@@ -7015,17 +7167,17 @@ class InternManagementRuntime:
                 for task_id, task in raw_tasks_by_id.items()
             ]
             tree_text = "\n".join(tree_lines)
-        candidate_tasks = [
+        assigned_candidates = [
             {
-                "id": str(task_id),
-                "name": str((task or {}).get("name") or task_id),
-                "parent_task_id": self._extract_task_parent_id(task or {}) or "",
-                "list_id": self._extract_task_list_id(task or {}) or "",
+                "id": str(task.get("id") or ""),
+                "name": str(task.get("name") or task.get("id") or "Unnamed task"),
+                "parent_task_id": self._extract_task_parent_id(task) or "",
+                "list_id": self._extract_task_list_id(task) or "",
             }
-            for task_id, task in raw_tasks_by_id.items()
-            if str(task_id).strip()
+            for task in assigned_visible
+            if str(task.get("id") or "").strip()
         ]
-        candidate_tasks.extend(
+        workspace_candidates = [
             {
                 "id": str(task.get("id") or ""),
                 "name": str(task.get("name") or "Unnamed task"),
@@ -7034,24 +7186,42 @@ class InternManagementRuntime:
                 "workspace_option": True,
                 "location": self._task_option_location_label(task),
             }
-            for task in workspace_options
+            for task in workspace_visible
             if str(task.get("id") or "")
-        )
-        lines = ["I need to confirm your active ClickUp task before you continue. Reply with the task name or ID."]
-        if assigned_tasks:
-            lines.extend(["", "Assigned task tree:", tree_text])
-        if workspace_options:
-            recommendation_id = str((recommended_task or {}).get("id") or "")
-            lines.extend(["", "Other open options across ClickUp spaces:"])
-            lines.extend(
-                self._task_workspace_option_line(
-                    task,
-                    recommended=(
-                        str(task.get("id") or "") == recommendation_id
-                        or (not recommendation_id and index == 0)
-                    ),
-                )
-                for index, task in enumerate(workspace_options)
+        ]
+        candidate_tasks = (assigned_candidates + workspace_candidates)[:5]
+        lines = [
+            "I need to confirm your active ClickUp task before you continue.",
+            "",
+            "Choose one option by replying with its number, name, or ID:",
+        ]
+        assigned_task_by_id = {
+            str(task.get("id") or ""): task
+            for task in assigned_visible
+            if str(task.get("id") or "")
+        }
+        workspace_task_by_id = {
+            str(task.get("id") or ""): task
+            for task in workspace_visible
+            if str(task.get("id") or "")
+        }
+        for index, candidate in enumerate(candidate_tasks, start=1):
+            task_id = str(candidate.get("id") or "")
+            task = assigned_task_by_id.get(task_id) or workspace_task_by_id.get(task_id) or {}
+            priority = str((task.get("priority") or {}).get("priority") or "none")
+            location = self._task_option_location_label(task)
+            markers: list[str] = []
+            if candidate.get("workspace_option"):
+                markers.append("workspace option")
+            else:
+                markers.append("assigned")
+            if task_id == recommended_task_id or (not recommended_task_id and index == 1):
+                markers.append("recommended")
+            reason = str(task.get("_don_pollo_suggestion_reason") or "").strip()
+            suffix = f" | why: {reason}" if reason else ""
+            lines.append(
+                f"{index}. `{candidate.get('name') or task_id}` | id={task_id} | {location} | "
+                f"priority={priority} | {' '.join(f'[{marker}]' for marker in markers)}{suffix}"
             )
         if hidden_count:
             lines.extend(
@@ -7063,7 +7233,7 @@ class InternManagementRuntime:
         lines.extend(
             [
                 "",
-                "Reply with the name or ID of an `[assigned]` task or a shown workspace option, or reply `create task` if none of these fit. New tasks still require Erik or George approval.",
+                "Reply `create task` if none fit. New tasks still require Erik or George approval.",
             ]
         )
         return {

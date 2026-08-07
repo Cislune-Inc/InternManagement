@@ -157,6 +157,8 @@ The localhost editor/dashboard is the primary live view:
 - `http://127.0.0.1:8765/payroll` serves payroll and project-labor review
 - `http://127.0.0.1:8765/exceptions` serves the manager exception queue for blockers, incomplete close-outs, admin reviews, task/timer mismatches, uncertain Slack routing, and integration failures
 - `http://127.0.0.1:8765/health` serves service health, integrations, storage usage, the operational issue queue, and Slack routing review
+
+The worker-facing web beta is entered through Slack rather than through a permanent public URL. A configured Slack admin can DM `portal` to Don Pollo and receive a signed 72-hour VPN link. The Erik-only beta reads up to five ranked options from ClickUp across assigned and workspace tasks, but keeps its test clock, profile, task requests, and workday actions isolated from live workforce, payroll, and ClickUp records.
 - it reads fresh dashboard data from disk on request
 - while it is open, it auto-refreshes every 10 minutes without resetting your filters
 - if you are actively editing a past day, background refresh pauses until you close the editor panel
