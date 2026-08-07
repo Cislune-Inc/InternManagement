@@ -94,6 +94,9 @@ def test_roster_controls_connect_aj_to_slack_and_preserve_existing_focus() -> No
 
     assert rows[0]["slack_user_id"] == "U095NMY2U4R"
     assert rows[0]["preferred_transport"] == "slack"
+    assert rows[0]["worker_type"] == "contractor"
+    assert rows[0]["compensation_plan"] == "cislune_hourly"
+    assert rows[0]["overtime_approval_required"] == "true"
     assert rows[0]["interests"] == (
         "materials testing;Lockheed Bagworm;LM_Nightjar;shop organization"
     )
@@ -124,7 +127,9 @@ def test_production_roster_controls_add_missing_aj_with_provisional_schedule() -
     assert aj["slack_user_id"] == "U095NMY2U4R"
     assert aj["clickup_user_email"] == "ajtorres@caltech.edu"
     assert aj["timezone"] == "America/Los_Angeles"
-    assert aj["compensation_plan"] == "nasa_stipend"
+    assert aj["worker_type"] == "contractor"
+    assert aj["compensation_plan"] == "cislune_hourly"
+    assert aj["overtime_approval_required"] == "true"
     assert aj["weekly_target_hours"] == "40"
     assert aj["regular_workdays"] == "monday;tuesday;wednesday;thursday;friday"
     assert "clickup_user_email" in fieldnames

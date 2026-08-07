@@ -37,10 +37,10 @@ AJ_ROSTER_DEFAULTS = {
     "slack_user_id": AJ_SLACK_USER_ID,
     "active": "true",
     "preferred_transport": "slack",
-    "worker_type": "intern",
+    "worker_type": "contractor",
     "work_location": "Rosemead, CA",
     "labor_jurisdiction": "California",
-    "compensation_plan": "nasa_stipend",
+    "compensation_plan": "cislune_hourly",
     "time_tracking_required": "true",
     "meal_tracking_required": "true",
     "overtime_approval_required": "true",
@@ -142,6 +142,11 @@ def apply_roster_controls(
             aj_values = {
                 "slack_user_id": AJ_SLACK_USER_ID,
                 "preferred_transport": "slack",
+                "worker_type": "contractor",
+                "compensation_plan": "cislune_hourly",
+                "time_tracking_required": "true",
+                "meal_tracking_required": "true",
+                "overtime_approval_required": "true",
                 "interests": _append_semicolon_values(row.get("interests"), AJ_FOCUS_AREAS),
             }
             for field_name, desired in aj_values.items():
