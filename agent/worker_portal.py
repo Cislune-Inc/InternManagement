@@ -155,6 +155,8 @@ class WorkerPortalService:
             state["work"]["selected_task_name"] = task_name
             state["work"]["selected_task_location"] = _clean_text(payload.get("task_location"), limit=240)
             message = f"Selected {task_name}. Add a concrete outcome and first step before starting."
+        elif action == "claim_task":
+            message = await self._claim_task(admin, state, payload)
         elif action == "start":
             try:
                 message = self._start_work(state, payload)
@@ -275,7 +277,7 @@ class WorkerPortalService:
             candidates: list[dict[str, Any]] = []
             assigned_ids: set[str] = set()
             try:
-                assigned = await self.runtime.clickup.list_assigned_tasks(portal_user, limit=100)
+                assigned = await self.runtime.clickup.list_assigned_tasks(portal_user, limit=500)
                 candidates.extend(task for task in assigned if isinstance(task, dict))
                 assigned_ids = {str(task.get("id") or "") for task in candidates}
                 list_workspace = getattr(self.runtime.clickup, "list_workspace_tasks", None)
@@ -311,7 +313,12 @@ class WorkerPortalService:
         options = [self._task_payload(task, assigned_ids, profile, index) for index, task in enumerate(ranked)]
         return options or self._fallback_tasks(), ""
 
-    def _task_rank(self, task: dict[str, Any], assigned_ids: set[str], profile: dict[str, Any]) -> tuple[int, int, str]:
+    def _task_rank(
+        self,
+        task: dict[str, Any],
+        assigned_ids: set[str],
+        profile: dict[str, Any],
+    ) -> tuple[int, int, int, str]:
         task_id = str(task.get("id") or "")
         status = str((task.get("status") or {}).get("status") or "").lower()
         priority = str((task.get("priority") or {}).get("priority") or "").lower()
@@ -338,7 +345,27 @@ class WorkerPortalService:
         ]
         matches = sum(1 for term in context_terms if term in haystack)
         score += min(matches, 4) * 9
-        return score, matches, str(task.get("name") or "").lower()
+        due_at = _task_due_datetime(task)
+        deadline_tiebreak = -int(due_at.timestamp() * 1000) if due_at else -(10**30)
+        if due_at:
+            remaining = due_at - datetime.now(timezone.utc)
+            if remaining.total_seconds() < 0:
+                overdue_by = -remaining
+                if overdue_by <= timedelta(days=7):
+                    score += 70
+                elif overdue_by <= timedelta(days=30):
+                    score += 45
+                else:
+                    score += 18
+            elif remaining <= timedelta(days=1):
+                score += 60
+            elif remaining <= timedelta(days=3):
+                score += 48
+            elif remaining <= timedelta(days=7):
+                score += 34
+            elif remaining <= timedelta(days=14):
+                score += 20
+        return score, matches, deadline_tiebreak, str(task.get("name") or "").lower()
 
     def _task_payload(
         self,
@@ -359,6 +386,12 @@ class WorkerPortalService:
         folder_name = str((task.get("folder") or {}).get("name") or "").strip()
         list_name = str((task.get("list") or {}).get("name") or "Open work").strip() or "Open work"
         contract_name = _task_contract_name(task) or folder_name or "General / overhead"
+        due_at = _task_due_datetime(task)
+        assignee_names = [
+            _clean_text(assignee.get("username") or assignee.get("email") or assignee.get("id"), limit=100)
+            for assignee in (task.get("assignees") or [])
+            if isinstance(assignee, dict)
+        ]
         reasons: list[str] = []
         if task_id in assigned_ids:
             reasons.append("assigned to you")
@@ -366,6 +399,12 @@ class WorkerPortalService:
             reasons.append("already moving")
         if priority.lower() in {"urgent", "high"}:
             reasons.append(f"{priority.lower()} priority")
+        if due_at:
+            remaining = due_at - datetime.now(timezone.utc)
+            if remaining.total_seconds() < 0:
+                reasons.append(f"overdue since {due_at.date().isoformat()}")
+            elif remaining <= timedelta(days=7):
+                reasons.append(f"due {due_at.date().isoformat()}")
         text = f"{task.get('name') or ''} {task.get('description') or ''}".lower()
         matches = [
             str(term)
@@ -384,6 +423,8 @@ class WorkerPortalService:
             "reason": ", ".join(reasons) or "recent open workspace work",
             "recommended": index == 0,
             "assigned": task_id in assigned_ids,
+            "assignees": assignee_names,
+            "due_date": due_at.date().isoformat() if due_at else "",
             "contract": contract_name,
             "space": space_name,
             "list": list_name,
@@ -423,6 +464,41 @@ class WorkerPortalService:
                 }
             )
         return catalog
+
+    async def _claim_task(
+        self,
+        admin: AdminProfile,
+        state: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> str:
+        if not self.runtime.clickup:
+            raise ValueError("ClickUp is unavailable, so this task could not be claimed.")
+        task_id = _clean_text(payload.get("task_id"), limit=100)
+        if not task_id:
+            raise ValueError("Choose a task before claiming it in ClickUp.")
+        available_tasks, warning = await self._load_task_options(admin, state)
+        if warning:
+            raise ValueError("The live ClickUp catalog is not available, so assignment was not changed.")
+        candidate = next((task for task in available_tasks if task.get("id") == task_id), None)
+        if candidate is None:
+            raise ValueError("That task is not in the current open Cislune task catalog.")
+        clickup_user_id = admin.clickup_user_id
+        if not clickup_user_id:
+            resolve_member = getattr(self.runtime.clickup, "resolve_workspace_member_id", None)
+            if callable(resolve_member):
+                clickup_user_id = await resolve_member(name=admin.name, email=admin.clickup_user_email)
+        if not clickup_user_id:
+            raise ValueError("Your Slack profile is not mapped to a ClickUp member yet, so assignment was not changed.")
+        if candidate.get("assigned"):
+            message = f"{candidate['name']} is already assigned to you in ClickUp."
+        else:
+            await self.runtime.clickup.update_task_assignees(task_id, add_user_ids=[str(clickup_user_id)])
+            self._task_source_cache.pop(admin.slack_user_id, None)
+            message = f"Claimed {candidate['name']} in ClickUp without removing its other assignees."
+        state["work"]["selected_task_id"] = task_id
+        state["work"]["selected_task_name"] = str(candidate.get("name") or "Untitled task")
+        state["work"]["selected_task_location"] = str(candidate.get("location") or "")
+        return message
 
     def _fallback_tasks(self) -> list[dict[str, Any]]:
         examples = [
@@ -642,7 +718,7 @@ class WorkerPortalService:
             lines.append(f"• Progress: {work['latest_progress']}")
         if work.get("latest_blocker"):
             lines.append(f"• Blocker: {work['latest_blocker']}")
-        lines.append("No live time, payroll, or ClickUp records were changed.")
+        lines.append("No live time or payroll records were changed; only an explicit Claim action can add the tester as a ClickUp assignee.")
         await self._post_slack(slack_user_id, "\n".join(lines))
         return "A concise beta summary was sent to your Slack DM."
 
@@ -773,6 +849,19 @@ def _task_contract_name(task: dict[str, Any]) -> str:
         if isinstance(value, (str, int, float)):
             return _clean_text(value, limit=100)
     return ""
+
+
+def _task_due_datetime(task: dict[str, Any]) -> datetime | None:
+    try:
+        timestamp = int(str(task.get("due_date") or ""))
+    except ValueError:
+        return None
+    if timestamp < 100_000_000_000:
+        timestamp *= 1000
+    try:
+        return datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def _is_vague(value: str, *, minimum_words: int, minimum_characters: int) -> bool:
@@ -921,8 +1010,8 @@ def _portal_template() -> str:
         <label>Rough estimate<select id="estimate"><option>30 minutes</option><option selected>1 hour</option><option>2 hours</option><option>half day</option><option>full day</option><option>multi-day</option></select></label>
         <label>Reconsider / ask for help after<select id="checkpoint"><option>30 minutes</option><option selected>60 minutes</option><option>90 minutes</option><option>2 hours</option></select></label>
       </div>
-      <div class="actions"><button class="button primary" data-action="start">Start beta work</button><button class="button subtle" data-action="short-rest">Short rest</button><button class="button subtle" data-action="lunch">Lunch</button><button class="button subtle" data-action="back">Back</button><button class="button danger subtle" data-action="clock-out">Clock out</button></div>
-      <p class="muted" style="margin:12px 0 0">A recognizable result and concrete first move are required. This beta does not change live time, payroll, or ClickUp records.</p>
+      <div class="actions"><button class="button primary" data-action="start">Start beta work</button><button class="button orange" id="claim-selected" data-action="claim-task">Claim in ClickUp</button><button class="button subtle" data-action="short-rest">Short rest</button><button class="button subtle" data-action="lunch">Lunch</button><button class="button subtle" data-action="back">Back</button><button class="button danger subtle" data-action="clock-out">Clock out</button></div>
+      <p class="muted" style="margin:12px 0 0">A recognizable result and concrete first move are required. Beta time and payroll stay isolated; only the clearly labeled Claim action changes ClickUp by adding you as an assignee.</p>
     </section>
     <section class="panel section-space">
       <details class="chooser-details" id="recommended-details" open>
@@ -965,6 +1054,7 @@ def _portal_template() -> str:
       const assignedOnly = $('assigned-only').checked;
       const openGroups = new Set([...document.querySelectorAll('#task-catalog details[open]')].map(node => node.dataset.groupKey));
       const contracts = (data.task_catalog || []).map((contract) => {
+        const flattenOnlyOtherSpace = (contract.spaces || []).length === 1 && String(contract.spaces[0].name || '').toLowerCase() === 'other';
         const spaces = (contract.spaces || []).map((space) => {
           const lists = (space.lists || []).map((taskList) => {
             const visibleTasks = (taskList.tasks || []).filter((task) => {
@@ -973,10 +1063,11 @@ def _portal_template() -> str:
               return !query || searchable.includes(query);
             });
             if (!visibleTasks.length) return '';
-            const rows = visibleTasks.map((task) => `<div class="catalog-task"><div><strong>${esc(task.name)}</strong><div class="meta">${task.assigned ? 'Assigned to you · ' : ''}${esc(task.priority)} · ${esc(task.status)} · ${esc(taskList.name)}</div></div><button class="button" data-select-task="${esc(task.id)}" data-task-name="${esc(task.name)}" data-task-location="${esc(task.location)}">Choose</button></div>`).join('');
+            const rows = visibleTasks.map((task) => { const owners=(task.assignees || []).join(', ') || 'Unassigned'; const due=task.due_date ? ` · Due ${esc(task.due_date)}` : ''; return `<div class="catalog-task"><div><strong>${esc(task.name)}</strong><div class="meta">${task.assigned ? 'Assigned to you · ' : ''}${esc(task.priority)} · ${esc(task.status)}${due} · Owners: ${esc(owners)}</div></div><div class="actions" style="margin:0"><button class="button" data-select-task="${esc(task.id)}" data-task-name="${esc(task.name)}" data-task-location="${esc(task.location)}">Choose</button><button class="button orange" data-claim-task="${esc(task.id)}" data-task-name="${esc(task.name)}" data-task-location="${esc(task.location)}"${task.assigned ? ' disabled' : ''}>${task.assigned ? 'Already mine' : 'Claim'}</button></div></div>`; }).join('');
             return `<div class="catalog-list"><h3>${esc(taskList.name)} · ${visibleTasks.length}</h3>${rows}</div>`;
           }).filter(Boolean);
           if (!lists.length) return '';
+          if (flattenOnlyOtherSpace) return lists.join('');
           const groupKey = `${contract.name}::${space.name}`;
           const isOpen = query || openGroups.has(groupKey);
           return `<details class="space-group" data-group-key="${esc(groupKey)}"${isOpen ? ' open' : ''}><summary>${esc(space.name)} · ${lists.length} active list${lists.length === 1 ? '' : 's'}</summary>${lists.join('')}</details>`;
@@ -1002,7 +1093,7 @@ def _portal_template() -> str:
       const tasks = data.task_options || [];
       $('task-count').textContent = `${tasks.length} option${tasks.length === 1 ? '' : 's'}`;
       $('task-total').textContent = `${Number(data.task_total || 0)} open tasks`;
-      $('task-grid').innerHTML = tasks.map((task,index) => `<button class="task ${task.id === work.selected_task_id ? 'selected' : ''}" data-select-task="${esc(task.id)}" data-task-name="${esc(task.name)}" data-task-location="${esc(task.location)}"><span class="number">${index+1}</span><h3>${esc(task.name)}</h3><div class="tagrow">${task.recommended ? '<span class="tag recommended">Recommended</span>' : ''}<span class="tag">${esc(task.priority)}</span><span class="tag">${esc(task.status)}</span></div><div class="muted">${esc(task.location)}</div><div class="why">Why: ${esc(task.reason)}</div></button>`).join('');
+      $('task-grid').innerHTML = tasks.map((task,index) => `<button class="task ${task.id === work.selected_task_id ? 'selected' : ''}" data-select-task="${esc(task.id)}" data-task-name="${esc(task.name)}" data-task-location="${esc(task.location)}"><span class="number">${index+1}</span><h3>${esc(task.name)}</h3><div class="tagrow">${task.recommended ? '<span class="tag recommended">Recommended</span>' : ''}${task.assigned ? '<span class="tag">Assigned to you</span>' : ''}<span class="tag">${esc(task.priority)}</span><span class="tag">${esc(task.status)}</span>${task.due_date ? `<span class="tag">Due ${esc(task.due_date)}</span>` : ''}</div><div class="muted">${esc(task.location)}</div><div class="why">Why: ${esc(task.reason)}</div></button>`).join('');
       renderTaskCatalog();
       $('selected-task').innerHTML = work.selected_task_name ? `<strong>${esc(work.selected_task_name)}</strong><br><span class="muted">${esc(work.selected_task_location || '')}</span>` : 'Choose an option above.';
       $('outcome').value = work.outcome || '';
@@ -1033,10 +1124,14 @@ def _portal_template() -> str:
       document.querySelector('[data-action="short-rest"]').disabled = work.status !== 'active';
       document.querySelector('[data-action="lunch"]').disabled = work.status !== 'active';
       document.querySelector('[data-action="clock-out"]').disabled = ['ready','clocked_out'].includes(work.status);
+      const selectedOption = (data.task_options || []).find(task => task.id === work.selected_task_id) || (data.task_catalog || []).flatMap(contract => contract.spaces || []).flatMap(space => space.lists || []).flatMap(taskList => taskList.tasks || []).find(task => task.id === work.selected_task_id);
+      $('claim-selected').disabled = !work.selected_task_id || Boolean(selectedOption && selectedOption.assigned);
+      $('claim-selected').textContent = selectedOption && selectedOption.assigned ? 'Already mine in ClickUp' : 'Claim in ClickUp';
     }
     function actionPayload(action) {
       if (action === 'start') return {action, outcome:$('outcome').value, first_step:$('first-step').value, estimate:$('estimate').value, checkpoint:$('checkpoint').value};
       if (action === 'check-in') return {action, progress:$('progress').value, blocker:$('blocker').value};
+      if (action === 'claim-task') return {action:'claim_task', task_id:(data.work || {}).selected_task_id};
       if (action === 'save-profile') return {action:'save_profile', weekly_target_hours:$('weekly-hours').value, regular_workdays:[...document.querySelectorAll('#workdays input:checked')].map(node => node.value), typical_start_time:$('start-time').value, typical_end_time:$('end-time').value, planned_time_off:$('time-off').value, interests:$('interests').value, skills:$('skills').value};
       if (action === 'request-task') return {action:'request_task', title:$('request-title').value, task_type:$('request-type').value, reason:$('request-reason').value};
       return {action: action.replaceAll('-','_')};
@@ -1053,6 +1148,8 @@ def _portal_template() -> str:
       finally { if (button && button.isConnected) { button.disabled = false; button.textContent = original; } }
     }
     document.addEventListener('click', (event) => {
+      const claim = event.target.closest('[data-claim-task]');
+      if (claim) return post({action:'claim_task',task_id:claim.dataset.claimTask},claim).then((saved) => { if (!saved) return; $('recommended-details').open=false; $('catalog-details').open=false; if (window.innerWidth <= 600) $('work-now').scrollIntoView({behavior:'smooth',block:'start'}); });
       const task = event.target.closest('[data-select-task]');
       if (task) return post({action:'select_task',task_id:task.dataset.selectTask,task_name:task.dataset.taskName,task_location:task.dataset.taskLocation},task).then((saved) => { if (!saved) return; $('recommended-details').open=false; $('catalog-details').open=false; if (window.innerWidth <= 600) $('work-now').scrollIntoView({behavior:'smooth',block:'start'}); });
       const button = event.target.closest('[data-action]');

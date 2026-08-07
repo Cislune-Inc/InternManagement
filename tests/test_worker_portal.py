@@ -27,6 +27,9 @@ class _FakeSlack:
 
 
 class _FakeClickUp:
+    def __init__(self) -> None:
+        self.assignee_updates: list[tuple[str, list[str]]] = []
+
     async def list_assigned_tasks(self, _user, limit=35):
         return [
             {
@@ -51,9 +54,18 @@ class _FakeClickUp:
                 "space": {"name": "Operations" if index % 2 else "NASA"},
                 "folder": {"name": "Internal" if index % 2 else "NASA Award"},
                 "list": {"name": "Open work"},
+                "assignees": [{"id": 456, "username": "George"}] if index == 1 else [],
+                "due_date": str(int((datetime.now(timezone.utc) + timedelta(days=2)).timestamp() * 1000))
+                if index == 0
+                else None,
             }
             for index in range(12)
         ]
+
+    async def update_task_assignees(self, task_id, *, add_user_ids=None, remove_user_ids=None):
+        assert remove_user_ids is None
+        self.assignee_updates.append((task_id, list(add_user_ids or [])))
+        return {"id": task_id}
 
 
 def _runtime(tmp_path):
@@ -125,6 +137,18 @@ def test_worker_portal_limits_task_options_and_keeps_beta_state_isolated(tmp_pat
         "Internal",
         "NASA Award",
     }
+    catalog_tasks = [
+        task
+        for contract in initial["task_catalog"]
+        for space in contract["spaces"]
+        for task_list in space["lists"]
+        for task in task_list["tasks"]
+    ]
+    due_task = next(task for task in catalog_tasks if task["id"] == "workspace-0")
+    other_owned_task = next(task for task in catalog_tasks if task["id"] == "workspace-1")
+    assert due_task["due_date"]
+    assert "due" in due_task["reason"]
+    assert other_owned_task["assignees"] == ["George"]
     assert initial["work"]["status"] == "ready"
 
     selected = asyncio.run(
@@ -139,6 +163,13 @@ def test_worker_portal_limits_task_options_and_keeps_beta_state_isolated(tmp_pat
         )
     )
     assert selected["work"]["selected_task_id"] == "assigned"
+
+    claimed = asyncio.run(
+        service.apply_action(token, {"action": "claim_task", "task_id": "workspace-1"})
+    )
+    assert claimed["work"]["selected_task_id"] == "workspace-1"
+    assert runtime.clickup.assignee_updates == [("workspace-1", ["123"])]
+    assert "without removing" in claimed["message"]
 
     weak_payload = {
         "action": "start",

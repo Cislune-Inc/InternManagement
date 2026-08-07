@@ -1353,8 +1353,9 @@ class InternManagementRuntime:
                     (
                         "Open the Erik-only Don Pollo Workday beta:\n"
                         f"{portal_url}\n\n"
-                        "The signed link expires in 72 hours. This beta uses live read-only ClickUp options, "
-                        "but its clock, profile, and workday actions are isolated from worker, payroll, and ClickUp records."
+                        "The signed link expires in 72 hours. Its clock, profile, and workday actions are isolated "
+                        "from worker and payroll records. Browsing and choosing are read-only; the clearly labeled "
+                        "Claim action adds you as a ClickUp assignee without removing anyone else."
                     ),
                 )
                 return

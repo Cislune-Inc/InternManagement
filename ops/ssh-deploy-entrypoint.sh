@@ -20,6 +20,14 @@ case "${original_command}" in
   revision)
     exec git -C "${repo_root}" rev-parse HEAD
     ;;
+  seed-management)
+    cd "${repo_root}"
+    exec .venv/bin/python ops/seed-project-management-tasks.py --apply
+    ;;
+  seed-management-plan)
+    cd "${repo_root}"
+    exec .venv/bin/python ops/seed-project-management-tasks.py
+    ;;
   deploy\ agent/*)
     branch="${original_command#deploy }"
     if [[ ! "${branch}" =~ '^agent/[A-Za-z0-9._/-]+$' ]]; then
@@ -30,7 +38,7 @@ case "${original_command}" in
     exec ops/deploy-branch.sh "${branch}"
     ;;
   *)
-    echo "Allowed commands: health, status, revision, deploy agent/<reviewed-branch>" >&2
+    echo "Allowed commands: health, status, revision, seed-management-plan, seed-management, deploy agent/<reviewed-branch>" >&2
     exit 2
     ;;
 esac
