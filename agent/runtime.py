@@ -97,6 +97,7 @@ _AUTO_CLOCK_OUT_WARNING_KEY = "auto_clock_out_warning"
 _SHORT_REST_ACTIVE_KEY = "short_rest_break_active"
 _SHORT_REST_HISTORY_KEY = "short_rest_breaks"
 _SLACK_USER_MIN_POST_INTERVAL = timedelta(minutes=90)
+_SLACK_MISSING_TASK_ESCALATION_DELAY = timedelta(minutes=30)
 _TRANSCRIPT_PACIFIC_BACKFILL_MARKER = "transcript_pacific_backfill_v1.done"
 _SESSION_DATE_DIRECTORY_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _PENDING_ADMIN_REVIEWS_KEY = "pending_admin_reviews"
@@ -3612,21 +3613,74 @@ class InternManagementRuntime:
         messages = self.list_session_messages(user.user_key, session)
         active_task_id = str(self._active_task_id(session) or "")
         if not active_task_id:
-            await self._report_operational_issue(
-                category="slack_update_missing_task",
-                severity="warning",
-                summary=f"Slack update held because {user.display_name} has no active ClickUp task.",
-                details={
-                    "user_key": user.user_key,
-                    "display_name": user.display_name,
-                    "session_date": session.session_date,
-                },
-                fingerprint_parts=(user.user_key, session.session_date),
-                now=now,
+            if not session.clocked_in_at or session.clocked_out_at:
+                return False
+            recent_messages = self._fresh_interesting_slack_messages(messages, since=None)
+            images = self._fresh_interesting_slack_images(
+                messages,
+                previous_image_paths=set(),
+                since=None,
             )
-            self._record_unmapped_slack_update(state, user, session, now)
+            has_work_evidence = self._slack_update_has_anything_to_say(
+                session,
+                recent_messages,
+                images,
+                include_session_context=True,
+                blocker_changed=bool(session.latest_blocker),
+            )
+            if not has_work_evidence:
+                return False
+            clocked_in_at = self._coerce_datetime_for_reference(
+                str(session.clocked_in_at or ""),
+                reference=now,
+                timezone_name=self.resolve_user_timezone_name(user),
+            )
+            if (
+                not clocked_in_at
+                or now - clocked_in_at < _SLACK_MISSING_TASK_ESCALATION_DELAY
+            ):
+                return False
+            newly_recorded = self._record_unmapped_slack_update(
+                state,
+                user,
+                session,
+                now,
+            )
+            escalation_key = f"{user.user_key}:{session.session_date}"
+            escalations = state.setdefault("missing_task_escalations", {})
+            if not isinstance(escalations, dict):
+                escalations = {}
+                state["missing_task_escalations"] = escalations
+            if escalation_key not in escalations:
+                await self._report_operational_issue(
+                    category="slack_update_missing_task",
+                    severity="warning",
+                    summary=(
+                        f"{user.display_name} reported meaningful work but has not confirmed "
+                        "an active ClickUp task after 30 minutes."
+                    ),
+                    details={
+                        "user_key": user.user_key,
+                        "display_name": user.display_name,
+                        "session_date": session.session_date,
+                        "escalated_after_minutes": 30,
+                        "worker_prompted": True,
+                    },
+                    fingerprint_parts=(user.user_key, session.session_date),
+                    now=now,
+                )
+                escalations[escalation_key] = {
+                    "reported_at": now.isoformat(),
+                    "unmapped_update_recorded": newly_recorded,
+                }
             self._write_slack_update_state(state)
             return False
+        self._resolve_matching_operational_issue(
+            "slack_update_missing_task",
+            user_key=user.user_key,
+            session_date=session.session_date,
+            now=now,
+        )
         channel_id, route_label, route_uncertain = await self._resolve_slack_daily_channel(
             user,
             session,
@@ -3637,30 +3691,43 @@ class InternManagementRuntime:
             self._write_slack_update_state(state)
             return False
         if route_uncertain:
-            await self._report_operational_issue(
-                category="slack_route_uncertain",
-                severity="warning",
-                summary=f"Slack project routing needs review for {user.display_name}.",
-                details={
-                    "user_key": user.user_key,
-                    "display_name": user.display_name,
-                    "session_date": session.session_date,
-                    "active_task_id": self._active_task_id(session),
-                    "active_task_name": str(
-                        session.metadata.get("active_clickup_task_name") or ""
-                    ),
-                    "fallback_channel_id": channel_id,
-                },
-                fingerprint_parts=(
-                    user.user_key,
-                    str(self._active_task_id(session) or ""),
-                ),
-                now=now,
+            newly_recorded = self._record_unmapped_slack_update(
+                state,
+                user,
+                session,
+                now,
             )
+            if newly_recorded:
+                await self._report_operational_issue(
+                    category="slack_route_uncertain",
+                    severity="warning",
+                    summary=f"Slack project routing needs review for {user.display_name}.",
+                    details={
+                        "user_key": user.user_key,
+                        "display_name": user.display_name,
+                        "session_date": session.session_date,
+                        "active_task_id": self._active_task_id(session),
+                        "active_task_name": str(
+                            session.metadata.get("active_clickup_task_name") or ""
+                        ),
+                        "fallback_channel_id": channel_id,
+                    },
+                    fingerprint_parts=(
+                        user.user_key,
+                        str(self._active_task_id(session) or ""),
+                    ),
+                    now=now,
+                )
             if self.config.slack.quarantine_uncertain_routes:
-                self._record_unmapped_slack_update(state, user, session, now)
                 self._write_slack_update_state(state)
                 return False
+        else:
+            self._resolve_matching_operational_issue(
+                "slack_route_uncertain",
+                user_key=user.user_key,
+                active_task_id=active_task_id,
+                now=now,
+            )
         previous_update = self._slack_daily_update_state(state, user.user_key, session.session_date)
         if str(previous_update.get("active_task_id") or "") != active_task_id:
             previous_update = {}
@@ -4184,14 +4251,14 @@ class InternManagementRuntime:
         user: UserProfile,
         session: SessionState,
         now: datetime,
-    ) -> None:
+    ) -> bool:
         unmapped = state.setdefault("unmapped_updates", [])
         if not isinstance(unmapped, list):
             unmapped = []
             state["unmapped_updates"] = unmapped
         key = f"{user.user_key}:{session.session_date}:{self._active_task_id(session) or ''}"
         if any(str(item.get("key") or "") == key for item in unmapped if isinstance(item, dict)):
-            return
+            return False
         unmapped.append(
             {
                 "key": key,
@@ -4202,6 +4269,30 @@ class InternManagementRuntime:
                 "active_task_name": str(session.metadata.get("active_clickup_task_name") or ""),
                 "recorded_at": now.isoformat(),
             }
+        )
+        return True
+
+    def _resolve_matching_operational_issue(
+        self,
+        category: str,
+        *,
+        now: datetime,
+        **details_match: Any,
+    ) -> int:
+        resolve_matching = getattr(
+            getattr(self, "state_store", None),
+            "resolve_matching_operational_issues",
+            None,
+        )
+        if not callable(resolve_matching):
+            return 0
+        return int(
+            resolve_matching(
+                category=category,
+                details_match=details_match,
+                resolved_at=now,
+            )
+            or 0
         )
 
     def _fresh_interesting_slack_messages(

@@ -16,8 +16,10 @@ from agent.models import (
     SlackProjectRoute,
     UserProfile,
 )
+from agent.operations import OperationalIssueReporter
 from agent.runtime import InternManagementRuntime
 from agent.slack_update_policy import SlackUpdatePolicy
+from agent.state_store import StateStore
 
 
 class _FakeSlack:
@@ -591,6 +593,125 @@ def test_slack_daily_update_skips_repeat_and_records_unmapped_route(tmp_path: Pa
     assert runtime.slack.messages == []
     state = runtime._load_slack_update_state()
     assert len(state["unmapped_updates"]) == 1
+
+
+def test_slack_missing_task_escalates_once_after_worker_has_meaningful_work(tmp_path: Path) -> None:
+    runtime = _build_runtime(tmp_path)
+    store = StateStore(tmp_path / "state.sqlite3")
+    runtime.state_store = store
+    runtime.operations = OperationalIssueReporter(
+        state_store=store,
+        config_provider=lambda: runtime.config,
+        slack_provider=lambda: None,
+        admins_provider=lambda: [],
+        timezone_provider=runtime.runtime_timezone_name,
+    )
+    user = UserProfile(
+        user_key="alex",
+        display_name="Alex",
+        discord_user_id=1,
+        discord_username="alex",
+        storage_folder_name="Alex",
+    )
+    session = SessionState(
+        user_key="alex",
+        session_date="2026-07-13",
+        stage="awaiting_task_selection",
+        clocked_in_at="2026-07-13T12:00:00-07:00",
+        latest_status="Completed the first bracket fit check and recorded the interference measurements.",
+    )
+
+    too_soon = asyncio.run(
+        runtime._maybe_post_slack_daily_update(
+            user,
+            session,
+            datetime.fromisoformat("2026-07-13T12:20:00-07:00"),
+        )
+    )
+    first = asyncio.run(
+        runtime._maybe_post_slack_daily_update(
+            user,
+            session,
+            datetime.fromisoformat("2026-07-13T12:31:00-07:00"),
+        )
+    )
+    repeat = asyncio.run(
+        runtime._maybe_post_slack_daily_update(
+            user,
+            session,
+            datetime.fromisoformat("2026-07-13T12:45:00-07:00"),
+        )
+    )
+
+    assert too_soon is False
+    assert first is False
+    assert repeat is False
+    issues = store.list_operational_issues(status="open")
+    assert len(issues) == 1
+    assert issues[0]["category"] == "slack_update_missing_task"
+    assert issues[0]["occurrence_count"] == 1
+    assert issues[0]["details"]["worker_prompted"] is True
+
+    session.stage = "active"
+    session.metadata.update(
+        {
+            "active_clickup_task_id": "task-1",
+            "active_clickup_task_name": "Solar wifi diagnostics",
+        }
+    )
+    asyncio.run(
+        runtime._maybe_post_slack_daily_update(
+            user,
+            session,
+            datetime.fromisoformat("2026-07-13T13:00:00-07:00"),
+        )
+    )
+
+    assert store.list_operational_issues(status="open") == []
+
+
+def test_slack_uncertain_route_records_one_issue_per_worker_task_day(tmp_path: Path) -> None:
+    runtime = _build_runtime(tmp_path)
+    runtime.clickup = SimpleNamespace(
+        get_task=lambda _task_id: asyncio.sleep(0, result={"list": {"id": "unknown"}})
+    )
+    store = StateStore(tmp_path / "state.sqlite3")
+    runtime.state_store = store
+    runtime.operations = OperationalIssueReporter(
+        state_store=store,
+        config_provider=lambda: runtime.config,
+        slack_provider=lambda: None,
+        admins_provider=lambda: [],
+        timezone_provider=runtime.runtime_timezone_name,
+    )
+    user = UserProfile(
+        user_key="alex",
+        display_name="Alex",
+        discord_user_id=1,
+        storage_folder_name="Alex",
+    )
+    session = SessionState(
+        user_key="alex",
+        session_date="2026-07-13",
+        stage="active",
+        clocked_in_at="2026-07-13T09:00:00-07:00",
+        latest_status="Completed the sensor bracket fit check and recorded the revised measurements.",
+        metadata={"active_clickup_task_id": "task-x", "active_clickup_task_name": "Sensor bracket"},
+    )
+
+    for minute in (0, 30, 59):
+        asyncio.run(
+            runtime._maybe_post_slack_daily_update(
+                user,
+                session,
+                datetime.fromisoformat(f"2026-07-13T12:{minute:02d}:00-07:00"),
+            )
+        )
+
+    issues = store.list_operational_issues(status="open")
+    assert len(issues) == 1
+    assert issues[0]["category"] == "slack_route_uncertain"
+    assert issues[0]["occurrence_count"] == 1
 
 
 def test_slack_daily_update_filters_hours_and_lunch_workflow_chatter(tmp_path: Path) -> None:

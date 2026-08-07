@@ -173,6 +173,22 @@ def test_route_issue_maintenance_merges_worker_task_duplicates_and_retires_stale
         details={"user_key": "old", "active_task_id": "task-old"},
         observed_at=now - timedelta(days=20),
     )
+    store.record_operational_issue(
+        fingerprint="route-without-task",
+        category="slack_route_uncertain",
+        severity="warning",
+        summary="Legacy route warning without a task.",
+        details={"user_key": "legacy", "active_task_id": None},
+        observed_at=now,
+    )
+    store.record_operational_issue(
+        fingerprint="legacy-missing-task",
+        category="slack_update_missing_task",
+        severity="warning",
+        summary="Legacy missing-task warning.",
+        details={"user_key": "legacy", "session_date": "2026-07-29"},
+        observed_at=now,
+    )
 
     result = reporter._maintain_route_issues(now)
     open_routes = [
@@ -181,7 +197,7 @@ def test_route_issue_maintenance_merges_worker_task_duplicates_and_retires_stale
         if issue["category"] == "slack_route_uncertain"
     ]
 
-    assert result == {"stale_resolved": 1, "merged": 2}
+    assert result == {"stale_resolved": 3, "merged": 2}
     assert len(open_routes) == 1
     assert open_routes[0]["occurrence_count"] == 3
     assert open_routes[0]["details"]["active_task_id"] == "task-1"

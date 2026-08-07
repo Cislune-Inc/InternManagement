@@ -102,6 +102,7 @@ class OperationalIssueReporter:
         observed_at = now or datetime.now(
             tz=resolve_timezone(self.timezone_provider())
         )
+        self._maintain_route_issues(observed_at)
         config = self.config_provider()
         slack = self.slack_provider()
         if (
@@ -116,7 +117,6 @@ class OperationalIssueReporter:
         digest_now = observed_at.astimezone(digest_timezone)
         if digest_now.hour < config.slack.operational_digest_hour:
             return False
-        self._maintain_route_issues(observed_at)
         digest_state = self.state_store.get_operational_state(
             "operational_issue_digest"
         ) or {}
@@ -201,6 +201,23 @@ class OperationalIssueReporter:
         stale_resolved = 0
         active: list[dict[str, Any]] = []
         for issue in route_issues:
+            details = issue.get("details")
+            details = details if isinstance(details, dict) else {}
+            if (
+                details.get("user_key")
+                and ("active_task_id" in details or "active_task_name" in details)
+                and not str(
+                    details.get("active_task_id")
+                    or details.get("active_task_name")
+                    or ""
+                ).strip()
+            ):
+                if self.state_store.resolve_operational_issue(
+                    str(issue.get("fingerprint") or ""),
+                    resolved_at=observed_at,
+                ):
+                    stale_resolved += 1
+                continue
             try:
                 last_seen_at = datetime.fromisoformat(
                     str(issue.get("last_seen_at") or "")
@@ -218,6 +235,19 @@ class OperationalIssueReporter:
                     stale_resolved += 1
                 continue
             active.append(issue)
+
+        for issue in open_issues:
+            if str(issue.get("category") or "") != "slack_update_missing_task":
+                continue
+            details = issue.get("details")
+            details = details if isinstance(details, dict) else {}
+            if details.get("escalated_after_minutes"):
+                continue
+            if self.state_store.resolve_operational_issue(
+                str(issue.get("fingerprint") or ""),
+                resolved_at=observed_at,
+            ):
+                stale_resolved += 1
 
         grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
         for issue in active:
