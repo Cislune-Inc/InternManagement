@@ -228,14 +228,30 @@ _AUTO_CLOCK_OUT_NOTIFICATION_MESSAGE = (
 
 def _normalize_slack_admin_text(value: Any) -> str:
     text = _SLACK_CHATGPT_ATTRIBUTION_RE.sub("", str(value or "")).strip()
-    normalized_text = text.casefold()
+    attribution_marker = _SLACK_SENT_USING_MARKER_RE.search(text)
+    command_candidate = (
+        text[: attribution_marker.start()].strip()
+        if attribution_marker
+        else text
+    )
+    normalized_text = command_candidate.casefold()
     is_deterministic_command = (
-        normalized_text == "help"
+        normalized_text in {
+            "help",
+            "menu",
+            "flow",
+            "back",
+            "home",
+            "cancel",
+            "portal",
+            "beta portal",
+            "worker portal",
+            "workday beta",
+        }
         or normalized_text.startswith("help ")
         or normalized_text.startswith("run ")
     )
     if is_deterministic_command:
-        attribution_marker = _SLACK_SENT_USING_MARKER_RE.search(text)
         if attribution_marker:
             text = text[: attribution_marker.start()].strip()
     lines = [line.strip() for line in text.splitlines() if line.strip()]

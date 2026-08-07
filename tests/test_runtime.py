@@ -494,7 +494,11 @@ def test_slack_admin_portal_command_returns_signed_vpn_beta_link(tmp_path: Path)
     asyncio.run(
         runtime.handle_slack_direct_message(
             SimpleNamespace(),
-            {"user": "U01SWQKDTBM", "text": "portal", "ts": "1785859200.0"},
+            {
+                "user": "U01SWQKDTBM",
+                "text": "portal *Sent using* <@U0BATRYF16C|ChatGPT>",
+                "ts": "1785859200.0",
+            },
         )
     )
 
