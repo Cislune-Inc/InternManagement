@@ -6,6 +6,7 @@ import hmac
 import json
 import re
 import secrets
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import quote, urlsplit
@@ -120,6 +121,7 @@ def validate_meaningful_work_detail(
 class WorkerPortalService:
     def __init__(self, runtime: Any) -> None:
         self.runtime = runtime
+        self._task_source_cache: dict[str, tuple[float, list[dict[str, Any]], set[str]]] = {}
 
     async def build_payload(self, token: str) -> dict[str, Any]:
         slack_user_id = validate_worker_portal_token(self.runtime, token)
@@ -211,6 +213,7 @@ class WorkerPortalService:
             "version": 1,
             "profile": {
                 "display_name": admin.name,
+                "saved_at": "",
                 "weekly_target_hours": 40,
                 "regular_workdays": list(_DEFAULT_WORKDAYS),
                 "typical_start_time": "09:00",
@@ -264,18 +267,32 @@ class WorkerPortalService:
             interests=list(profile.get("interests") or []),
             skills=list(profile.get("skills") or []),
         )
-        candidates: list[dict[str, Any]] = []
-        assigned_ids: set[str] = set()
-        try:
-            assigned = await self.runtime.clickup.list_assigned_tasks(portal_user, limit=35)
-            candidates.extend(task for task in assigned if isinstance(task, dict))
-            assigned_ids = {str(task.get("id") or "") for task in candidates}
-            list_workspace = getattr(self.runtime.clickup, "list_workspace_tasks", None)
-            if callable(list_workspace):
-                workspace = await list_workspace(limit=100, include_closed=False)
-                candidates.extend(task for task in workspace if isinstance(task, dict))
-        except Exception as exc:
-            return self._fallback_tasks(), f"Live ClickUp options could not load: {exc}"
+        cached = self._task_source_cache.get(admin.slack_user_id)
+        if cached and time.monotonic() - cached[0] < 180:
+            candidates = list(cached[1])
+            assigned_ids = set(cached[2])
+        else:
+            candidates: list[dict[str, Any]] = []
+            assigned_ids: set[str] = set()
+            try:
+                assigned = await self.runtime.clickup.list_assigned_tasks(portal_user, limit=100)
+                candidates.extend(task for task in assigned if isinstance(task, dict))
+                assigned_ids = {str(task.get("id") or "") for task in candidates}
+                list_workspace = getattr(self.runtime.clickup, "list_workspace_tasks", None)
+                if callable(list_workspace):
+                    workspace = await list_workspace(limit=500, include_closed=False)
+                    candidates.extend(task for task in workspace if isinstance(task, dict))
+                self._task_source_cache[admin.slack_user_id] = (
+                    time.monotonic(),
+                    list(candidates),
+                    set(assigned_ids),
+                )
+            except Exception as exc:
+                if cached:
+                    candidates = list(cached[1])
+                    assigned_ids = set(cached[2])
+                else:
+                    return self._fallback_tasks(), f"Live ClickUp options could not load: {exc}"
         deduped: dict[str, dict[str, Any]] = {}
         for task in candidates:
             task_id = str(task.get("id") or "").strip()
@@ -291,7 +308,7 @@ class WorkerPortalService:
         selected_id = str(state["work"].get("selected_task_id") or "")
         if selected_id and selected_id in deduped:
             ranked = [deduped[selected_id]] + [task for task in ranked if str(task.get("id")) != selected_id]
-        options = [self._task_payload(task, assigned_ids, profile, index) for index, task in enumerate(ranked[:5])]
+        options = [self._task_payload(task, assigned_ids, profile, index) for index, task in enumerate(ranked)]
         return options or self._fallback_tasks(), ""
 
     def _task_rank(self, task: dict[str, Any], assigned_ids: set[str], profile: dict[str, Any]) -> tuple[int, int, str]:
@@ -338,6 +355,10 @@ class WorkerPortalService:
             for key in ("space", "folder", "list")
         ]
         location = " / ".join(part for part in location_parts if part) or "ClickUp workspace"
+        space_name = str((task.get("space") or {}).get("name") or "Other").strip() or "Other"
+        folder_name = str((task.get("folder") or {}).get("name") or "").strip()
+        list_name = str((task.get("list") or {}).get("name") or "Open work").strip() or "Open work"
+        contract_name = _task_contract_name(task) or folder_name or "General / overhead"
         reasons: list[str] = []
         if task_id in assigned_ids:
             reasons.append("assigned to you")
@@ -362,7 +383,46 @@ class WorkerPortalService:
             "url": str(task.get("url") or ""),
             "reason": ", ".join(reasons) or "recent open workspace work",
             "recommended": index == 0,
+            "assigned": task_id in assigned_ids,
+            "contract": contract_name,
+            "space": space_name,
+            "list": list_name,
         }
+
+    def _task_catalog(self, tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        grouped: dict[str, dict[str, dict[str, list[dict[str, Any]]]]] = {}
+        for task in tasks:
+            contract_name = str(task.get("contract") or "General / overhead")
+            space_name = str(task.get("space") or "Other")
+            list_name = str(task.get("list") or "Open work")
+            grouped.setdefault(contract_name, {}).setdefault(space_name, {}).setdefault(list_name, []).append(task)
+
+        def group_key(name: str) -> tuple[bool, str]:
+            return name == "General / overhead", name.lower()
+
+        catalog: list[dict[str, Any]] = []
+        for contract_name in sorted(grouped, key=group_key):
+            spaces: list[dict[str, Any]] = []
+            for space_name in sorted(grouped[contract_name], key=str.lower):
+                lists = [
+                    {"name": list_name, "tasks": grouped[contract_name][space_name][list_name]}
+                    for list_name in sorted(grouped[contract_name][space_name], key=str.lower)
+                ]
+                spaces.append(
+                    {
+                        "name": space_name,
+                        "task_count": sum(len(item["tasks"]) for item in lists),
+                        "lists": lists,
+                    }
+                )
+            catalog.append(
+                {
+                    "name": contract_name,
+                    "task_count": sum(space["task_count"] for space in spaces),
+                    "spaces": spaces,
+                }
+            )
+        return catalog
 
     def _fallback_tasks(self) -> list[dict[str, Any]]:
         examples = [
@@ -396,6 +456,7 @@ class WorkerPortalService:
             raise ValueError("Choose at least one regular workday.")
         profile.update(
             {
+                "saved_at": datetime.now(timezone.utc).isoformat(),
                 "weekly_target_hours": weekly_hours,
                 "regular_workdays": workdays,
                 "typical_start_time": _clean_clock(payload.get("typical_start_time")),
@@ -624,6 +685,8 @@ class WorkerPortalService:
             "work": work,
             "quality": state["quality"],
             "task_options": tasks[:5],
+            "task_catalog": self._task_catalog(tasks),
+            "task_total": len(tasks),
             "task_warning": task_warning,
             "task_requests": list(state.get("task_requests") or [])[:5],
             "history": list(state.get("history") or [])[:8],
@@ -690,6 +753,28 @@ def _clean_clock(value: Any) -> str:
     return text
 
 
+def _task_contract_name(task: dict[str, Any]) -> str:
+    for field in task.get("custom_fields") or []:
+        if not isinstance(field, dict):
+            continue
+        field_name = str(field.get("name") or "").strip().lower()
+        if not any(term in field_name for term in ("contract", "program", "award", "customer")):
+            continue
+        value = field.get("value")
+        options = ((field.get("type_config") or {}).get("options") or [])
+        for option in options:
+            if not isinstance(option, dict):
+                continue
+            option_values = {str(option.get(key)) for key in ("id", "orderindex")}
+            if str(value) in option_values:
+                return _clean_text(option.get("name") or option.get("label"), limit=100)
+        if isinstance(value, dict):
+            return _clean_text(value.get("name") or value.get("label"), limit=100)
+        if isinstance(value, (str, int, float)):
+            return _clean_text(value, limit=100)
+    return ""
+
+
 def _is_vague(value: str, *, minimum_words: int, minimum_characters: int) -> bool:
     normalized = _clean_text(value, limit=1000).lower().strip(" .!?")
     words = re.findall(r"[a-z0-9][a-z0-9'-]*", normalized)
@@ -744,8 +829,9 @@ def _portal_template() -> str:
     .pill { border:1px solid var(--line); border-radius:999px; padding:7px 11px; background:white; font-size:.85rem; }
     .pill.beta { color:#7a431e; border-color:#eab181; background:#fff3e8; font-weight:800; }
     .pill.running { color:white; border-color:var(--teal); background:var(--teal); }
-    .hero { display:grid; grid-template-columns:1.5fr .8fr; gap:18px; margin:20px 0; }
     .panel { border:1px solid var(--line); background:var(--card); border-radius:22px; padding:22px; box-shadow:0 8px 28px rgba(21,40,33,.05); }
+    .section-space { margin-top:18px; }
+    .work-now { margin-top:18px; border-top:5px solid var(--teal); }
     .hero-main { background:var(--ink); color:white; border-color:var(--ink); }
     .hero-main p { color:#d4e0da; max-width:66ch; }
     .hero-main strong { color:#ffd3ad; }
@@ -760,6 +846,28 @@ def _portal_template() -> str:
     .tagrow { display:flex; gap:6px; flex-wrap:wrap; }
     .tag { font-size:.73rem; border:1px solid var(--line); border-radius:999px; padding:4px 7px; color:var(--muted); }
     .recommended { border-color:#eab181; background:#fff3e8; color:#7a431e; }
+    .catalog-tools { display:grid; grid-template-columns:minmax(220px,1fr) auto; gap:12px; align-items:end; margin:12px 0 16px; }
+    .inline-check { display:flex; align-items:center; gap:8px; min-height:44px; padding:0 4px; white-space:nowrap; }
+    .inline-check input { width:auto; }
+    .catalog { display:grid; gap:10px; }
+    .catalog details { border:1px solid var(--line); border-radius:14px; padding:0; background:white; overflow:hidden; }
+    .catalog summary { padding:13px 14px; list-style-position:inside; }
+    .catalog .space-group { margin:0 12px 10px; border-radius:11px; background:var(--card); }
+    .catalog .space-group > summary { padding:10px 12px; color:var(--teal-dark); }
+    .catalog-list { padding:0 12px 12px; }
+    .catalog-list h3 { margin:8px 0; color:var(--muted); font-size:.8rem; text-transform:uppercase; letter-spacing:.06em; }
+    .catalog-task { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:10px; align-items:center; padding:10px 0; border-top:1px solid var(--line); }
+    .catalog-task:first-of-type { border-top:0; }
+    .catalog-task strong { display:block; }
+    .catalog-task .meta { color:var(--muted); font-size:.79rem; margin-top:3px; }
+    .catalog-empty { padding:14px; color:var(--muted); text-align:center; }
+    .chooser-details { border:0; padding:0; }
+    .chooser-summary { display:flex; align-items:flex-end; justify-content:space-between; gap:12px; list-style:none; }
+    .chooser-summary::-webkit-details-marker { display:none; }
+    .chooser-summary h2 { display:inline; }
+    .chooser-summary::after { content:'Expand'; color:var(--teal-dark); font-size:.8rem; margin-left:auto; }
+    .chooser-details[open] > .chooser-summary::after { content:'Collapse'; }
+    .chooser-body { margin-top:14px; }
     .layout { display:grid; grid-template-columns:1.45fr .75fr; gap:18px; margin-top:18px; }
     .stack { display:grid; gap:18px; }
     .form-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
@@ -793,8 +901,8 @@ def _portal_template() -> str:
     #toast { position:fixed; right:18px; bottom:18px; width:min(420px,calc(100% - 36px)); padding:14px 16px; border-radius:14px; background:var(--ink); color:white; box-shadow:0 12px 40px rgba(0,0,0,.2); transform:translateY(140%); transition:.2s ease; z-index:10; }
     #toast.show { transform:translateY(0); }
     #toast.error { background:var(--danger); }
-    @media (max-width:900px) { .hero,.layout { grid-template-columns:1fr; } .topbar { position:static; } .task-grid { grid-template-columns:repeat(5,240px); } }
-    @media (max-width:600px) { .shell { width:min(100% - 16px,100%); margin:8px auto 40px; } .topbar,.panel { border-radius:16px; padding:16px; } .topbar { align-items:flex-start; } .status { display:none; } .form-grid,.profile-summary { grid-template-columns:1fr; } }
+    @media (max-width:900px) { .layout { grid-template-columns:1fr; } .topbar { position:static; } .task-grid { grid-template-columns:repeat(5,240px); } }
+    @media (max-width:600px) { .shell { width:min(100% - 16px,100%); margin:8px auto 40px; } .topbar,.panel { border-radius:16px; padding:16px; } .topbar { align-items:flex-start; } .status { display:none; } .form-grid,.profile-summary,.catalog-tools { grid-template-columns:1fr; } .task-grid { grid-template-columns:1fr; overflow:visible; } .task { min-height:0; } .actions .button { min-height:44px; } .work-now .actions .primary { flex:1 1 100%; } .catalog-task { grid-template-columns:1fr; } .catalog-task .button { width:100%; } }
   </style>
 </head>
 <body>
@@ -803,30 +911,33 @@ def _portal_template() -> str:
       <div class="brand"><div class="mark">DP</div><div><div class="eyebrow">Cislune work system</div><h1>Don Pollo Workday</h1></div></div>
       <div class="status"><span class="pill beta">Erik-only beta</span><span class="pill" id="clock-pill">Ready</span><span class="pill">Slack connected</span></div>
     </header>
-    <section class="hero">
-      <article class="panel hero-main"><div class="eyebrow">Today’s goal</div><h2>Turn a useful plan into visible progress.</h2><p>Pick one of five ranked options, describe the result and first move, then start. <strong>No live time, payroll, or ClickUp records change in this beta.</strong></p><div id="work-notice"></div></article>
-      <article class="panel"><div class="eyebrow">Worker context</div><h2 id="welcome">Welcome</h2><p class="muted" id="schedule-line"></p><div class="profile-summary"><div class="fact"><small>Skills</small><span id="skills-line">—</span></div><div class="fact"><small>Interests</small><span id="interests-line">—</span></div></div></article>
+    <section class="panel work-now" id="work-now">
+      <div class="section-head"><div><div class="eyebrow">Work now</div><h2>Start or continue useful work</h2></div><span class="pill" id="quality-pill">0 strong plans</span></div>
+      <div id="work-notice"></div>
+      <div class="selected-task"><small class="muted">SELECTED TASK</small><div id="selected-task">Choose an option below.</div></div>
+      <div class="form-grid">
+        <label>By the next checkpoint, what will exist or be demonstrably different?<textarea id="outcome" placeholder="Example: A tested mounting bracket CAD revision with the hole pattern corrected and a screenshot attached."></textarea></label>
+        <label>What is the first concrete move?<textarea id="first-step" placeholder="Example: Open revision 3, measure the current hole spacing, and update the sketch constraints."></textarea></label>
+        <label>Rough estimate<select id="estimate"><option>30 minutes</option><option selected>1 hour</option><option>2 hours</option><option>half day</option><option>full day</option><option>multi-day</option></select></label>
+        <label>Reconsider / ask for help after<select id="checkpoint"><option>30 minutes</option><option selected>60 minutes</option><option>90 minutes</option><option>2 hours</option></select></label>
+      </div>
+      <div class="actions"><button class="button primary" data-action="start">Start beta work</button><button class="button subtle" data-action="short-rest">Short rest</button><button class="button subtle" data-action="lunch">Lunch</button><button class="button subtle" data-action="back">Back</button><button class="button danger subtle" data-action="clock-out">Clock out</button></div>
+      <p class="muted" style="margin:12px 0 0">A recognizable result and concrete first move are required. This beta does not change live time, payroll, or ClickUp records.</p>
     </section>
-    <section class="panel">
-      <div class="section-head"><div><div class="eyebrow">Choose the work</div><h2>Best next options</h2><p class="muted">Ranked across assigned and open ClickUp work; only five are shown.</p></div><span class="pill" id="task-count">5 options</span></div>
-      <div class="notice" id="task-warning" hidden></div>
-      <div class="task-grid" id="task-grid"></div>
-      <details><summary>None of these fit? Propose a task for approval</summary><div class="form-grid" style="margin-top:12px"><label>Task title<input id="request-title" placeholder="Label and organize the electronics bench"></label><label>Type<select id="request-type"><option value="project">Project</option><option value="overhead">Overhead / shop</option></select></label><label style="grid-column:1/-1">Why this should be done<textarea id="request-reason" placeholder="What result or problem does this address?"></textarea></label></div><div class="actions"><button class="button" data-action="request-task">Send beta approval request to Slack</button></div></details>
+    <section class="panel section-space">
+      <details class="chooser-details" id="recommended-details" open>
+        <summary class="chooser-summary"><span><span class="eyebrow">Quick choice</span><br><h2>Five best next options</h2></span><span class="pill" id="task-count">5 options</span></summary>
+        <div class="chooser-body"><p class="muted">Ranked from your assignments, priorities, active work, interests, and skills.</p><div class="notice" id="task-warning" hidden></div><div class="task-grid" id="task-grid"></div></div>
+      </details>
+    </section>
+    <section class="panel section-space">
+      <details class="chooser-details" id="catalog-details" open>
+        <summary class="chooser-summary"><span><span class="eyebrow">Explore Cislune work</span><br><h2>Browse all potential tasks</h2></span><span class="pill" id="task-total">0 open tasks</span></summary>
+        <div class="chooser-body"><p class="muted">Open ClickUp work organized by contract or program, then space and list.</p><div class="catalog-tools"><label>Search tasks, contracts, or spaces<input id="task-search" type="search" placeholder="Search all open work"></label><label class="inline-check"><input id="assigned-only" type="checkbox"> Assigned to me only</label></div><div class="catalog" id="task-catalog"></div><details><summary>Nothing fits? Propose work for approval</summary><div class="form-grid" style="margin-top:12px"><label>Task title<input id="request-title" placeholder="Label and organize the electronics bench"></label><label>Type<select id="request-type"><option value="project">Project</option><option value="overhead">Overhead / shop</option></select></label><label style="grid-column:1/-1">Why this should be done<textarea id="request-reason" placeholder="What result or problem does this address?"></textarea></label></div><div class="actions"><button class="button" data-action="request-task">Send beta approval request to Slack</button></div></details></div>
+      </details>
     </section>
     <div class="layout">
       <div class="stack">
-        <section class="panel">
-          <div class="section-head"><div><div class="eyebrow">Commit to a finish line</div><h2>Start with meaningful detail</h2></div><span class="pill" id="quality-pill">0 strong plans</span></div>
-          <div class="selected-task"><small class="muted">SELECTED TASK</small><div id="selected-task">Choose an option above.</div></div>
-          <div class="form-grid">
-            <label>By the next checkpoint, what will exist or be demonstrably different?<textarea id="outcome" placeholder="Example: A tested mounting bracket CAD revision with the hole pattern corrected and a screenshot attached."></textarea></label>
-            <label>What is the first concrete move?<textarea id="first-step" placeholder="Example: Open revision 3, measure the current hole spacing, and update the sketch constraints."></textarea></label>
-            <label>Rough estimate<select id="estimate"><option>30 minutes</option><option selected>1 hour</option><option>2 hours</option><option>half day</option><option>full day</option><option>multi-day</option></select></label>
-            <label>Reconsider / ask for help after<select id="checkpoint"><option>30 minutes</option><option selected>60 minutes</option><option>90 minutes</option><option>2 hours</option></select></label>
-          </div>
-          <ul class="checklist"><li>Specific enough that another person can recognize “done.”</li><li>Short enough to answer in about a minute.</li><li>Vague or repeated boilerplate cannot start the timer.</li></ul>
-          <div class="actions"><button class="button primary" data-action="start">Start beta work</button><button class="button subtle" data-action="short-rest">Short rest</button><button class="button subtle" data-action="lunch">Lunch</button><button class="button subtle" data-action="back">Back</button><button class="button danger subtle" data-action="clock-out">Clock out</button></div>
-        </section>
         <section class="panel">
           <div class="eyebrow">Checkpoint</div><h2>Say what changed, not just that you worked.</h2>
           <div class="form-grid"><label>Meaningful progress<textarea id="progress" placeholder="What now exists, changed, passed, failed, or was learned?"></textarea></label><label>Blocker or help needed<textarea id="blocker" placeholder="Optional. Name the decision, dependency, or failed approach."></textarea></label></div>
@@ -834,7 +945,7 @@ def _portal_template() -> str:
         </section>
       </div>
       <aside class="stack">
-        <section class="panel"><div class="eyebrow">Intuitive prompting</div><h2>Schedule & fit</h2><p class="muted">This context will eventually suppress prompts on days off and improve task ranking.</p><details open><summary>Edit beta worker profile</summary><div style="margin-top:12px" class="stack"><label>Weekly target hours<input id="weekly-hours" type="number" min="1" max="80" step="0.5"></label><label>Regular workdays<div class="days" id="workdays"></div></label><div class="form-grid"><label>Typical start<input id="start-time" type="time"></label><label>Typical end<input id="end-time" type="time"></label></div><label>Planned time off<input id="time-off" placeholder="2026-08-21, 2026-08-24"></label><label>Interests<input id="interests" placeholder="robotics, fabrication, flight testing"></label><label>Skills<input id="skills" placeholder="CAD, Python, assembly"></label><button class="button" data-action="save-profile">Save worker context</button></div></details></section>
+        <section class="panel"><div class="eyebrow">Worker context</div><h2 id="welcome">Welcome</h2><p class="muted" id="schedule-line"></p><div class="profile-summary"><div class="fact"><small>Skills</small><span id="skills-line">—</span></div><div class="fact"><small>Interests</small><span id="interests-line">—</span></div></div><details id="profile-details" open><summary id="profile-summary-label">Set schedule & fit</summary><div style="margin-top:12px" class="stack"><label>Weekly target hours<input id="weekly-hours" type="number" min="1" max="80" step="0.5"></label><label>Regular workdays<div class="days" id="workdays"></div></label><div class="form-grid"><label>Typical start<input id="start-time" type="time"></label><label>Typical end<input id="end-time" type="time"></label></div><label>Planned time off<input id="time-off" placeholder="2026-08-21, 2026-08-24"></label><label>Interests<input id="interests" placeholder="robotics, fabrication, flight testing"></label><label>Skills<input id="skills" placeholder="CAD, Python, assembly"></label><button class="button" data-action="save-profile">Save worker context</button></div></details></section>
         <section class="panel"><div class="section-head"><div><div class="eyebrow">Recent beta activity</div><h2>Audit trail</h2></div></div><div class="history" id="history"></div><div class="actions"><button class="button subtle danger" data-action="reset-beta">Reset beta</button></div></section>
       </aside>
     </div>
@@ -847,6 +958,36 @@ def _portal_template() -> str:
     const days = ['monday','tuesday','wednesday','thursday','friday','saturday','sunday'];
     const $ = (id) => document.getElementById(id);
     const esc = (value) => String(value ?? '').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#39;');
+    let renderedProfileSavedAt = null;
+    let chooserInitialized = false;
+    function renderTaskCatalog() {
+      const query = String($('task-search').value || '').trim().toLowerCase();
+      const assignedOnly = $('assigned-only').checked;
+      const openGroups = new Set([...document.querySelectorAll('#task-catalog details[open]')].map(node => node.dataset.groupKey));
+      const contracts = (data.task_catalog || []).map((contract) => {
+        const spaces = (contract.spaces || []).map((space) => {
+          const lists = (space.lists || []).map((taskList) => {
+            const visibleTasks = (taskList.tasks || []).filter((task) => {
+              if (assignedOnly && !task.assigned) return false;
+              const searchable = [task.name,task.status,task.priority,task.location,contract.name,space.name,taskList.name].join(' ').toLowerCase();
+              return !query || searchable.includes(query);
+            });
+            if (!visibleTasks.length) return '';
+            const rows = visibleTasks.map((task) => `<div class="catalog-task"><div><strong>${esc(task.name)}</strong><div class="meta">${task.assigned ? 'Assigned to you · ' : ''}${esc(task.priority)} · ${esc(task.status)} · ${esc(taskList.name)}</div></div><button class="button" data-select-task="${esc(task.id)}" data-task-name="${esc(task.name)}" data-task-location="${esc(task.location)}">Choose</button></div>`).join('');
+            return `<div class="catalog-list"><h3>${esc(taskList.name)} · ${visibleTasks.length}</h3>${rows}</div>`;
+          }).filter(Boolean);
+          if (!lists.length) return '';
+          const groupKey = `${contract.name}::${space.name}`;
+          const isOpen = query || openGroups.has(groupKey);
+          return `<details class="space-group" data-group-key="${esc(groupKey)}"${isOpen ? ' open' : ''}><summary>${esc(space.name)} · ${lists.length} active list${lists.length === 1 ? '' : 's'}</summary>${lists.join('')}</details>`;
+        }).filter(Boolean);
+        if (!spaces.length) return '';
+        const groupKey = String(contract.name || 'General / overhead');
+        const isOpen = query || openGroups.has(groupKey);
+        return `<details class="contract-group" data-group-key="${esc(groupKey)}"${isOpen ? ' open' : ''}><summary>${esc(contract.name)} · ${contract.task_count} open</summary>${spaces.join('')}</details>`;
+      }).filter(Boolean);
+      $('task-catalog').innerHTML = contracts.join('') || '<div class="catalog-empty">No open tasks match this view.</div>';
+    }
     function render() {
       const work = data.work || {}, profile = data.profile || {}, quality = data.quality || {};
       $('welcome').textContent = `Welcome, ${(data.actor || {}).name || 'beta tester'}`;
@@ -860,7 +1001,9 @@ def _portal_template() -> str:
       $('task-warning').textContent = data.task_warning || '';
       const tasks = data.task_options || [];
       $('task-count').textContent = `${tasks.length} option${tasks.length === 1 ? '' : 's'}`;
+      $('task-total').textContent = `${Number(data.task_total || 0)} open tasks`;
       $('task-grid').innerHTML = tasks.map((task,index) => `<button class="task ${task.id === work.selected_task_id ? 'selected' : ''}" data-select-task="${esc(task.id)}" data-task-name="${esc(task.name)}" data-task-location="${esc(task.location)}"><span class="number">${index+1}</span><h3>${esc(task.name)}</h3><div class="tagrow">${task.recommended ? '<span class="tag recommended">Recommended</span>' : ''}<span class="tag">${esc(task.priority)}</span><span class="tag">${esc(task.status)}</span></div><div class="muted">${esc(task.location)}</div><div class="why">Why: ${esc(task.reason)}</div></button>`).join('');
+      renderTaskCatalog();
       $('selected-task').innerHTML = work.selected_task_name ? `<strong>${esc(work.selected_task_name)}</strong><br><span class="muted">${esc(work.selected_task_location || '')}</span>` : 'Choose an option above.';
       $('outcome').value = work.outcome || '';
       $('first-step').value = work.first_step || '';
@@ -876,6 +1019,15 @@ def _portal_template() -> str:
       $('interests').value = (profile.interests || []).join(', ');
       $('skills').value = (profile.skills || []).join(', ');
       $('workdays').innerHTML = days.map(day => `<label class="day"><input type="checkbox" value="${day}" ${(profile.regular_workdays || []).includes(day) ? 'checked' : ''}><span>${day.slice(0,3)}</span></label>`).join('');
+      const savedAt = String(profile.saved_at || '');
+      if (renderedProfileSavedAt === null || renderedProfileSavedAt !== savedAt) $('profile-details').open = !savedAt;
+      renderedProfileSavedAt = savedAt;
+      $('profile-summary-label').textContent = savedAt ? 'Profile saved · Edit schedule & fit' : 'Set schedule & fit';
+      if (!chooserInitialized) {
+        $('recommended-details').open = !work.selected_task_id;
+        $('catalog-details').open = !work.selected_task_id;
+        chooserInitialized = true;
+      }
       $('history').innerHTML = (data.history || []).length ? (data.history || []).map(item => `<article><strong>${esc(String(item.action || '').replaceAll('_',' '))}</strong><br>${esc(item.message)}<br><time>${new Date(item.at).toLocaleString()}</time></article>`).join('') : '<p class="muted">No beta actions yet.</p>';
       document.querySelector('[data-action="back"]').disabled = !['short_rest','lunch'].includes(work.status);
       document.querySelector('[data-action="short-rest"]').disabled = work.status !== 'active';
@@ -896,16 +1048,18 @@ def _portal_template() -> str:
         const response = await fetch(`/api/portal/action?token=${encodeURIComponent(token)}`, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
         const result = await response.json();
         if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
-        data = result; render(); showToast(result.message || 'Saved.');
-      } catch (error) { showToast(error.message || String(error), true); }
+        data = result; render(); showToast(result.message || 'Saved.'); return true;
+      } catch (error) { showToast(error.message || String(error), true); return false; }
       finally { if (button && button.isConnected) { button.disabled = false; button.textContent = original; } }
     }
     document.addEventListener('click', (event) => {
       const task = event.target.closest('[data-select-task]');
-      if (task) return post({action:'select_task',task_id:task.dataset.selectTask,task_name:task.dataset.taskName,task_location:task.dataset.taskLocation},task);
+      if (task) return post({action:'select_task',task_id:task.dataset.selectTask,task_name:task.dataset.taskName,task_location:task.dataset.taskLocation},task).then((saved) => { if (!saved) return; $('recommended-details').open=false; $('catalog-details').open=false; if (window.innerWidth <= 600) $('work-now').scrollIntoView({behavior:'smooth',block:'start'}); });
       const button = event.target.closest('[data-action]');
       if (button) post(actionPayload(button.dataset.action), button);
     });
+    $('task-search').addEventListener('input', renderTaskCatalog);
+    $('assigned-only').addEventListener('change', renderTaskCatalog);
     let toastTimer;
     function showToast(message,error=false) { const node=$('toast'); node.textContent=message; node.className=error?'show error':'show'; clearTimeout(toastTimer); toastTimer=setTimeout(()=>node.className='',7000); }
     render();

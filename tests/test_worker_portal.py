@@ -41,6 +41,7 @@ class _FakeClickUp:
 
     async def list_workspace_tasks(self, limit=100, include_closed=False):
         assert include_closed is False
+        assert limit == 500
         return [
             {
                 "id": f"workspace-{index}",
@@ -48,9 +49,10 @@ class _FakeClickUp:
                 "status": {"status": "to do"},
                 "priority": {"priority": "normal"},
                 "space": {"name": "Operations" if index % 2 else "NASA"},
+                "folder": {"name": "Internal" if index % 2 else "NASA Award"},
                 "list": {"name": "Open work"},
             }
-            for index in range(limit)
+            for index in range(12)
         ]
 
 
@@ -116,6 +118,13 @@ def test_worker_portal_limits_task_options_and_keeps_beta_state_isolated(tmp_pat
     assert initial["beta"] is True
     assert len(initial["task_options"]) == 5
     assert initial["task_options"][0]["id"] == "assigned"
+    assert initial["task_total"] == 13
+    assert sum(group["task_count"] for group in initial["task_catalog"]) == 13
+    assert {group["name"] for group in initial["task_catalog"]} == {
+        "General / overhead",
+        "Internal",
+        "NASA Award",
+    }
     assert initial["work"]["status"] == "ready"
 
     selected = asyncio.run(
@@ -160,6 +169,34 @@ def test_worker_portal_limits_task_options_and_keeps_beta_state_isolated(tmp_pat
     )
     assert started["work"]["status"] == "active"
     assert runtime.state_store.list_sessions_for_date(datetime.now().date().isoformat()) == []
+
+
+def test_saved_profile_is_marked_for_compact_rendering(tmp_path) -> None:
+    runtime, admin, _slack = _runtime(tmp_path)
+    token = _token_from_link(build_worker_portal_link(runtime, admin))
+    service = WorkerPortalService(runtime)
+
+    result = asyncio.run(
+        service.apply_action(
+            token,
+            {
+                "action": "save_profile",
+                "weekly_target_hours": 32,
+                "regular_workdays": ["monday", "tuesday", "thursday", "friday"],
+                "typical_start_time": "08:30",
+                "typical_end_time": "16:30",
+                "planned_time_off": "2026-08-21",
+                "interests": "program management, flight testing",
+                "skills": "planning, review",
+            },
+        )
+    )
+
+    assert result["profile"]["saved_at"]
+    assert result["profile"]["weekly_target_hours"] == 32
+    html = service.render_html(result)
+    assert 'id="profile-details"' in html
+    assert 'id="catalog-details"' in html
 
 
 def test_portal_task_request_and_summary_are_sent_only_to_beta_slack_user(tmp_path) -> None:
