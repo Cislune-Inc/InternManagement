@@ -197,7 +197,10 @@ class WorkerPortalService:
             self._sync_state_from_live_session(actor, state)
         else:
             self._advance_deadlines(state)
-        action = str(payload.get("action") or "").strip().lower()
+        # Accept both DOM-style action names (``check-in``) and the API's
+        # canonical snake_case names. This also keeps already-open portal pages
+        # compatible after a server-side deploy.
+        action = str(payload.get("action") or "").strip().lower().replace("-", "_")
         message = ""
         if action == "save_profile":
             self._save_profile(state, payload)
@@ -1871,13 +1874,14 @@ def _portal_template() -> str:
       $('claim-selected').textContent = selectedOption && selectedOption.assigned ? 'Already mine in ClickUp' : 'Claim in ClickUp';
     }
     function actionPayload(action) {
-      if (action === 'start') return {action, outcome:$('outcome').value, first_step:$('first-step').value, estimate:$('estimate').value, checkpoint:$('checkpoint').value};
-      if (action === 'check-in') return {action, progress:$('progress').value, blocker:$('blocker').value};
-      if (action === 'clock-out') return {action:'clock_out', progress:$('progress').value, blocker:$('blocker').value};
-      if (action === 'claim-task') return {action:'claim_task', task_id:(data.work || {}).selected_task_id};
-      if (action === 'save-profile') return {action:'save_profile', weekly_target_hours:$('weekly-hours').value, regular_workdays:[...document.querySelectorAll('#workdays input:checked')].map(node => node.value), typical_start_time:$('start-time').value, typical_end_time:$('end-time').value, planned_time_off:$('time-off').value, interests:$('interests').value, skills:$('skills').value};
-      if (action === 'request-task') return {action:'request_task', title:$('request-title').value, task_type:$('request-type').value, reason:$('request-reason').value};
-      return {action: action.replaceAll('-','_')};
+      const apiAction = action.replaceAll('-','_');
+      if (apiAction === 'start') return {action:apiAction, outcome:$('outcome').value, first_step:$('first-step').value, estimate:$('estimate').value, checkpoint:$('checkpoint').value};
+      if (apiAction === 'check_in') return {action:apiAction, progress:$('progress').value, blocker:$('blocker').value};
+      if (apiAction === 'clock_out') return {action:apiAction, progress:$('progress').value, blocker:$('blocker').value};
+      if (apiAction === 'claim_task') return {action:apiAction, task_id:(data.work || {}).selected_task_id};
+      if (apiAction === 'save_profile') return {action:apiAction, weekly_target_hours:$('weekly-hours').value, regular_workdays:[...document.querySelectorAll('#workdays input:checked')].map(node => node.value), typical_start_time:$('start-time').value, typical_end_time:$('end-time').value, planned_time_off:$('time-off').value, interests:$('interests').value, skills:$('skills').value};
+      if (apiAction === 'request_task') return {action:apiAction, title:$('request-title').value, task_type:$('request-type').value, reason:$('request-reason').value};
+      return {action:apiAction};
     }
     async function post(payload, button) {
       const original = button ? button.textContent : '';

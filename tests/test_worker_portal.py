@@ -505,10 +505,28 @@ def test_roster_worker_portal_uses_one_live_session_and_idempotent_timer(tmp_pat
     assert "const dirtyFields = new Set()" in html
     assert "if (!dirtyFields.has(id))" in html
     assert "clearSubmittedDraft(payload.action)" in html
+    assert "const apiAction = action.replaceAll('-','_')" in html
     live_session, _ = runtime.get_user_session_for_moment(runtime.user)
     assert len(live_session.work_segments) == 1
     assert live_session.metadata["clickup_time_tracking"]["task_id"] == "assigned"
     assert live_session.metadata.get("clickup_time_tracking_history", []) == []
+
+    checkpoint = asyncio.run(
+        service.apply_action(
+            token,
+            {
+                # Existing open pages used the DOM-style action name. The API
+                # intentionally accepts it so a deploy fixes them immediately.
+                "action": "check-in",
+                "progress": "Completed the base measurements and recorded the first alignment datum in the build sheet",
+                "blocker": "Waiting for the revised fastener dimensions before final assembly",
+            },
+        )
+    )
+    assert "Checkpoint saved" in checkpoint["message"]
+    live_session, _ = runtime.get_user_session_for_moment(runtime.user)
+    assert live_session.latest_status.startswith("Completed the base measurements")
+    assert live_session.latest_blocker == "Waiting for the revised fastener dimensions before final assembly"
 
     clocked_out = asyncio.run(
         service.apply_action(
@@ -528,7 +546,7 @@ def test_roster_worker_portal_uses_one_live_session_and_idempotent_timer(tmp_pat
     assert len(live_session.metadata["clickup_time_tracking_history"]) == 1
     assert any("Live work started" in message for _, message in runtime.slack.messages)
     assert any("clocked out" in message.lower() for _, message in runtime.slack.messages)
-    assert runtime.dashboard_writes == 2
+    assert runtime.dashboard_writes == 3
 
 
 def test_admin_portal_tracks_projects_live_but_uses_salary_nonpayroll_identity(tmp_path) -> None:
