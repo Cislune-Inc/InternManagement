@@ -76,3 +76,26 @@ def test_roster_controls_keep_exempt_worker_out_of_overtime_enforcement() -> Non
 
     assert rows[0]["compensation_plan"] == "salary"
     assert rows[0]["overtime_approval_required"] == "false"
+
+
+def test_roster_controls_connect_aj_to_slack_and_preserve_existing_focus() -> None:
+    rows = [
+        {
+            "user_key": "AJ",
+            "display_name": "AJ Torres",
+            "active": "true",
+            "worker_type": "intern",
+            "compensation_plan": "nasa_stipend",
+            "interests": "materials testing",
+        }
+    ]
+
+    fieldnames, changed = apply_roster_controls(rows, list(rows[0]))
+
+    assert rows[0]["slack_user_id"] == "U095NMY2U4R"
+    assert rows[0]["preferred_transport"] == "slack"
+    assert rows[0]["interests"] == (
+        "materials testing;Lockheed Bagworm;LM_Nightjar;shop organization"
+    )
+    assert {"slack_user_id", "preferred_transport", "interests"}.issubset(fieldnames)
+    assert changed

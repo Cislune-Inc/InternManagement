@@ -8,7 +8,7 @@ import re
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, TypeAlias
 from urllib.parse import quote, urlsplit
 
 from .models import AdminProfile, UserProfile
@@ -16,7 +16,7 @@ from .models import AdminProfile, UserProfile
 
 _PORTAL_SECRET_STATE_KEY = "worker_portal_signing_secret"
 _PORTAL_STATE_PREFIX = "worker_portal_beta:"
-_PORTAL_BETA_ADMIN_NAMES = {"erik"}
+PortalActor: TypeAlias = AdminProfile | UserProfile
 _GENERIC_WORK_REPLIES = {
     "continue",
     "continue working",
@@ -36,17 +36,19 @@ _VALID_CHECKPOINTS = {"30 minutes", "60 minutes", "90 minutes", "2 hours"}
 
 def build_worker_portal_link(
     runtime: Any,
-    admin: AdminProfile,
+    actor: PortalActor,
     *,
     now: datetime | None = None,
     ttl_hours: int = 72,
 ) -> str:
-    if not admin.slack_user_id:
+    if not actor.slack_user_id:
         raise ValueError("The beta tester needs a Slack member ID.")
-    if admin.name.strip().casefold() not in _PORTAL_BETA_ADMIN_NAMES:
-        raise ValueError("The worker portal is still limited to the current beta tester.")
+    if not _is_worker_portal_beta_tester(runtime, actor.slack_user_id):
+        raise ValueError("The worker portal is limited to the configured beta testers.")
+    if resolve_worker_portal_actor(runtime, actor.slack_user_id) is None:
+        raise ValueError("The beta tester is not an active Don Pollo Slack user.")
     reference = now or datetime.now(timezone.utc)
-    token = _issue_token(runtime, admin.slack_user_id, reference, ttl_hours=ttl_hours)
+    token = _issue_token(runtime, actor.slack_user_id, reference, ttl_hours=ttl_hours)
     manager_url = str(runtime.config.slack.manager_queue_url or "http://127.0.0.1:8765/exceptions")
     parsed = urlsplit(manager_url)
     origin = f"{parsed.scheme or 'http'}://{parsed.netloc or '127.0.0.1:8765'}"
@@ -76,10 +78,45 @@ def validate_worker_portal_token(
     reference = now or datetime.now(timezone.utc)
     if not subject or int(reference.timestamp()) >= expires_at:
         raise ValueError("This portal link expired. DM `portal` to Don Pollo in Slack for a fresh link.")
-    admin = runtime.admin_profile_by_slack_user_id(subject)
-    if admin is None or admin.name.strip().casefold() not in _PORTAL_BETA_ADMIN_NAMES:
-        raise ValueError("This beta link is not assigned to a current Don Pollo administrator.")
+    actor = resolve_worker_portal_actor(runtime, subject)
+    if actor is None or not _is_worker_portal_beta_tester(runtime, subject):
+        raise ValueError("This beta link is not assigned to a current Don Pollo beta tester.")
     return subject
+
+
+def resolve_worker_portal_actor(runtime: Any, slack_user_id: str) -> PortalActor | None:
+    normalized = str(slack_user_id or "").strip()
+    if not normalized:
+        return None
+    admin_lookup = getattr(runtime, "admin_profile_by_slack_user_id", None)
+    if callable(admin_lookup):
+        admin = admin_lookup(normalized)
+        if admin is not None:
+            return admin
+    roster = getattr(runtime, "roster_by_slack_id", {})
+    if isinstance(roster, dict):
+        worker = roster.get(normalized)
+        if isinstance(worker, UserProfile) and worker.active:
+            return worker
+    return None
+
+
+def _is_worker_portal_beta_tester(runtime: Any, slack_user_id: str) -> bool:
+    config = getattr(runtime, "config", None)
+    slack_config = getattr(config, "slack", None)
+    allowed = getattr(slack_config, "worker_portal_beta_slack_user_ids", [])
+    normalized = str(slack_user_id or "").strip()
+    return bool(normalized and normalized in {str(item).strip() for item in allowed})
+
+
+def _actor_name(actor: PortalActor) -> str:
+    return actor.name if isinstance(actor, AdminProfile) else actor.display_name
+
+
+def _actor_user_key(actor: PortalActor) -> str:
+    if isinstance(actor, UserProfile):
+        return actor.user_key
+    return f"portal-beta-{_actor_name(actor).lower().replace(' ', '-')}"
 
 
 def validate_work_commitment(
@@ -129,21 +166,21 @@ class WorkerPortalService:
 
     async def build_payload(self, token: str) -> dict[str, Any]:
         slack_user_id = validate_worker_portal_token(self.runtime, token)
-        admin = self.runtime.admin_profile_by_slack_user_id(slack_user_id)
-        if admin is None:
+        actor = resolve_worker_portal_actor(self.runtime, slack_user_id)
+        if actor is None:
             raise ValueError("The beta tester is no longer configured.")
-        state = self._load_state(slack_user_id, admin)
+        state = self._load_state(slack_user_id, actor)
         self._advance_deadlines(state)
         self._save_state(slack_user_id, state)
-        tasks, task_warning = await self._load_task_options(admin, state)
-        return self._payload(admin, state, tasks, task_warning)
+        tasks, task_warning = await self._load_task_options(actor, state)
+        return self._payload(actor, state, tasks, task_warning)
 
     async def apply_action(self, token: str, payload: dict[str, Any]) -> dict[str, Any]:
         slack_user_id = validate_worker_portal_token(self.runtime, token)
-        admin = self.runtime.admin_profile_by_slack_user_id(slack_user_id)
-        if admin is None:
+        actor = resolve_worker_portal_actor(self.runtime, slack_user_id)
+        if actor is None:
             raise ValueError("The beta tester is no longer configured.")
-        state = self._load_state(slack_user_id, admin)
+        state = self._load_state(slack_user_id, actor)
         self._advance_deadlines(state)
         action = str(payload.get("action") or "").strip().lower()
         message = ""
@@ -160,7 +197,7 @@ class WorkerPortalService:
             state["work"]["selected_task_location"] = _clean_text(payload.get("task_location"), limit=240)
             message = f"Selected {task_name}. Add a concrete outcome and first step before starting."
         elif action == "claim_task":
-            message = await self._claim_task(admin, state, payload)
+            message = await self._claim_task(actor, state, payload)
         elif action == "start":
             try:
                 message = self._start_work(state, payload)
@@ -183,14 +220,14 @@ class WorkerPortalService:
         elif action == "share_slack":
             message = await self._share_to_slack(slack_user_id, state)
         elif action == "reset_beta":
-            state = self._default_state(admin)
+            state = self._default_state(actor)
             message = "Beta workday reset. No live workforce records were changed."
         else:
             raise ValueError("Unsupported portal action.")
         self._record_history(state, action, message)
         self._save_state(slack_user_id, state)
-        tasks, task_warning = await self._load_task_options(admin, state)
-        result = self._payload(admin, state, tasks, task_warning)
+        tasks, task_warning = await self._load_task_options(actor, state)
+        result = self._payload(actor, state, tasks, task_warning)
         result["message"] = message
         return result
 
@@ -198,11 +235,11 @@ class WorkerPortalService:
         payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":")).replace("</", "<\\/")
         return _portal_template().replace("__PORTAL_PAYLOAD__", payload_json)
 
-    def _load_state(self, slack_user_id: str, admin: AdminProfile) -> dict[str, Any]:
+    def _load_state(self, slack_user_id: str, actor: PortalActor) -> dict[str, Any]:
         state = self.runtime.state_store.get_operational_state(_PORTAL_STATE_PREFIX + slack_user_id)
         if not isinstance(state, dict):
-            return self._default_state(admin)
-        default = self._default_state(admin)
+            return self._default_state(actor)
+        default = self._default_state(actor)
         for key in ("profile", "work", "quality"):
             if not isinstance(state.get(key), dict):
                 state[key] = default[key]
@@ -214,19 +251,35 @@ class WorkerPortalService:
             state["task_requests"] = []
         return state
 
-    def _default_state(self, admin: AdminProfile) -> dict[str, Any]:
+    def _default_state(self, actor: PortalActor) -> dict[str, Any]:
+        if isinstance(actor, UserProfile):
+            weekly_target_hours = actor.weekly_target_hours
+            regular_workdays = actor.regular_workdays or list(_DEFAULT_WORKDAYS)
+            typical_start_time = actor.typical_start_time
+            typical_end_time = actor.typical_end_time
+            planned_time_off = actor.planned_time_off
+            interests = actor.interests
+            skills = actor.skills
+        else:
+            weekly_target_hours = 40
+            regular_workdays = list(_DEFAULT_WORKDAYS)
+            typical_start_time = "09:00"
+            typical_end_time = "17:00"
+            planned_time_off = []
+            interests = ["project delivery", "process improvement"]
+            skills = ["program management"]
         return {
             "version": 1,
             "profile": {
-                "display_name": admin.name,
+                "display_name": _actor_name(actor),
                 "saved_at": "",
-                "weekly_target_hours": 40,
-                "regular_workdays": list(_DEFAULT_WORKDAYS),
-                "typical_start_time": "09:00",
-                "typical_end_time": "17:00",
-                "planned_time_off": [],
-                "interests": ["project delivery", "process improvement"],
-                "skills": ["program management"],
+                "weekly_target_hours": weekly_target_hours,
+                "regular_workdays": list(regular_workdays),
+                "typical_start_time": typical_start_time,
+                "typical_end_time": typical_end_time,
+                "planned_time_off": list(planned_time_off),
+                "interests": list(interests),
+                "skills": list(skills),
             },
             "work": {
                 "status": "ready",
@@ -257,23 +310,23 @@ class WorkerPortalService:
 
     async def _load_task_options(
         self,
-        admin: AdminProfile,
+        actor: PortalActor,
         state: dict[str, Any],
     ) -> tuple[list[dict[str, Any]], str]:
         if not self.runtime.clickup:
             return self._fallback_tasks(), "ClickUp is unavailable, so these are safe beta examples."
         profile = state["profile"]
         portal_user = UserProfile(
-            user_key=f"portal-beta-{admin.name.lower().replace(' ', '-')}",
-            display_name=admin.name,
-            discord_user_id=admin.discord_user_id,
-            slack_user_id=admin.slack_user_id,
-            clickup_user_id=admin.clickup_user_id,
-            clickup_user_email=admin.clickup_user_email,
+            user_key=_actor_user_key(actor),
+            display_name=_actor_name(actor),
+            discord_user_id=actor.discord_user_id,
+            slack_user_id=actor.slack_user_id,
+            clickup_user_id=actor.clickup_user_id,
+            clickup_user_email=actor.clickup_user_email,
             interests=list(profile.get("interests") or []),
             skills=list(profile.get("skills") or []),
         )
-        cached = self._task_source_cache.get(admin.slack_user_id)
+        cached = self._task_source_cache.get(str(actor.slack_user_id))
         if cached and time.monotonic() - cached[0] < 180:
             candidates = list(cached[1])
             assigned_ids = set(cached[2])
@@ -288,7 +341,7 @@ class WorkerPortalService:
                 if callable(list_workspace):
                     workspace = await list_workspace(limit=500, include_closed=False)
                     candidates.extend(task for task in workspace if isinstance(task, dict))
-                self._task_source_cache[admin.slack_user_id] = (
+                self._task_source_cache[str(actor.slack_user_id)] = (
                     time.monotonic(),
                     list(candidates),
                     set(assigned_ids),
@@ -471,7 +524,7 @@ class WorkerPortalService:
 
     async def _claim_task(
         self,
-        admin: AdminProfile,
+        actor: PortalActor,
         state: dict[str, Any],
         payload: dict[str, Any],
     ) -> str:
@@ -480,24 +533,27 @@ class WorkerPortalService:
         task_id = _clean_text(payload.get("task_id"), limit=100)
         if not task_id:
             raise ValueError("Choose a task before claiming it in ClickUp.")
-        available_tasks, warning = await self._load_task_options(admin, state)
+        available_tasks, warning = await self._load_task_options(actor, state)
         if warning:
             raise ValueError("The live ClickUp catalog is not available, so assignment was not changed.")
         candidate = next((task for task in available_tasks if task.get("id") == task_id), None)
         if candidate is None:
             raise ValueError("That task is not in the current open Cislune task catalog.")
-        clickup_user_id = admin.clickup_user_id
+        clickup_user_id = actor.clickup_user_id
         if not clickup_user_id:
             resolve_member = getattr(self.runtime.clickup, "resolve_workspace_member_id", None)
             if callable(resolve_member):
-                clickup_user_id = await resolve_member(name=admin.name, email=admin.clickup_user_email)
+                clickup_user_id = await resolve_member(
+                    name=_actor_name(actor),
+                    email=actor.clickup_user_email,
+                )
         if not clickup_user_id:
             raise ValueError("Your Slack profile is not mapped to a ClickUp member yet, so assignment was not changed.")
         if candidate.get("assigned"):
             message = f"{candidate['name']} is already assigned to you in ClickUp."
         else:
             await self.runtime.clickup.update_task_assignees(task_id, add_user_ids=[str(clickup_user_id)])
-            self._task_source_cache.pop(admin.slack_user_id, None)
+            self._task_source_cache.pop(str(actor.slack_user_id), None)
             message = f"Claimed {candidate['name']} in ClickUp without removing its other assignees."
         state["work"]["selected_task_id"] = task_id
         state["work"]["selected_task_name"] = str(candidate.get("name") or "Untitled task")
@@ -749,7 +805,7 @@ class WorkerPortalService:
 
     def _payload(
         self,
-        admin: AdminProfile,
+        actor: PortalActor,
         state: dict[str, Any],
         tasks: list[dict[str, Any]],
         task_warning: str,
@@ -760,7 +816,7 @@ class WorkerPortalService:
         cutoff = _parse_datetime(work.get("break_cutoff_at"))
         return {
             "beta": True,
-            "actor": {"name": admin.name, "slack_user_id": admin.slack_user_id},
+            "actor": {"name": _actor_name(actor), "slack_user_id": actor.slack_user_id},
             "profile": state["profile"],
             "work": work,
             "quality": state["quality"],

@@ -1333,32 +1333,44 @@ class InternManagementRuntime:
         if not self.config:
             return
         slack_user_id = str(event.get("user") or "").strip()
+        normalized_text = _normalize_slack_admin_text(event.get("text"))
+        if normalized_text.lower() in {
+            "portal",
+            "beta portal",
+            "worker portal",
+            "workday beta",
+        }:
+            from .worker_portal import build_worker_portal_link, resolve_worker_portal_actor
+
+            actor = resolve_worker_portal_actor(self, slack_user_id)
+            if actor is not None:
+                if not self.slack:
+                    logger.error("Cannot answer Slack portal DM because Slack is not configured.")
+                    return
+                try:
+                    portal_url = build_worker_portal_link(self, actor)
+                except ValueError:
+                    pass
+                else:
+                    await self.slack.post_message(
+                        slack_user_id,
+                        (
+                            "Open your Don Pollo Workday beta:\n"
+                            f"{portal_url}\n\n"
+                            "The signed link expires in 72 hours and works on the office network or VPN. "
+                            "Its beta clock and profile are isolated from live payroll records. Browsing and "
+                            "choosing are read-only; the clearly labeled Claim action adds you as a ClickUp "
+                            "assignee without removing anyone else. Continue using this Slack DM for the live "
+                            "time-tracking workflow while we test the portal."
+                        ),
+                    )
+                    return
         admin = self.admin_profile_by_slack_user_id(slack_user_id)
         if admin:
             if not self.slack:
                 logger.error("Cannot answer Slack admin DM because Slack is not configured.")
                 return
-            admin_text = _normalize_slack_admin_text(event.get("text"))
-            if admin_text.lower() in {
-                "portal",
-                "beta portal",
-                "worker portal",
-                "workday beta",
-            }:
-                from .worker_portal import build_worker_portal_link
-
-                portal_url = build_worker_portal_link(self, admin)
-                await self.slack.post_message(
-                    slack_user_id,
-                    (
-                        "Open the Erik-only Don Pollo Workday beta:\n"
-                        f"{portal_url}\n\n"
-                        "The signed link expires in 72 hours. Its clock, profile, and workday actions are isolated "
-                        "from worker and payroll records. Browsing and choosing are read-only; the clearly labeled "
-                        "Claim action adds you as a ClickUp assignee without removing anyone else."
-                    ),
-                )
-                return
+            admin_text = normalized_text
             response = await self.admin_router.handle_plain_text(
                 client,
                 admin.discord_user_id,

@@ -7,7 +7,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
-from agent.models import AdminProfile, SlackConfig
+from agent.models import AdminProfile, SlackConfig, UserProfile
 from agent.state_store import StateStore
 from agent.worker_portal import (
     WorkerPortalService,
@@ -79,11 +79,15 @@ def _runtime(tmp_path):
     runtime = SimpleNamespace(
         state_store=StateStore(tmp_path / "state.sqlite3"),
         config=SimpleNamespace(
-            slack=SlackConfig(manager_queue_url="http://192.168.4.87:8765/exceptions")
+            slack=SlackConfig(
+                manager_queue_url="http://192.168.4.87:8765/exceptions",
+                worker_portal_beta_slack_user_ids=["UERIK", "UAJ"],
+            )
         ),
         clickup=_FakeClickUp(),
         slack=slack,
         admin_profile_by_slack_user_id=lambda slack_user_id: admin if slack_user_id == "UERIK" else None,
+        roster_by_slack_id={},
     )
     return runtime, admin, slack
 
@@ -105,12 +109,44 @@ def test_signed_portal_link_is_vpn_scoped_and_expires(tmp_path) -> None:
         validate_worker_portal_token(runtime, token, now=now + timedelta(hours=3))
 
 
-def test_worker_portal_remains_limited_to_erik_during_beta(tmp_path) -> None:
+def test_worker_portal_remains_limited_to_configured_beta_testers(tmp_path) -> None:
     runtime, _admin, _slack = _runtime(tmp_path)
     george = AdminProfile(name="George", discord_user_id=998, slack_user_id="UGEORGE")
 
-    with pytest.raises(ValueError, match="current beta tester"):
+    with pytest.raises(ValueError, match="configured beta testers"):
         build_worker_portal_link(runtime, george)
+
+
+def test_roster_worker_can_use_portal_with_existing_schedule_and_focus(tmp_path) -> None:
+    runtime, _admin, _slack = _runtime(tmp_path)
+    aj = UserProfile(
+        user_key="AJ",
+        display_name="AJ Torres",
+        slack_user_id="UAJ",
+        clickup_user_id="456",
+        weekly_target_hours=24,
+        regular_workdays=["monday", "wednesday", "friday"],
+        typical_start_time="10:00",
+        typical_end_time="18:00",
+        planned_time_off=["2026-08-14"],
+        interests=["Lockheed Bagworm", "LM_Nightjar", "shop organization"],
+        skills=["test planning"],
+    )
+    runtime.roster_by_slack_id["UAJ"] = aj
+
+    token = _token_from_link(build_worker_portal_link(runtime, aj))
+    payload = asyncio.run(WorkerPortalService(runtime).build_payload(token))
+
+    assert validate_worker_portal_token(runtime, token) == "UAJ"
+    assert payload["actor"] == {"name": "AJ Torres", "slack_user_id": "UAJ"}
+    assert payload["profile"]["weekly_target_hours"] == 24
+    assert payload["profile"]["regular_workdays"] == ["monday", "wednesday", "friday"]
+    assert payload["profile"]["planned_time_off"] == ["2026-08-14"]
+    assert payload["profile"]["interests"] == [
+        "Lockheed Bagworm",
+        "LM_Nightjar",
+        "shop organization",
+    ]
 
 
 def test_work_commitment_rejects_vague_and_repeated_answers() -> None:

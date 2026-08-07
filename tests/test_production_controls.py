@@ -37,6 +37,18 @@ def test_production_controls_schedule_daily_pacific_digest_and_meal_minimum() ->
     assert "slack.operational_digest_hour" in changed
 
 
+def test_production_controls_limit_worker_portal_beta_to_erik_and_aj() -> None:
+    payload: dict = {}
+
+    changed = apply_controls(payload)
+
+    assert payload["slack"]["worker_portal_beta_slack_user_ids"] == [
+        "U01SWQKDTBM",
+        "U095NMY2U4R",
+    ]
+    assert "slack.worker_portal_beta_slack_user_ids" in changed
+
+
 def test_production_controls_configure_management_slack_admins() -> None:
     payload = {
         "admins": [

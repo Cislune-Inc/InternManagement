@@ -485,6 +485,7 @@ def test_slack_admin_portal_command_returns_signed_vpn_beta_link(tmp_path: Path)
         return {"channel": "DADMIN", "ts": "1.234"}
 
     runtime.config.slack.manager_queue_url = "http://192.168.4.87:8765/exceptions"
+    runtime.config.slack.worker_portal_beta_slack_user_ids = ["U01SWQKDTBM"]
     runtime.state_store = StateStore(tmp_path / "state.sqlite3")
     runtime.refresh_configuration = refresh_configuration  # type: ignore[method-assign]
     runtime.admin_router = SimpleNamespace(handle_plain_text=handle_plain_text)
@@ -506,6 +507,47 @@ def test_slack_admin_portal_command_returns_signed_vpn_beta_link(tmp_path: Path)
     assert posted[0][0] == "U01SWQKDTBM"
     assert "http://192.168.4.87:8765/portal?token=" in posted[0][1]
     assert "isolated" in posted[0][1]
+
+
+def test_slack_worker_portal_command_returns_own_beta_link(tmp_path: Path) -> None:
+    runtime = _build_runtime()
+    aj = UserProfile(
+        user_key="AJ",
+        display_name="AJ Torres",
+        slack_user_id="U095NMY2U4R",
+        clickup_user_id="456",
+    )
+    posted: list[tuple[str, str]] = []
+
+    async def refresh_configuration(*_args, **_kwargs):
+        return None
+
+    async def post_message(channel_id: str, message: str) -> dict[str, str]:
+        posted.append((channel_id, message))
+        return {"channel": "DAJ", "ts": "1.234"}
+
+    runtime.config.slack.manager_queue_url = "http://192.168.4.87:8765/exceptions"
+    runtime.config.slack.worker_portal_beta_slack_user_ids = ["U01SWQKDTBM", "U095NMY2U4R"]
+    runtime.state_store = StateStore(tmp_path / "state.sqlite3")
+    runtime.refresh_configuration = refresh_configuration  # type: ignore[method-assign]
+    runtime.slack = SimpleNamespace(post_message=post_message)
+    runtime.roster_by_slack_id = {aj.slack_user_id: aj}
+
+    asyncio.run(
+        runtime.handle_slack_direct_message(
+            SimpleNamespace(),
+            {
+                "user": "U095NMY2U4R",
+                "text": "portal *Sent using* <@U0BATRYF16C|ChatGPT>",
+                "ts": "1785859200.0",
+            },
+        )
+    )
+
+    assert posted[0][0] == "U095NMY2U4R"
+    assert "http://192.168.4.87:8765/portal?token=" in posted[0][1]
+    assert "office network or VPN" in posted[0][1]
+    assert "Continue using this Slack DM" in posted[0][1]
 
 
 def test_short_rest_stays_paid_and_requires_return_check_in() -> None:

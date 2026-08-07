@@ -399,6 +399,9 @@ def _parse_slack_config(raw_slack: Any) -> SlackConfig:
             raw_slack.get("manager_queue_url")
             or "http://127.0.0.1:8765/exceptions"
         ).strip(),
+        worker_portal_beta_slack_user_ids=_clean_string_list(
+            raw_slack.get("worker_portal_beta_slack_user_ids")
+        ),
         quarantine_uncertain_routes=bool(
             raw_slack.get("quarantine_uncertain_routes", True)
         ),

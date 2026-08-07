@@ -23,6 +23,8 @@ CONTROL_FIELDS = (
     "meal_tracking_required",
     "overtime_approval_required",
 )
+AJ_SLACK_USER_ID = "U095NMY2U4R"
+AJ_FOCUS_AREAS = ("Lockheed Bagworm", "LM_Nightjar", "shop organization")
 OVERTIME_EXEMPT_WORKER_TYPES = {"salaried", "exempt", "external", "contractor"}
 
 
@@ -46,12 +48,28 @@ def _default_compensation_plan(row: dict[str, Any]) -> str:
     return "needs_review"
 
 
+def _matches_aj(row: dict[str, Any]) -> bool:
+    identifiers = {
+        str(row.get("display_name") or "").strip().casefold(),
+        str(row.get("user_key") or "").strip().casefold(),
+        str(row.get("discord_username") or "").strip().casefold(),
+    }
+    return bool({"aj", "aj torres", "ajtorres"}.intersection(identifiers))
+
+
+def _append_semicolon_values(current: Any, additions: tuple[str, ...]) -> str:
+    values = [item.strip() for item in str(current or "").split(";") if item.strip()]
+    normalized = {item.casefold() for item in values}
+    values.extend(item for item in additions if item.casefold() not in normalized)
+    return ";".join(values)
+
+
 def apply_roster_controls(
     rows: list[dict[str, Any]],
     fieldnames: list[str],
 ) -> tuple[list[str], list[str]]:
     output_fields = list(fieldnames)
-    for field_name in CONTROL_FIELDS:
+    for field_name in (*CONTROL_FIELDS, "slack_user_id", "preferred_transport", "interests"):
         if field_name not in output_fields:
             output_fields.append(field_name)
 
@@ -82,6 +100,17 @@ def apply_roster_controls(
                 continue
             row[field_name] = desired
             changed.append(f"row {index}: {field_name}")
+        if _matches_aj(row):
+            aj_values = {
+                "slack_user_id": AJ_SLACK_USER_ID,
+                "preferred_transport": "slack",
+                "interests": _append_semicolon_values(row.get("interests"), AJ_FOCUS_AREAS),
+            }
+            for field_name, desired in aj_values.items():
+                if str(row.get(field_name) or "").strip() == desired:
+                    continue
+                row[field_name] = desired
+                changed.append(f"row {index}: {field_name}")
     return output_fields, changed
 
 

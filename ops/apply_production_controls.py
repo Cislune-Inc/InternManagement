@@ -34,6 +34,7 @@ CONTROL_VALUES: dict[str, dict[str, Any]] = {
         "operational_digest_hour": 8,
         "operational_digest_timezone": "America/Los_Angeles",
         "manager_queue_url": "http://192.168.4.87:8765/exceptions",
+        "worker_portal_beta_slack_user_ids": ["U01SWQKDTBM", "U095NMY2U4R"],
         "practice_channel_id": None,
         "quarantine_uncertain_routes": True,
         "thread_daily_updates": True,
