@@ -30,13 +30,14 @@ from .admin_console import (
 from .clickup_client import ClickUpClient
 from .models import MessageRecord, SessionState, UserProfile
 from .openai_models import ModelFallbackChain
-from .time_utils import ADMIN_DISPLAY_TIMEZONE, format_admin_datetime, resolve_timezone
+from .time_utils import ADMIN_DISPLAY_TIMEZONE, format_admin_datetime, localize_datetime, resolve_timezone
 
 if TYPE_CHECKING:
     from .runtime import InternManagementRuntime
 
 
 _MAX_DISCORD_MESSAGE = 1900
+_MAX_SLACK_MESSAGE = 35000
 
 
 @dataclass(slots=True)
@@ -130,6 +131,11 @@ class UserDailySnapshot:
     @property
     def pending_admin_unblocker_task(self) -> dict[str, Any] | None:
         value = self.session.metadata.get("pending_admin_unblocker_task")
+        return value if isinstance(value, dict) else None
+
+    @property
+    def pending_admin_task_proposal(self) -> dict[str, Any] | None:
+        value = self.session.metadata.get("pending_admin_task_proposal")
         return value if isinstance(value, dict) else None
 
 
@@ -442,6 +448,107 @@ class AdminCommandRouter:
             return True
         finally:
             self._active_admin_user_id = None
+
+    async def handle_plain_text(
+        self,
+        client: discord.Client,
+        admin_user_id: int,
+        text: str,
+    ) -> str:
+        """Run the admin console without Discord-specific menus or buttons."""
+        raw = (text or "").strip()
+        lowered = raw.lower()
+        self._active_admin_user_id = admin_user_id
+        try:
+            if lowered == "confirm" or lowered.startswith("confirm "):
+                result = await self._confirm_plain_text_action(
+                    client,
+                    admin_user_id,
+                    raw,
+                )
+                return result[:_MAX_SLACK_MESSAGE]
+
+            parsed = parse_admin_input(raw, self.registry)
+            if parsed.kind == "help_root":
+                return render_root_help(self.registry)[:_MAX_SLACK_MESSAGE]
+            if parsed.kind == "help_group" and parsed.group_id:
+                return render_group_help(self.registry, parsed.group_id)[:_MAX_SLACK_MESSAGE]
+            if parsed.kind == "flow":
+                return (
+                    "Admin console flow:\n\n"
+                    + render_flow(self.registry)
+                    + "\n\nUse `help` to browse commands."
+                )[:_MAX_SLACK_MESSAGE]
+            if parsed.kind in {"home", "back"}:
+                return render_root_help(self.registry)[:_MAX_SLACK_MESSAGE]
+            if parsed.kind == "cancel":
+                pending = self._pending_actions.pop(admin_user_id, None)
+                if pending:
+                    return f"Cancelled `{pending.command_id}`."
+                return "There is no pending admin action to cancel."
+            if parsed.kind == "invalid":
+                config = getattr(self.runtime, "config", None)
+                if (
+                    config
+                    and getattr(config, "admin_console", None)
+                    and config.admin_console.enable_ai_fallback
+                ):
+                    response = await self._admin_ai_fallback_response(parsed.raw)
+                    if response:
+                        return response[:_MAX_SLACK_MESSAGE]
+                return (
+                    (parsed.error or "I could not parse that command.")
+                    + "\n\n"
+                    + self._grammar_hint()
+                )[:_MAX_SLACK_MESSAGE]
+            if parsed.kind == "run" and parsed.command_id:
+                command = self.registry.command(parsed.command_id)
+                if not command:
+                    return f"I do not know the command `{parsed.command_id}`."
+                if command.confirm_required and not command.read_only:
+                    preview = await self._build_preview(command, parsed.args)
+                    request = AdminActionRequest(
+                        token=self._new_token(),
+                        admin_user_id=admin_user_id,
+                        command_id=parsed.command_id,
+                        args=parsed.args,
+                        preview=preview,
+                    )
+                    self._pending_actions[admin_user_id] = request
+                    return (
+                        self._format_preview(preview)
+                        + f"\n\nReply `confirm {request.token}` to run it, or `cancel`."
+                    )[:_MAX_SLACK_MESSAGE]
+                result = await self._execute_command(
+                    client,
+                    parsed.command_id,
+                    parsed.args,
+                )
+                return result[:_MAX_SLACK_MESSAGE]
+            return self._grammar_hint()[:_MAX_SLACK_MESSAGE]
+        finally:
+            self._active_admin_user_id = None
+
+    async def _confirm_plain_text_action(
+        self,
+        client: discord.Client,
+        admin_user_id: int,
+        text: str,
+    ) -> str:
+        request = self._pending_actions.get(admin_user_id)
+        if not request:
+            return "There is no pending admin action to confirm."
+        if not self._is_pending_action_valid(admin_user_id, request.token):
+            self._pending_actions.pop(admin_user_id, None)
+            return "That confirmation expired. Run the command again if you still want to do it."
+        parts = text.split()
+        supplied_token = parts[1].strip() if len(parts) == 2 else ""
+        if not supplied_token:
+            return f"Include the confirmation token: `confirm {request.token}`."
+        if supplied_token != request.token:
+            return "That confirmation token does not match the pending action. Nothing was changed."
+        self._pending_actions.pop(admin_user_id, None)
+        return await self._execute_command(client, request.command_id, request.args)
 
     async def _send_root_menu(self, client: discord.Client, admin_user_id: int) -> None:
         state = self._new_menu_state(admin_user_id, "root")
@@ -865,6 +972,12 @@ class AdminCommandRouter:
             lines.extend(f"- {item}" for item in items)
         return "\n".join(lines)
 
+    def _active_admin_name(self) -> str:
+        admin = self.runtime._admin_profile_by_discord_user_id(
+            int(self._active_admin_user_id or 0)
+        )
+        return admin.name if admin else "Admin"
+
     async def _command_presence_clocked_in(
         self,
         _client: discord.Client | None,
@@ -1172,6 +1285,90 @@ class AdminCommandRouter:
             lines.append(f"- {snapshot.user.display_name}: {title or 'untitled draft'}")
         return "\n".join(lines)
 
+    async def _command_review_pending_task_proposals(
+        self,
+        _client: discord.Client | None,
+        snapshots: list[UserDailySnapshot],
+        _args: dict[str, str],
+    ) -> str:
+        pending = [snapshot for snapshot in snapshots if snapshot.pending_admin_task_proposal]
+        if not pending:
+            return "No new-task proposals are waiting for Erik or George right now."
+        lines = ["Pending new-task proposals:"]
+        for snapshot in pending:
+            proposal = snapshot.pending_admin_task_proposal or {}
+            draft = proposal.get("draft") if isinstance(proposal, dict) else {}
+            title = str(draft.get("title") or "untitled proposal") if isinstance(draft, dict) else "untitled proposal"
+            category = str(proposal.get("category") or "project")
+            lines.append(f"- {snapshot.user.display_name}: [{category}] {title}")
+        return "\n".join(lines)
+
+    async def _command_review_overtime_approve(
+        self,
+        client: discord.Client | None,
+        snapshots: list[UserDailySnapshot],
+        args: dict[str, str],
+    ) -> str:
+        if not client:
+            return "Discord client is unavailable."
+        snapshot = self._snapshot_or_error(args.get("user"), snapshots)
+        if isinstance(snapshot, str):
+            return snapshot
+        comments = (args.get("comments") or "").strip()
+        if not comments:
+            return "I need `comments=` describing why the overtime is approved."
+        return await self.runtime.approve_same_day_overtime(
+            client,
+            snapshot.user,
+            snapshot.session,
+            approved_by=self._active_admin_name(),
+            comments=comments,
+        )
+
+    async def _command_review_task_proposal_approve(
+        self,
+        client: discord.Client | None,
+        snapshots: list[UserDailySnapshot],
+        args: dict[str, str],
+    ) -> str:
+        if not client:
+            return "Discord client is unavailable."
+        snapshot = self._snapshot_or_error(args.get("user"), snapshots)
+        if isinstance(snapshot, str):
+            return snapshot
+        admin_message = (args.get("comments") or "Approved from the admin console.").strip()
+        return await self.runtime.resolve_admin_task_proposal(
+            client,
+            snapshot.user,
+            snapshot.session,
+            approve_create=True,
+            admin_message=admin_message,
+            resolved_by=self._active_admin_name(),
+        )
+
+    async def _command_review_task_proposal_revise(
+        self,
+        client: discord.Client | None,
+        snapshots: list[UserDailySnapshot],
+        args: dict[str, str],
+    ) -> str:
+        if not client:
+            return "Discord client is unavailable."
+        snapshot = self._snapshot_or_error(args.get("user"), snapshots)
+        if isinstance(snapshot, str):
+            return snapshot
+        comments = (args.get("comments") or "").strip()
+        if not comments:
+            return "I need `comments=` for `review.task_proposal_revise`."
+        return await self.runtime.resolve_admin_task_proposal(
+            client,
+            snapshot.user,
+            snapshot.session,
+            approve_create=False,
+            admin_message=comments,
+            resolved_by=self._active_admin_name(),
+        )
+
     async def _command_review_unblocker_approve(
         self,
         client: discord.Client | None,
@@ -1190,6 +1387,7 @@ class AdminCommandRouter:
             snapshot.session,
             approve_create=True,
             admin_message=admin_message,
+            resolved_by=self._active_admin_name(),
         )
 
     async def _command_review_unblocker_revise(
@@ -1212,6 +1410,7 @@ class AdminCommandRouter:
             snapshot.session,
             approve_create=False,
             admin_message=comments,
+            resolved_by=self._active_admin_name(),
         )
 
     async def _command_evidence_before_after(
@@ -1675,6 +1874,60 @@ class AdminCommandRouter:
             args=dict(args),
         )
 
+    async def _preview_review_task_proposal_approve(
+        self,
+        snapshots: list[UserDailySnapshot],
+        args: dict[str, str],
+    ) -> AdminActionPreview:
+        target = self._snapshot_or_error(args.get("user"), snapshots)
+        label = args.get("user") or "that user"
+        if isinstance(target, UserDailySnapshot):
+            label = target.user.display_name
+        return AdminActionPreview(
+            title="Preview `review.task_proposal_approve`",
+            summary=f"The pending project/overhead task proposal for {label} will be created in ClickUp.",
+            command_id="review.task_proposal_approve",
+            args=dict(args),
+        )
+
+    async def _preview_review_overtime_approve(
+        self,
+        snapshots: list[UserDailySnapshot],
+        args: dict[str, str],
+    ) -> AdminActionPreview:
+        target = self._snapshot_or_error(args.get("user"), snapshots)
+        label = args.get("user") or "that user"
+        if isinstance(target, UserDailySnapshot):
+            label = target.user.display_name
+        comments = (args.get("comments") or "No approval reason provided.").strip()
+        return AdminActionPreview(
+            title="Preview `review.overtime_approve`",
+            summary=(
+                f"{label} will be allowed to restart tracked work today after the overtime stop. "
+                "The worker and the other configured approver will be notified.\n\n"
+                f"Reason: {comments}"
+            ),
+            command_id="review.overtime_approve",
+            args=dict(args),
+        )
+
+    async def _preview_review_task_proposal_revise(
+        self,
+        snapshots: list[UserDailySnapshot],
+        args: dict[str, str],
+    ) -> AdminActionPreview:
+        target = self._snapshot_or_error(args.get("user"), snapshots)
+        label = args.get("user") or "that user"
+        if isinstance(target, UserDailySnapshot):
+            label = target.user.display_name
+        comments = args.get("comments") or "No comments provided."
+        return AdminActionPreview(
+            title="Preview `review.task_proposal_revise`",
+            summary=f"{label} will receive revision comments for the proposed task.\n\nComments:\n{comments}",
+            command_id="review.task_proposal_revise",
+            args=dict(args),
+        )
+
     async def _preview_review_unblocker_revise(
         self,
         snapshots: list[UserDailySnapshot],
@@ -1759,8 +2012,9 @@ class AdminCommandRouter:
         lines = ["Currently stuck:"]
         for snapshot in stuck:
             suffix = " (no help requested)" if snapshot.blocker_state == "blocked_no_help" else ""
+            stuck_since = self._coerce_snapshot_datetime(snapshot, snapshot.session.stuck_since)
             lines.append(
-                f"- {snapshot.user.display_name}: stuck since {format_admin_datetime(snapshot.session.stuck_since, reference=now)}; "
+                f"- {snapshot.user.display_name}: stuck since {format_admin_datetime(stuck_since, reference=now)}; "
                 f"blocker: {snapshot.session.latest_blocker or 'no blocker text'}{suffix}"
             )
         return "\n".join(lines)
@@ -1775,18 +2029,39 @@ class AdminCommandRouter:
         for snapshot in snapshots:
             if not snapshot.session.stuck_since:
                 continue
-            stuck_since = datetime.fromisoformat(snapshot.session.stuck_since)
+            stuck_since = self._coerce_snapshot_datetime(snapshot, snapshot.session.stuck_since)
+            if not stuck_since:
+                continue
             hours = (now - stuck_since).total_seconds() / 3600
             if hours >= threshold_hours or snapshot.session.stuck_alerted_at:
                 found = True
                 suffix = " (no help requested)" if snapshot.blocker_state == "blocked_no_help" else ""
                 lines.append(
                     f"- {snapshot.user.display_name}: {snapshot.session.latest_blocker or 'no blocker text'} "
-                    f"(stuck {hours:.1f}h; since {format_admin_datetime(snapshot.session.stuck_since, reference=now)}){suffix}"
+                    f"(stuck {hours:.1f}h; since {format_admin_datetime(stuck_since, reference=now)}){suffix}"
                 )
         if not found:
             lines.append("- none beyond the current intervention threshold")
         return "\n".join(lines)
+
+    def _coerce_snapshot_datetime(
+        self,
+        snapshot: UserDailySnapshot,
+        raw_value: str | None,
+    ) -> datetime | None:
+        if not raw_value:
+            return None
+        timezone_name = self.runtime.resolve_user_timezone_name(snapshot.user)
+        parser = getattr(self.runtime, "_coerce_datetime", None)
+        if callable(parser):
+            return parser(raw_value, timezone_name=timezone_name)
+        try:
+            parsed = datetime.fromisoformat(raw_value)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return localize_datetime(parsed, timezone_name)
+        return parsed
 
     async def _dm_stuck_users(self, client: discord.Client, snapshots: list[UserDailySnapshot]) -> str:
         if not self.runtime.config:
@@ -1972,11 +2247,8 @@ class AdminCommandRouter:
     async def _unowned_task_report(self, snapshots: list[UserDailySnapshot]) -> str:
         if not self.runtime.clickup:
             return "ClickUp is not configured."
-        mission_board_id = self.runtime.config.clickup.mission_board_list_id if self.runtime.config else None
-        if not mission_board_id:
-            return "Mission Board is not configured in ClickUp."
         task_lines: list[str] = []
-        tasks = await self.runtime.clickup.list_list_tasks(mission_board_id, limit=100, include_closed=False)
+        tasks = await self.runtime.clickup.list_workspace_tasks(limit=500, include_closed=False)
         active_task_ids = {snapshot.active_clickup_task_id for snapshot in snapshots if snapshot.active_clickup_task_id}
         for task in tasks:
             task_id = str(task.get("id") or "")
@@ -1984,13 +2256,14 @@ class AdminCommandRouter:
                 continue
             if task.get("assignees"):
                 continue
+            location = self.runtime.clickup.task_location_label(task)
             task_lines.append(
-                f"- {task.get('name')} | status={(task.get('status') or {}).get('status') or 'unknown'} | "
+                f"- {task.get('name')} | {location} | status={(task.get('status') or {}).get('status') or 'unknown'} | "
                 f"priority={(task.get('priority') or {}).get('priority') or 'none'}"
             )
         if not task_lines:
-            return "I did not find any unassigned Mission Board tasks outside the active intern focus set."
-        return "Mission Board tasks with no intern actively focused on them right now:\n" + "\n".join(task_lines[:20])
+            return "I did not find any unassigned tasks across the configured ClickUp workspace outside the active focus set."
+        return "Workspace tasks with no worker actively focused on them right now:\n" + "\n".join(task_lines[:20])
 
     async def _post_summary_comments(self, snapshots: list[UserDailySnapshot]) -> str:
         if not self.runtime.config:

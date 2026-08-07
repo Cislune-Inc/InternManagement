@@ -15,6 +15,10 @@ from .models import AgentConfig, ClickUpContextBundle, MessageRecord, SessionSta
 
 
 logger = logging.getLogger(__name__)
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+_MAX_GET_ATTEMPTS = 3
+_CLICKUP_TASK_PAGE_SIZE = 100
+_WORKSPACE_TASK_SCAN_LIMIT = 500
 
 _PRIORITY_TO_INT = {
     "urgent": 1,
@@ -79,6 +83,10 @@ class ClickUpClient:
         user: UserProfile,
         session: SessionState,
         messages: list[MessageRecord],
+        *,
+        preferred_task_id: str | None = None,
+        preferred_task_name: str | None = None,
+        preferred_selection_reason: str | None = None,
     ) -> ClickUpContextBundle:
         tasks = await self._load_candidate_tasks(user)
         if not tasks:
@@ -93,7 +101,24 @@ class ClickUpClient:
             active_task_id = str(best_task.get("id"))
             active_task_name = best_task.get("name")
             selection_reason = best_reason
-        context = self._format_ranked_context(scored, active_task_id, selection_reason)
+        context_task_id = active_task_id
+        context_selection_reason = selection_reason
+        if preferred_task_id:
+            matched_preferred = next(
+                (
+                    (reason, task)
+                    for _, reason, task in scored
+                    if str(task.get("id") or "") == preferred_task_id
+                ),
+                None,
+            )
+            if matched_preferred is not None:
+                matched_reason, matched_task = matched_preferred
+                context_task_id = str(matched_task.get("id") or preferred_task_id)
+                if preferred_task_name:
+                    matched_task["name"] = preferred_task_name
+                context_selection_reason = preferred_selection_reason or matched_reason
+        context = self._format_ranked_context(scored, context_task_id, context_selection_reason)
         candidate_task_ids = [str(task.get("id")) for _, _, task in scored[:5] if task.get("id")]
         return ClickUpContextBundle(
             context=context,
@@ -125,6 +150,9 @@ class ClickUpClient:
                 self.config.clickup.workspace_id,
             )
         return None
+
+    async def list_workspace_members(self) -> list[dict[str, Any]]:
+        return await self._list_workspace_members()
 
     async def resolve_workspace_member_id(
         self,
@@ -373,19 +401,38 @@ class ClickUpClient:
         return self._match_task_hint(tasks, task_hint)
 
     async def list_workspace_tasks(self, limit: int = 100, include_closed: bool = False) -> list[dict[str, Any]]:
-        payload = await asyncio.to_thread(
-            self._request,
-            "GET",
-            f"/team/{self.config.clickup.workspace_id}/task",
-            params={
-                "page": 0,
-                "order_by": "updated",
-                "reverse": "true",
-                "include_closed": str(include_closed).lower(),
-                "subtasks": "true",
-            },
-        )
-        return list(payload.get("tasks", []))[:limit]
+        tasks: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        page = 0
+        while len(tasks) < limit:
+            payload = await asyncio.to_thread(
+                self._request,
+                "GET",
+                f"/team/{self.config.clickup.workspace_id}/task",
+                params={
+                    "page": page,
+                    "order_by": "updated",
+                    "reverse": "false",
+                    "include_closed": str(include_closed).lower(),
+                    "subtasks": "true",
+                },
+            )
+            page_tasks = [task for task in payload.get("tasks", []) if isinstance(task, dict)]
+            new_task_count = 0
+            for task in page_tasks:
+                task_id = str(task.get("id") or "").strip()
+                if task_id and task_id in seen_ids:
+                    continue
+                if task_id:
+                    seen_ids.add(task_id)
+                tasks.append(task)
+                new_task_count += 1
+                if len(tasks) >= limit:
+                    break
+            if len(page_tasks) < _CLICKUP_TASK_PAGE_SIZE or new_task_count == 0:
+                break
+            page += 1
+        return tasks[:limit]
 
     async def get_list(self, list_id: str) -> dict[str, Any]:
         return await asyncio.to_thread(self._request, "GET", f"/list/{list_id}")
@@ -720,10 +767,10 @@ class ClickUpClient:
         exclude_task_ids: set[str] | None = None,
         limit: int = 3,
     ) -> list[dict[str, Any]]:
-        list_id = self.config.clickup.mission_board_list_id or self.config.clickup.default_list_id
-        if not list_id:
-            return []
-        tasks = await self.list_list_tasks(list_id, limit=100, include_closed=False)
+        tasks = await self.list_workspace_tasks(
+            limit=_WORKSPACE_TASK_SCAN_LIMIT,
+            include_closed=False,
+        )
         open_unassigned = [
             task
             for task in tasks
@@ -732,7 +779,25 @@ class ClickUpClient:
             and str(task.get("id") or "") not in (exclude_task_ids or set())
         ]
         scored = self._rank_next_tasks(open_unassigned, session, messages)
-        return [task for _, _, task in scored[:limit]]
+        suggestions: list[dict[str, Any]] = []
+        for _, reason, task in scored[:limit]:
+            suggestion = dict(task)
+            suggestion["_don_pollo_workspace_option"] = True
+            suggestion["_don_pollo_suggestion_reason"] = reason
+            suggestions.append(suggestion)
+        return suggestions
+
+    @staticmethod
+    def task_location_label(task: dict[str, Any]) -> str:
+        labels: list[str] = []
+        for key in ("space", "folder", "list"):
+            payload = task.get(key)
+            if not isinstance(payload, dict):
+                continue
+            label = str(payload.get("name") or "").strip()
+            if label and label not in labels:
+                labels.append(label)
+        return " / ".join(labels) or "ClickUp workspace"
 
     @staticmethod
     def pick_highest_priority_task(tasks: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -766,7 +831,7 @@ class ClickUpClient:
             params: dict[str, Any] = {
                 "page": 0,
                 "order_by": "updated",
-                "reverse": "true",
+                "reverse": "false",
                 "include_closed": "false",
                 "subtasks": "true",
                 "assignees[]": [clickup_user_id],
@@ -954,6 +1019,15 @@ class ClickUpClient:
     def _score_next_task(self, task: dict[str, Any], evidence_tokens: set[str]) -> tuple[int, str]:
         score = 0
         reasons: list[str] = []
+        status = ((task.get("status") or {}).get("status") or "").strip().lower()
+        if status:
+            if any(word in status for word in ("progress", "active", "working")):
+                score += 30
+            elif any(word in status for word in ("review", "qa", "test")):
+                score += 20
+            elif any(word in status for word in ("todo", "to do", "open", "backlog")):
+                score += 10
+            reasons.append(f"status={status}")
         priority = ((task.get("priority") or {}).get("priority") or "").strip().lower()
         if priority == "urgent":
             score += 45
@@ -970,6 +1044,7 @@ class ClickUpClient:
             for part in (
                 str(task.get("name") or ""),
                 str(task.get("description") or ""),
+                self.task_location_label(task),
             )
             if part
         )
@@ -979,7 +1054,7 @@ class ClickUpClient:
             score += min(len(overlap) * 18, 72)
             reasons.append("keyword overlap: " + ", ".join(overlap[:5]))
         if not reasons:
-            reasons.append("open mission board task")
+            reasons.append("open workspace task")
         return score, "; ".join(reasons)
 
     def _build_evidence_tokens(
@@ -1059,9 +1134,13 @@ class ClickUpClient:
         selection_reason: str | None,
     ) -> str:
         if active_task_id:
-            active_task = next(task for _, _, task in scored if str(task.get("id")) == active_task_id)
-            other_tasks = [task for _, _, task in scored if str(task.get("id")) != active_task_id][:4]
-            return self._format_active_task_context(active_task, selection_reason, other_tasks)
+            active_task = next(
+                (task for _, _, task in scored if str(task.get("id")) == active_task_id),
+                None,
+            )
+            if active_task is not None:
+                other_tasks = [task for _, _, task in scored if str(task.get("id")) != active_task_id][:4]
+                return self._format_active_task_context(active_task, selection_reason, other_tasks)
 
         lines = ["Assigned ClickUp tasks:"]
         for _, _, task in scored[:5]:
@@ -1171,18 +1250,56 @@ class ClickUpClient:
         params: dict[str, Any] | None = None,
         json: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        response = requests.request(
-            method,
-            f"{self.base_url}{path}",
-            headers={
-                "Authorization": self.api_token,
-                "Content-Type": "application/json",
-            },
-            params=params,
-            json=json,
-            timeout=60,
-        )
-        response.raise_for_status()
-        if response.content:
-            return response.json()
-        return {}
+        normalized_method = method.upper()
+        max_attempts = _MAX_GET_ATTEMPTS if normalized_method == "GET" else 1
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = requests.request(
+                    normalized_method,
+                    f"{self.base_url}{path}",
+                    headers={
+                        "Authorization": self.api_token,
+                        "Content-Type": "application/json",
+                    },
+                    params=params,
+                    json=json,
+                    timeout=60,
+                )
+            except requests.RequestException as exc:
+                if attempt >= max_attempts:
+                    raise
+                delay = 0.5 * (2 ** (attempt - 1))
+                logger.warning(
+                    "ClickUp %s %s failed with %s; retrying in %.1fs (%s/%s).",
+                    normalized_method,
+                    path,
+                    type(exc).__name__,
+                    delay,
+                    attempt,
+                    max_attempts,
+                )
+                time.sleep(delay)
+                continue
+            retryable = response.status_code in _RETRYABLE_STATUS_CODES
+            if retryable and attempt < max_attempts:
+                retry_after = response.headers.get("Retry-After")
+                try:
+                    delay = float(retry_after) if retry_after else 0.5 * (2 ** (attempt - 1))
+                except ValueError:
+                    delay = 0.5 * (2 ** (attempt - 1))
+                logger.warning(
+                    "ClickUp %s %s returned HTTP %s; retrying in %.1fs (%s/%s).",
+                    normalized_method,
+                    path,
+                    response.status_code,
+                    delay,
+                    attempt,
+                    max_attempts,
+                )
+                time.sleep(min(max(delay, 0.0), 10.0))
+                continue
+            response.raise_for_status()
+            if response.content:
+                return response.json()
+            return {}
+        raise RuntimeError(f"ClickUp request exhausted retries: {normalized_method} {path}")

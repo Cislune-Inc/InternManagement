@@ -1,5 +1,10 @@
 import asyncio
 from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+import requests
 
 from agent.clickup_client import ClickUpClient
 from agent.models import (
@@ -64,6 +69,70 @@ def _build_config() -> AgentConfig:
     )
 
 
+def test_clickup_get_retries_transient_server_failures() -> None:
+    client = ClickUpClient("token", _build_config())
+    responses = [
+        SimpleNamespace(status_code=500, headers={}, content=b"error"),
+        SimpleNamespace(status_code=503, headers={"Retry-After": "0"}, content=b"error"),
+        SimpleNamespace(
+            status_code=200,
+            headers={},
+            content=b'{"tasks":[]}',
+            json=lambda: {"tasks": []},
+            raise_for_status=lambda: None,
+        ),
+    ]
+    for response in responses[:2]:
+        response.raise_for_status = lambda: (_ for _ in ()).throw(RuntimeError("unexpected"))
+
+    with (
+        patch("agent.clickup_client.requests.request", side_effect=responses) as request,
+        patch("agent.clickup_client.time.sleep") as sleep,
+    ):
+        result = client._request("GET", "/team/1/task")
+
+    assert result == {"tasks": []}
+    assert request.call_count == 3
+    assert sleep.call_count == 2
+
+
+def test_clickup_get_retries_connection_reset() -> None:
+    client = ClickUpClient("token", _build_config())
+    success = SimpleNamespace(
+        status_code=200,
+        headers={},
+        content=b'{"teams":[]}',
+        json=lambda: {"teams": []},
+        raise_for_status=lambda: None,
+    )
+
+    with (
+        patch(
+            "agent.clickup_client.requests.request",
+            side_effect=[requests.ConnectionError("connection reset"), success],
+        ) as request,
+        patch("agent.clickup_client.time.sleep") as sleep,
+    ):
+        result = client._request("GET", "/team")
+
+    assert result == {"teams": []}
+    assert request.call_count == 2
+    sleep.assert_called_once_with(0.5)
+
+
+def test_clickup_write_does_not_retry_connection_error() -> None:
+    client = ClickUpClient("token", _build_config())
+
+    with patch(
+        "agent.clickup_client.requests.request",
+        side_effect=requests.ConnectionError("connection reset"),
+    ) as request:
+        with pytest.raises(requests.ConnectionError):
+            client._request("POST", "/task", json={"name": "No duplicate"})
+
+    assert request.call_count == 1
+
+
 def test_clickup_context_prefers_matching_assigned_task() -> None:
     client = FakeClickUpClient(
         {
@@ -117,6 +186,73 @@ def test_clickup_context_prefers_matching_assigned_task() -> None:
     assert bundle.active_task_id == "task-2"
     assert bundle.active_task_name == "Intake form API integration"
     assert "Active ClickUp task candidate" in bundle.context
+
+
+def test_clickup_context_can_center_preferred_authoritative_task() -> None:
+    client = FakeClickUpClient(
+        {
+            (
+                "GET",
+                "/team/9011286053/task",
+            ): {
+                "tasks": [
+                    {
+                        "id": "task-1",
+                        "name": "Plan mechanism for lever automation",
+                        "description": "Ranked highest from ClickUp status and keywords.",
+                        "status": {"status": "in progress"},
+                        "priority": {"priority": "high"},
+                    },
+                    {
+                        "id": "task-2",
+                        "name": "Firmware",
+                        "description": "Stepper motor firmware work.",
+                        "status": {"status": "to do"},
+                        "priority": {"priority": "normal"},
+                    },
+                ]
+            }
+        }
+    )
+    user = UserProfile(
+        user_key="christie",
+        display_name="Christie",
+        discord_user_id=1,
+        discord_username="christie",
+        storage_folder_name="ChristieJackett",
+        clickup_user_id="87438366",
+    )
+    session = SessionState(
+        user_key="christie",
+        session_date="2026-06-15",
+        latest_plan="Continue firmware work on the stepper motor controller.",
+    )
+    messages = [
+        MessageRecord(
+            message_id="1",
+            direction="inbound",
+            author_id=1,
+            created_at=datetime(2026, 6, 15, 9, 15, 0),
+            content="I am still working on the firmware task.",
+            attachments=[],
+        )
+    ]
+
+    bundle = asyncio.run(
+        client.get_context_bundle(
+            user,
+            session,
+            messages,
+            preferred_task_id="task-2",
+            preferred_task_name="Firmware",
+            preferred_selection_reason="Confirmed by intern during task onboarding.",
+        )
+    )
+
+    assert "Active ClickUp task candidate:" in bundle.context
+    assert "- Firmware | id=task-2" in bundle.context
+    assert "Why this task: Confirmed by intern during task onboarding." in bundle.context
+    assert "- Plan mechanism for lever automation | id=task-1" in bundle.context
 
 
 def test_clickup_user_id_can_be_resolved_from_workspace_members() -> None:
@@ -425,7 +561,7 @@ def test_create_task_repairs_missing_assignees_after_create() -> None:
 def test_suggest_next_tasks_prefers_unassigned_priority_matches() -> None:
     client = FakeClickUpClient(
         {
-            ("GET", "/list/mission-board/task"): {
+            ("GET", "/team/9011286053/task"): {
                 "tasks": [
                     {
                         "id": "task-1",
@@ -434,6 +570,9 @@ def test_suggest_next_tasks_prefers_unassigned_priority_matches() -> None:
                         "assignees": [],
                         "status": {"status": "to do", "type": "open"},
                         "priority": {"priority": "high"},
+                        "space": {"id": "ops", "name": "Company Operations"},
+                        "folder": {"id": "shop", "name": "Shop Improvements"},
+                        "list": {"id": "cleanup", "name": "Cleanup"},
                     },
                     {
                         "id": "task-2",
@@ -442,6 +581,9 @@ def test_suggest_next_tasks_prefers_unassigned_priority_matches() -> None:
                         "assignees": [],
                         "status": {"status": "to do", "type": "open"},
                         "priority": {"priority": "urgent"},
+                        "space": {"id": "projects", "name": "Flight Projects"},
+                        "folder": {"id": "perdex", "name": "PERDEX"},
+                        "list": {"id": "hardware", "name": "Hardware"},
                     },
                     {
                         "id": "task-3",
@@ -479,6 +621,55 @@ def test_suggest_next_tasks_prefers_unassigned_priority_matches() -> None:
     ]
     suggestions = asyncio.run(client.suggest_next_tasks(user, session, messages, limit=2))
     assert [task["id"] for task in suggestions] == ["task-2", "task-1"]
+    assert all(task["_don_pollo_workspace_option"] is True for task in suggestions)
+    assert client.task_location_label(suggestions[0]) == "Flight Projects / PERDEX / Hardware"
+    assert any(
+        call[0:2] == ("GET", "/team/9011286053/task")
+        for call in client.calls
+    )
+
+
+def test_list_workspace_tasks_paginates_across_space_results() -> None:
+    class PagedClient(ClickUpClient):
+        def __init__(self) -> None:
+            super().__init__("token", _build_config())
+            self.pages: list[int] = []
+
+        def _request(self, method: str, path: str, *, params=None, json=None) -> dict:
+            del json
+            assert method == "GET"
+            assert path == "/team/9011286053/task"
+            assert (params or {}).get("order_by") == "updated"
+            assert (params or {}).get("reverse") == "false"
+            page = int((params or {}).get("page") or 0)
+            self.pages.append(page)
+            if page == 0:
+                return {
+                    "tasks": [
+                        {
+                            "id": f"intern-{index}",
+                            "name": f"Intern task {index}",
+                            "space": {"name": "Interns"},
+                        }
+                        for index in range(100)
+                    ]
+                }
+            return {
+                "tasks": [
+                    {
+                        "id": "company-overhead",
+                        "name": "Organize the fabrication shop",
+                        "space": {"name": "Company Operations"},
+                    }
+                ]
+            }
+
+    client = PagedClient()
+    tasks = asyncio.run(client.list_workspace_tasks(limit=250, include_closed=False))
+
+    assert len(tasks) == 101
+    assert tasks[-1]["id"] == "company-overhead"
+    assert client.pages == [0, 1]
 
 
 def test_resolve_task_for_user_matches_by_name_and_id() -> None:

@@ -18,6 +18,20 @@ class AdminCommandMatch:
     reason: str | None = None
 
 
+@dataclass(slots=True)
+class TaskDraftIntentMatch:
+    action: str
+    confidence: float
+    reason: str | None = None
+
+
+@dataclass(slots=True)
+class DailyAvailabilityIntentMatch:
+    action: str
+    confidence: float
+    reason: str | None = None
+
+
 class InterfaceIntelligence:
     def __init__(self) -> None:
         api_key = os.environ.get("OPENAI_API_KEY")
@@ -78,6 +92,80 @@ class InterfaceIntelligence:
             return None
         return AdminCommandMatch(canonical_command=canonical, confidence=confidence, reason=reason)
 
+    async def resolve_task_draft_intent(
+        self,
+        user_text: str,
+        *,
+        prompt_type: str,
+        step: str,
+        source: str | None = None,
+    ) -> TaskDraftIntentMatch | None:
+        if not self.enabled or not self.client or not user_text.strip():
+            return None
+        prompt = (
+            "You are classifying a Discord DM from an intern who is currently inside a task-draft workflow.\n"
+            "Decide whether the intern is clearly saying they started task creation by mistake and wants to back out of creating a task.\n"
+            "Only match when the meaning is clear, such as saying they did not mean to create a task, meant to choose an existing task instead, or do not want to create a task after all.\n"
+            "Do not match normal task titles, descriptions, priorities, assignees, due dates, yes/no answers, or generic workflow replies.\n"
+            "Return strict JSON with keys: match_type, action, confidence, reason.\n"
+            "match_type must be one of intent_match or no_match.\n"
+            "action must be mistaken_task_creation or no_match.\n\n"
+            f"Prompt type: {prompt_type}\n"
+            f"Prompt step: {step}\n"
+            f"Prompt source: {source or 'unknown'}\n"
+            f"Intern message:\n{user_text}"
+        )
+        try:
+            response = await self._create_response(prompt)
+        except Exception:
+            self.enabled = False
+            return None
+        payload = _extract_json(response.output_text)
+        if not isinstance(payload, dict):
+            return None
+        match_type = str(payload.get("match_type") or "").strip().lower()
+        action = str(payload.get("action") or "").strip().lower()
+        confidence = _coerce_confidence(payload.get("confidence"))
+        reason = str(payload.get("reason") or "").strip() or None
+        if match_type == "no_match" or action != "mistaken_task_creation" or confidence < 0.7:
+            return None
+        return TaskDraftIntentMatch(action=action, confidence=confidence, reason=reason)
+
+    async def resolve_daily_availability_intent(
+        self,
+        user_text: str,
+        *,
+        stage: str,
+    ) -> DailyAvailabilityIntentMatch | None:
+        if not self.enabled or not self.client or not user_text.strip():
+            return None
+        prompt = (
+            "You are classifying a Discord DM from an intern in a work-tracking workflow.\n"
+            "Decide whether the intern is clearly saying they are not working today and wants the bot to leave them alone for the rest of today.\n"
+            "Only match when the meaning is clear, such as being off today, out today, not coming in today, not working today, or unavailable for the rest of today.\n"
+            "Do not match normal status updates, task updates, clock-out messages, lunch messages, or statements about a specific task not being worked on.\n"
+            "Return strict JSON with keys: match_type, action, confidence, reason.\n"
+            "match_type must be one of intent_match or no_match.\n"
+            "action must be not_working_today or no_match.\n\n"
+            f"Workflow stage: {stage}\n"
+            f"Intern message:\n{user_text}"
+        )
+        try:
+            response = await self._create_response(prompt)
+        except Exception:
+            self.enabled = False
+            return None
+        payload = _extract_json(response.output_text)
+        if not isinstance(payload, dict):
+            return None
+        match_type = str(payload.get("match_type") or "").strip().lower()
+        action = str(payload.get("action") or "").strip().lower()
+        confidence = _coerce_confidence(payload.get("confidence"))
+        reason = str(payload.get("reason") or "").strip() or None
+        if match_type == "no_match" or action != "not_working_today" or confidence < 0.72:
+            return None
+        return DailyAvailabilityIntentMatch(action=action, confidence=confidence, reason=reason)
+
     async def enrich_intern_signals(self, text: str, stage: str, signals: MessageSignals) -> MessageSignals:
         if not text.strip() or not self.enabled or not self.client:
             return signals
@@ -93,6 +181,17 @@ class InterfaceIntelligence:
             or signals.starting_lunch
         ):
             should_query = True
+        elif stage == "clocked_out" and not (
+            signals.clocked_in
+            or signals.clocking_out
+            or signals.blocked_status
+            or signals.help_requested
+            or signals.help_declined
+            or signals.recovered
+            or signals.starting_lunch
+            or signals.ending_lunch
+        ):
+            should_query = True
         elif stage == "on_lunch_break" and not signals.ending_lunch:
             should_query = True
         if not should_query:
@@ -100,7 +199,7 @@ class InterfaceIntelligence:
 
         prompt = (
             "You are classifying a Discord DM from an intern for a workflow state machine.\n"
-            "Return strict JSON with boolean keys: clocked_in, clocking_out, blocked_status, help_requested, help_declined, recovered, starting_lunch, ending_lunch.\n"
+            "Return strict JSON with boolean keys: clocked_in, clocking_out, blocked_status, help_requested, help_declined, recovered, starting_lunch, ending_lunch, starting_short_rest, ending_short_rest.\n"
             "Be conservative. Only set a field to true if the message clearly implies it.\n\n"
             f"Workflow stage: {stage}\n"
             f"Message:\n{text}"
@@ -126,6 +225,14 @@ class InterfaceIntelligence:
             recovered=signals.recovered or bool(payload.get("recovered")),
             starting_lunch=signals.starting_lunch or bool(payload.get("starting_lunch")),
             ending_lunch=signals.ending_lunch or bool(payload.get("ending_lunch")),
+            starting_short_rest=(
+                signals.starting_short_rest
+                or bool(payload.get("starting_short_rest"))
+            ),
+            ending_short_rest=(
+                signals.ending_short_rest
+                or bool(payload.get("ending_short_rest"))
+            ),
         )
 
 
