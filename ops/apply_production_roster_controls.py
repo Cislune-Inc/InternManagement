@@ -25,6 +25,34 @@ CONTROL_FIELDS = (
 )
 AJ_SLACK_USER_ID = "U095NMY2U4R"
 AJ_FOCUS_AREAS = ("Lockheed Bagworm", "LM_Nightjar", "shop organization")
+AJ_ROSTER_DEFAULTS = {
+    "user_key": "AJ",
+    "display_name": "AJ Torres",
+    "discord_user_id": "",
+    "discord_username": "",
+    "storage_folder_name": "AJ Torres",
+    "timezone": "America/Los_Angeles",
+    "clickup_user_id": "",
+    "clickup_user_email": "ajtorres@caltech.edu",
+    "slack_user_id": AJ_SLACK_USER_ID,
+    "active": "true",
+    "preferred_transport": "slack",
+    "worker_type": "intern",
+    "work_location": "Rosemead, CA",
+    "labor_jurisdiction": "California",
+    "compensation_plan": "nasa_stipend",
+    "time_tracking_required": "true",
+    "meal_tracking_required": "true",
+    "overtime_approval_required": "true",
+    "expected_daily_hours": "8",
+    "weekly_target_hours": "40",
+    "regular_workdays": "monday;tuesday;wednesday;thursday;friday",
+    "typical_start_time": "09:00",
+    "typical_end_time": "17:00",
+    "planned_time_off": "",
+    "interests": ";".join(AJ_FOCUS_AREAS),
+    "skills": "",
+}
 OVERTIME_EXEMPT_WORKER_TYPES = {"salaried", "exempt", "external", "contractor"}
 
 
@@ -67,6 +95,8 @@ def _append_semicolon_values(current: Any, additions: tuple[str, ...]) -> str:
 def apply_roster_controls(
     rows: list[dict[str, Any]],
     fieldnames: list[str],
+    *,
+    ensure_aj: bool = False,
 ) -> tuple[list[str], list[str]]:
     output_fields = list(fieldnames)
     for field_name in (*CONTROL_FIELDS, "slack_user_id", "preferred_transport", "interests"):
@@ -74,6 +104,14 @@ def apply_roster_controls(
             output_fields.append(field_name)
 
     changed: list[str] = []
+    if ensure_aj and not any(_matches_aj(row) for row in rows):
+        for field_name in AJ_ROSTER_DEFAULTS:
+            if field_name not in output_fields:
+                output_fields.append(field_name)
+        aj_row = {field_name: "" for field_name in output_fields}
+        aj_row.update(AJ_ROSTER_DEFAULTS)
+        rows.append(aj_row)
+        changed.append("added AJ Torres")
     for index, row in enumerate(rows, start=2):
         if not _is_active(row):
             continue
@@ -138,7 +176,7 @@ def main() -> int:
     if not fieldnames:
         raise ValueError("Roster CSV is missing a header row.")
 
-    output_fields, changed = apply_roster_controls(rows, fieldnames)
+    output_fields, changed = apply_roster_controls(rows, fieldnames, ensure_aj=True)
     rendered = _render_roster(rows, output_fields)
     parse_roster_bytes(roster_path.name, rendered)
 

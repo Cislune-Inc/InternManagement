@@ -99,3 +99,33 @@ def test_roster_controls_connect_aj_to_slack_and_preserve_existing_focus() -> No
     )
     assert {"slack_user_id", "preferred_transport", "interests"}.issubset(fieldnames)
     assert changed
+
+
+def test_production_roster_controls_add_missing_aj_with_provisional_schedule() -> None:
+    rows = [
+        {
+            "user_key": "existing",
+            "display_name": "Existing Worker",
+            "discord_user_id": "123",
+            "active": "true",
+            "worker_type": "intern",
+            "compensation_plan": "nasa_stipend",
+        }
+    ]
+
+    fieldnames, changed = apply_roster_controls(
+        rows,
+        list(rows[0]),
+        ensure_aj=True,
+    )
+
+    aj = next(row for row in rows if row["user_key"] == "AJ")
+    assert aj["display_name"] == "AJ Torres"
+    assert aj["slack_user_id"] == "U095NMY2U4R"
+    assert aj["clickup_user_email"] == "ajtorres@caltech.edu"
+    assert aj["timezone"] == "America/Los_Angeles"
+    assert aj["compensation_plan"] == "nasa_stipend"
+    assert aj["weekly_target_hours"] == "40"
+    assert aj["regular_workdays"] == "monday;tuesday;wednesday;thursday;friday"
+    assert "clickup_user_email" in fieldnames
+    assert "added AJ Torres" in changed
