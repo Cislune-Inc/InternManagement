@@ -22,11 +22,11 @@ case "${original_command}" in
     ;;
   seed-management)
     cd "${repo_root}"
-    exec .venv/bin/python ops/seed-project-management-tasks.py --apply
+    exec .venv/bin/python -m ops.seed_project_management_tasks --apply
     ;;
   seed-management-plan)
     cd "${repo_root}"
-    exec .venv/bin/python ops/seed-project-management-tasks.py
+    exec .venv/bin/python -m ops.seed_project_management_tasks
     ;;
   deploy\ agent/*)
     branch="${original_command#deploy }"
