@@ -407,6 +407,44 @@ class _LiveRuntime:
         self.state_store.save_session(session)
         return True
 
+    @staticmethod
+    def _refresh_session_time_summary(session, now):
+        def elapsed(started_at, ended_at=None):
+            started = datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
+            ended = (
+                datetime.fromisoformat(str(ended_at).replace("Z", "+00:00"))
+                if ended_at
+                else now
+            )
+            return max(0, int((ended - started).total_seconds()))
+
+        gross = sum(
+            elapsed(segment["clocked_in_at"], segment.get("clocked_out_at"))
+            for segment in session.work_segments
+            if isinstance(segment, dict) and segment.get("clocked_in_at")
+        )
+        tracking_history = list(session.metadata.get("clickup_time_tracking_history") or [])
+        current_tracking = session.metadata.get("clickup_time_tracking")
+        if isinstance(current_tracking, dict):
+            tracking_history.append(current_tracking)
+        tracked = sum(
+            elapsed(item["started_at"], item.get("closed_at"))
+            for item in tracking_history
+            if isinstance(item, dict) and item.get("started_at")
+        )
+        session.time_summary = {
+            "gross_clocked_in_total_seconds": gross,
+            "unpaid_lunch_deducted_seconds": 0,
+            "clocked_in_total_seconds": gross,
+            "task_tracked_total_seconds": tracked,
+            "has_open_work_segment": any(
+                segment.get("clocked_in_at") and not segment.get("clocked_out_at")
+                for segment in session.work_segments
+                if isinstance(segment, dict)
+            ),
+            "active_task_timer_running": isinstance(current_tracking, dict),
+        }
+
     async def write_dashboard(self):
         self.dashboard_writes += 1
 
@@ -454,6 +492,19 @@ def test_roster_worker_portal_uses_one_live_session_and_idempotent_timer(tmp_pat
     assert first["work"]["status"] == "active"
     assert second["work"]["status"] == "active"
     assert "no duplicate time" in second["message"]
+    assert second["time"]["session_date"]
+    assert second["time"]["clocked_in_at"]
+    assert second["time"]["work_clock_running"] is True
+    assert second["time"]["task_timer_running"] is True
+    assert second["time"]["current_task_name"] == "Build test fixture"
+    html = service.render_html(second)
+    assert 'id="today-time"' in html
+    assert 'id="current-task-time"' in html
+    assert 'id="tracked-time"' in html
+    assert "window.setInterval(renderTimers, 1000)" in html
+    assert "const dirtyFields = new Set()" in html
+    assert "if (!dirtyFields.has(id))" in html
+    assert "clearSubmittedDraft(payload.action)" in html
     live_session, _ = runtime.get_user_session_for_moment(runtime.user)
     assert len(live_session.work_segments) == 1
     assert live_session.metadata["clickup_time_tracking"]["task_id"] == "assigned"
@@ -470,6 +521,8 @@ def test_roster_worker_portal_uses_one_live_session_and_idempotent_timer(tmp_pat
         )
     )
     assert clocked_out["work"]["status"] == "clocked_out"
+    assert clocked_out["time"]["work_clock_running"] is False
+    assert clocked_out["time"]["task_timer_running"] is False
     live_session, _ = runtime.get_user_session_for_moment(runtime.user)
     assert live_session.work_segments[0]["clocked_out_at"]
     assert len(live_session.metadata["clickup_time_tracking_history"]) == 1

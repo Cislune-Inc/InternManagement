@@ -1357,6 +1357,7 @@ class WorkerPortalService:
             "actor": {"name": _actor_name(actor), "slack_user_id": actor.slack_user_id},
             "profile": state["profile"],
             "work": work,
+            "time": self._time_payload(actor, work, now),
             "quality": state["quality"],
             "task_options": tasks[:5],
             "task_catalog": self._task_catalog(tasks),
@@ -1370,6 +1371,78 @@ class WorkerPortalService:
                 "cutoff_at": cutoff.isoformat() if cutoff else "",
             },
             "generated_at": now.isoformat(),
+        }
+
+    def _time_payload(
+        self,
+        actor: PortalActor,
+        work: dict[str, Any],
+        now: datetime,
+    ) -> dict[str, Any]:
+        empty = {
+            "session_date": "",
+            "clocked_in_at": "",
+            "clocked_out_at": "",
+            "worked_seconds": 0,
+            "gross_seconds": 0,
+            "unpaid_lunch_seconds": 0,
+            "tracked_seconds": 0,
+            "current_task_seconds": 0,
+            "work_clock_running": False,
+            "task_timer_running": False,
+            "current_task_name": str(work.get("selected_task_name") or ""),
+        }
+        if not self._live_enabled(actor):
+            return empty
+
+        session, _ = self._live_session(self._live_user(actor))
+        refresh_summary = getattr(self.runtime, "_refresh_session_time_summary", None)
+        if callable(refresh_summary):
+            refresh_summary(session, now)
+        summary = session.time_summary if isinstance(session.time_summary, dict) else {}
+        tracking = session.metadata.get("clickup_time_tracking")
+        tracking = tracking if isinstance(tracking, dict) and not tracking.get("closed_at") else {}
+        current_started_at = _parse_datetime(tracking.get("started_at"))
+        current_task_seconds = (
+            max(0, int((now - current_started_at).total_seconds()))
+            if current_started_at
+            else 0
+        )
+        status_value = str(work.get("status") or "ready")
+        work_segment_open = bool(summary.get("has_open_work_segment")) or any(
+            isinstance(segment, dict)
+            and segment.get("clocked_in_at")
+            and not segment.get("clocked_out_at")
+            for segment in session.work_segments
+        )
+        task_timer_running = (
+            bool(summary.get("active_task_timer_running") or tracking)
+            and status_value in {"active", "short_rest"}
+        )
+
+        def whole_seconds(key: str) -> int:
+            try:
+                return max(0, int(float(summary.get(key) or 0)))
+            except (TypeError, ValueError):
+                return 0
+
+        return {
+            "session_date": str(session.session_date or ""),
+            "clocked_in_at": str(session.clocked_in_at or ""),
+            "clocked_out_at": str(session.clocked_out_at or ""),
+            "worked_seconds": whole_seconds("clocked_in_total_seconds"),
+            "gross_seconds": whole_seconds("gross_clocked_in_total_seconds"),
+            "unpaid_lunch_seconds": whole_seconds("unpaid_lunch_deducted_seconds"),
+            "tracked_seconds": whole_seconds("task_tracked_total_seconds"),
+            "current_task_seconds": current_task_seconds,
+            "work_clock_running": work_segment_open and status_value in {"active", "short_rest"},
+            "task_timer_running": task_timer_running,
+            "current_task_name": str(
+                tracking.get("task_name")
+                or work.get("selected_task_name")
+                or session.metadata.get("active_clickup_task_name")
+                or ""
+            ),
         }
 
     def _record_history(self, state: dict[str, Any], action: str, message: str) -> None:
@@ -1519,6 +1592,13 @@ def _portal_template() -> str:
     .panel { border:1px solid var(--line); background:var(--card); border-radius:22px; padding:22px; box-shadow:0 8px 28px rgba(21,40,33,.05); }
     .section-space { margin-top:18px; }
     .work-now { margin-top:18px; border-top:5px solid var(--teal); }
+    .time-strip { display:grid; grid-template-columns:1.15fr 1fr 1fr; gap:10px; margin:2px 0 14px; }
+    .time-card { min-width:0; padding:13px 14px; border:1px solid var(--line); border-radius:15px; background:var(--soft); }
+    .time-card.primary { background:var(--ink); border-color:var(--ink); color:white; }
+    .time-card small { display:block; margin-bottom:2px; color:var(--muted); font-size:.7rem; font-weight:900; letter-spacing:.07em; text-transform:uppercase; }
+    .time-card.primary small,.time-card.primary .time-detail { color:#d4e0da; }
+    .time-value { display:block; overflow:hidden; font-size:clamp(1.3rem,3.2vw,1.75rem); font-variant-numeric:tabular-nums; letter-spacing:-.03em; text-overflow:ellipsis; white-space:nowrap; }
+    .time-detail { display:block; overflow:hidden; margin-top:2px; color:var(--muted); font-size:.78rem; text-overflow:ellipsis; white-space:nowrap; }
     .hero-main { background:var(--ink); color:white; border-color:var(--ink); }
     .hero-main p { color:#d4e0da; max-width:66ch; }
     .hero-main strong { color:#ffd3ad; }
@@ -1589,7 +1669,7 @@ def _portal_template() -> str:
     #toast.show { transform:translateY(0); }
     #toast.error { background:var(--danger); }
     @media (max-width:900px) { .layout { grid-template-columns:1fr; } .topbar { position:static; } .task-grid { grid-template-columns:repeat(5,240px); } }
-    @media (max-width:600px) { .shell { width:min(100% - 16px,100%); margin:8px auto 40px; } .topbar,.panel { border-radius:16px; padding:16px; } .topbar { align-items:flex-start; } .status { display:none; } .form-grid,.profile-summary,.catalog-tools { grid-template-columns:1fr; } .task-grid { grid-template-columns:1fr; overflow:visible; } .task { min-height:0; } .actions .button { min-height:44px; } .work-now .actions .primary { flex:1 1 100%; } .catalog-task { grid-template-columns:1fr; } .catalog-task .button { width:100%; } }
+    @media (max-width:600px) { .shell { width:min(100% - 16px,100%); margin:8px auto 40px; } .topbar,.panel { border-radius:16px; padding:16px; } .topbar { align-items:flex-start; } .status { display:none; } .time-strip { grid-template-columns:1fr 1fr; } .time-card.primary { grid-column:1/-1; } .form-grid,.profile-summary,.catalog-tools { grid-template-columns:1fr; } .task-grid { grid-template-columns:1fr; overflow:visible; } .task { min-height:0; } .actions .button { min-height:44px; } .work-now .actions .primary { flex:1 1 100%; } .catalog-task { grid-template-columns:1fr; } .catalog-task .button { width:100%; } }
   </style>
 </head>
 <body>
@@ -1600,6 +1680,11 @@ def _portal_template() -> str:
     </header>
     <section class="panel work-now" id="work-now">
       <div class="section-head"><div><div class="eyebrow">Work now</div><h2>Start or continue useful work</h2></div><span class="pill" id="quality-pill">0 strong plans</span></div>
+      <div class="time-strip" aria-live="polite">
+        <div class="time-card primary"><small>Today worked</small><strong class="time-value" id="today-time">0:00:00</strong><span class="time-detail" id="session-state">Not clocked in</span></div>
+        <div class="time-card"><small>Current task timer</small><strong class="time-value" id="current-task-time">0:00:00</strong><span class="time-detail" id="current-task-label">No task running</span></div>
+        <div class="time-card"><small>Task time today</small><strong class="time-value" id="tracked-time">0:00:00</strong><span class="time-detail" id="lunch-time">No unpaid lunch recorded</span></div>
+      </div>
       <div id="work-notice"></div>
       <div class="selected-task"><small class="muted">SELECTED TASK</small><div id="selected-task">Choose an option below.</div></div>
       <div class="form-grid">
@@ -1647,6 +1732,55 @@ def _portal_template() -> str:
     const esc = (value) => String(value ?? '').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#39;');
     let renderedProfileSavedAt = null;
     let chooserInitialized = false;
+    const dirtyFields = new Set();
+    const editableFieldIds = new Set(['outcome','first-step','estimate','checkpoint','progress','blocker','weekly-hours','start-time','end-time','time-off','interests','skills']);
+    function syncInput(id, value) {
+      if (!dirtyFields.has(id)) $(id).value = value ?? '';
+    }
+    function clearSubmittedDraft(action) {
+      const submittedFields = {
+        start: ['outcome','first-step','estimate','checkpoint'],
+        check_in: ['progress','blocker'],
+        clock_out: ['progress','blocker'],
+        save_profile: ['weekly-hours','workdays','start-time','end-time','time-off','interests','skills'],
+      }[action] || [];
+      submittedFields.forEach((id) => dirtyFields.delete(id));
+    }
+    function formatDuration(value) {
+      const total = Math.max(0, Math.floor(Number(value) || 0));
+      const hours = Math.floor(total / 3600);
+      const minutes = Math.floor((total % 3600) / 60);
+      const seconds = total % 60;
+      return `${hours}:${String(minutes).padStart(2,'0')}:${String(seconds).padStart(2,'0')}`;
+    }
+    function formatClock(value) {
+      const parsed = Date.parse(value || '');
+      return Number.isFinite(parsed) ? new Date(parsed).toLocaleTimeString([], {hour:'numeric',minute:'2-digit'}) : '';
+    }
+    function renderTimers() {
+      const time = data.time || {}, work = data.work || {};
+      const generatedAt = Date.parse(data.generated_at || '');
+      const elapsed = Number.isFinite(generatedAt) ? Math.max(0, (Date.now() - generatedAt) / 1000) : 0;
+      const worked = Number(time.worked_seconds || 0) + (time.work_clock_running ? elapsed : 0);
+      const tracked = Number(time.tracked_seconds || 0) + (time.task_timer_running ? elapsed : 0);
+      const current = Number(time.current_task_seconds || 0) + (time.task_timer_running ? elapsed : 0);
+      $('today-time').textContent = formatDuration(worked);
+      $('tracked-time').textContent = formatDuration(tracked);
+      $('current-task-time').textContent = formatDuration(current);
+      const clockedIn = formatClock(time.clocked_in_at);
+      const clockedOut = formatClock(time.clocked_out_at);
+      const stateLabels = {
+        active: clockedIn ? `Working since ${clockedIn}` : 'Work clock is running',
+        short_rest: 'Paid short rest · work clock is running',
+        lunch: 'Unpaid lunch · work clock is paused',
+        clocked_out: clockedOut ? `Clocked out at ${clockedOut}` : 'Clocked out',
+        ready: 'Not clocked in',
+      };
+      $('session-state').textContent = stateLabels[work.status] || 'Not clocked in';
+      $('current-task-label').textContent = time.current_task_name || work.selected_task_name || 'No task running';
+      const lunchSeconds = Number(time.unpaid_lunch_seconds || 0);
+      $('lunch-time').textContent = lunchSeconds > 0 ? `Unpaid lunch excluded: ${formatDuration(lunchSeconds)}` : 'No unpaid lunch recorded';
+    }
     function renderTaskCatalog() {
       const query = String($('task-search').value || '').trim().toLowerCase();
       const assignedOnly = $('assigned-only').checked;
@@ -1690,7 +1824,8 @@ def _portal_template() -> str:
       $('history-eyebrow').textContent = live ? 'Recent live activity' : 'Recent preview activity';
       $('reset-beta').hidden = live;
       $('clock-pill').textContent = String(work.status || 'ready').replaceAll('_',' ');
-      $('clock-pill').classList.toggle('running', work.status === 'active');
+      $('clock-pill').classList.toggle('running', ['active','short_rest'].includes(work.status));
+      renderTimers();
       $('work-notice').innerHTML = work.notice ? `<div class="notice">${esc(work.notice)}</div>` : '';
       $('schedule-line').textContent = `${Number(profile.weekly_target_hours || 0)} hours/week · ${(profile.regular_workdays || []).map(day => day.slice(0,3)).join(', ')} · ${profile.typical_start_time || '—'}–${profile.typical_end_time || '—'}`;
       $('skills-line').textContent = (profile.skills || []).join(', ') || 'Not set';
@@ -1703,20 +1838,20 @@ def _portal_template() -> str:
       $('task-grid').innerHTML = tasks.map((task,index) => `<button class="task ${task.id === work.selected_task_id ? 'selected' : ''}" data-select-task="${esc(task.id)}" data-task-name="${esc(task.name)}" data-task-location="${esc(task.location)}"><span class="number">${index+1}</span><h3>${esc(task.name)}</h3><div class="tagrow">${task.recommended ? '<span class="tag recommended">Recommended</span>' : ''}${task.assigned ? '<span class="tag">Assigned to you</span>' : ''}<span class="tag">${esc(task.priority)}</span><span class="tag">${esc(task.status)}</span>${task.due_date ? `<span class="tag">Due ${esc(task.due_date)}</span>` : ''}</div><div class="muted">${esc(task.location)}</div><div class="why">Why: ${esc(task.reason)}</div></button>`).join('');
       renderTaskCatalog();
       $('selected-task').innerHTML = work.selected_task_name ? `<strong>${esc(work.selected_task_name)}</strong><br><span class="muted">${esc(work.selected_task_location || '')}</span>` : 'Choose an option above.';
-      $('outcome').value = work.outcome || '';
-      $('first-step').value = work.first_step || '';
-      $('estimate').value = work.estimate || '1 hour';
-      $('checkpoint').value = work.checkpoint || '60 minutes';
-      $('progress').value = work.latest_progress || '';
-      $('blocker').value = work.latest_blocker || '';
+      syncInput('outcome', work.outcome || '');
+      syncInput('first-step', work.first_step || '');
+      syncInput('estimate', work.estimate || '1 hour');
+      syncInput('checkpoint', work.checkpoint || '60 minutes');
+      syncInput('progress', work.latest_progress || '');
+      syncInput('blocker', work.latest_blocker || '');
       $('quality-pill').textContent = `${Number(quality.strong_plans || 0)} strong plan${Number(quality.strong_plans || 0) === 1 ? '' : 's'}`;
-      $('weekly-hours').value = profile.weekly_target_hours || 40;
-      $('start-time').value = profile.typical_start_time || '09:00';
-      $('end-time').value = profile.typical_end_time || '17:00';
-      $('time-off').value = (profile.planned_time_off || []).join(', ');
-      $('interests').value = (profile.interests || []).join(', ');
-      $('skills').value = (profile.skills || []).join(', ');
-      $('workdays').innerHTML = days.map(day => `<label class="day"><input type="checkbox" value="${day}" ${(profile.regular_workdays || []).includes(day) ? 'checked' : ''}><span>${day.slice(0,3)}</span></label>`).join('');
+      syncInput('weekly-hours', profile.weekly_target_hours || 40);
+      syncInput('start-time', profile.typical_start_time || '09:00');
+      syncInput('end-time', profile.typical_end_time || '17:00');
+      syncInput('time-off', (profile.planned_time_off || []).join(', '));
+      syncInput('interests', (profile.interests || []).join(', '));
+      syncInput('skills', (profile.skills || []).join(', '));
+      if (!dirtyFields.has('workdays')) $('workdays').innerHTML = days.map(day => `<label class="day"><input type="checkbox" value="${day}" ${(profile.regular_workdays || []).includes(day) ? 'checked' : ''}><span>${day.slice(0,3)}</span></label>`).join('');
       const savedAt = String(profile.saved_at || '');
       if (renderedProfileSavedAt === null || renderedProfileSavedAt !== savedAt) $('profile-details').open = !savedAt;
       renderedProfileSavedAt = savedAt;
@@ -1751,6 +1886,7 @@ def _portal_template() -> str:
         const response = await fetch(`/api/portal/action?token=${encodeURIComponent(token)}`, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
         const result = await response.json();
         if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+        clearSubmittedDraft(payload.action);
         data = result; render(); showToast(result.message || 'Saved.'); return true;
       } catch (error) { showToast(error.message || String(error), true); return false; }
       finally { if (button && button.isConnected) { button.disabled = false; button.textContent = original; } }
@@ -1763,11 +1899,19 @@ def _portal_template() -> str:
       const button = event.target.closest('[data-action]');
       if (button) post(actionPayload(button.dataset.action), button);
     });
+    document.addEventListener('input', (event) => {
+      if (editableFieldIds.has(event.target.id)) dirtyFields.add(event.target.id);
+    });
+    document.addEventListener('change', (event) => {
+      if (editableFieldIds.has(event.target.id)) dirtyFields.add(event.target.id);
+      if (event.target.closest('#workdays')) dirtyFields.add('workdays');
+    });
     $('task-search').addEventListener('input', renderTaskCatalog);
     $('assigned-only').addEventListener('change', renderTaskCatalog);
     let toastTimer;
     function showToast(message,error=false) { const node=$('toast'); node.textContent=message; node.className=error?'show error':'show'; clearTimeout(toastTimer); toastTimer=setTimeout(()=>node.className='',7000); }
     render();
+    window.setInterval(renderTimers, 1000);
     window.setInterval(async () => {
       try {
         const response = await fetch(`/api/portal-data?token=${encodeURIComponent(token)}`, {cache:'no-store'});
