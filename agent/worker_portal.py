@@ -122,7 +122,7 @@ def _actor_name(actor: PortalActor) -> str:
 def _actor_user_key(actor: PortalActor) -> str:
     if isinstance(actor, UserProfile):
         return actor.user_key
-    return f"portal-beta-{_actor_name(actor).lower().replace(' ', '-')}"
+    return f"portal-admin-{_actor_name(actor).lower().replace(' ', '-')}"
 
 
 def validate_work_commitment(
@@ -202,9 +202,12 @@ class WorkerPortalService:
         if action == "save_profile":
             self._save_profile(state, payload)
             if live:
-                await self._save_live_profile(actor, state["profile"])
-                actor = resolve_worker_portal_actor(self.runtime, slack_user_id) or actor
-                message = "Schedule and worker context saved to the live Don Pollo roster."
+                if isinstance(actor, UserProfile):
+                    await self._save_live_profile(actor, state["profile"])
+                    actor = resolve_worker_portal_actor(self.runtime, slack_user_id) or actor
+                    message = "Schedule and worker context saved to the live Don Pollo roster."
+                else:
+                    message = "Schedule and project context saved for live admin tracking."
             else:
                 message = "Profile saved. Don Pollo can now use this context when ranking work and timing prompts."
         elif action == "select_task":
@@ -652,8 +655,39 @@ class WorkerPortalService:
         )
 
     def _live_enabled(self, actor: PortalActor) -> bool:
-        return isinstance(actor, UserProfile) and callable(
+        return isinstance(actor, (AdminProfile, UserProfile)) and callable(
             getattr(self.runtime, "get_user_session_for_moment", None)
+        )
+
+    def _live_user(self, actor: PortalActor) -> UserProfile:
+        if isinstance(actor, UserProfile):
+            return actor
+        raw_state = self.runtime.state_store.get_operational_state(
+            _PORTAL_STATE_PREFIX + str(actor.slack_user_id or "")
+        )
+        profile = raw_state.get("profile") if isinstance(raw_state, dict) else {}
+        profile = profile if isinstance(profile, dict) else {}
+        return UserProfile(
+            user_key=_actor_user_key(actor),
+            display_name=actor.name,
+            discord_user_id=actor.discord_user_id,
+            storage_folder_name=f"Admin-{actor.name}",
+            clickup_user_id=actor.clickup_user_id,
+            clickup_user_email=actor.clickup_user_email,
+            slack_user_id=actor.slack_user_id,
+            preferred_transport="slack",
+            worker_type="admin",
+            compensation_plan="salary",
+            time_tracking_required=True,
+            meal_tracking_required=False,
+            overtime_approval_required=False,
+            weekly_target_hours=float(profile.get("weekly_target_hours") or 40),
+            regular_workdays=list(profile.get("regular_workdays") or _DEFAULT_WORKDAYS),
+            typical_start_time=str(profile.get("typical_start_time") or "09:00"),
+            typical_end_time=str(profile.get("typical_end_time") or "17:00"),
+            planned_time_off=list(profile.get("planned_time_off") or []),
+            interests=list(profile.get("interests") or ["program management", "project delivery"]),
+            skills=list(profile.get("skills") or ["program management"]),
         )
 
     async def _save_live_profile(
@@ -733,8 +767,7 @@ class WorkerPortalService:
         state: dict[str, Any],
         payload: dict[str, Any],
     ) -> str:
-        if not isinstance(actor, UserProfile):
-            raise ValueError("This portal account is not attached to a live worker record.")
+        user = self._live_user(actor)
         work = state["work"]
         task_id = str(work.get("selected_task_id") or "").strip()
         task_name = str(work.get("selected_task_name") or "").strip()
@@ -773,9 +806,9 @@ class WorkerPortalService:
         # Starting an open task is also the deliberate claim action. Existing co-owners remain assigned.
         await self._claim_task(actor, state, {"task_id": task_id})
         task_name = str(state["work"].get("selected_task_name") or task_name)
-        lock = self.runtime._user_session_lock(actor.user_key)
+        lock = self.runtime._user_session_lock(user.user_key)
         async with lock:
-            session, now = self._live_session(actor)
+            session, now = self._live_session(user)
             if session.stage == "on_lunch_break":
                 raise ValueError("Finish the unpaid lunch period before resuming work.")
             if self.runtime._active_short_rest_break(session):
@@ -794,7 +827,7 @@ class WorkerPortalService:
             previous = self.runtime._clone_session_state(session)
             if prior_task_id and prior_task_id != task_id:
                 await self.runtime._pause_current_task_tracking(
-                    actor,
+                    user,
                     session,
                     now,
                     set_hold=True,
@@ -820,20 +853,20 @@ class WorkerPortalService:
                     "portal_last_started_at": now.isoformat(),
                 }
             )
-            await self.runtime._activate_clickup_task(actor, session, now, task_id, task_name)
+            await self.runtime._activate_clickup_task(user, session, now, task_id, task_name)
             self._append_live_event(
-                actor,
+                user,
                 session,
                 now,
                 f"Started {task_name}. Result: {outcome} First move: {first_step} Estimate: {estimate}; checkpoint: {checkpoint}.",
             )
             await self._notify_live(
-                actor,
+                user,
                 session,
                 now,
                 f"Live work started on `{task_name}`. Your ClickUp task timer is running. Planned result: {outcome}",
             )
-            await self._persist_live_action(actor, session, previous, now, "portal_start")
+            await self._persist_live_action(user, session, previous, now, "portal_start")
         quality["strong_plans"] = int(quality.get("strong_plans") or 0) + 1
         quality["last_rejected_fingerprint"] = ""
         return "Live work started. The durable time record and ClickUp task timer are running."
@@ -844,88 +877,83 @@ class WorkerPortalService:
         state: dict[str, Any],
         payload: dict[str, Any],
     ) -> str:
-        if not isinstance(actor, UserProfile):
-            raise ValueError("This portal account is not attached to a live worker record.")
+        user = self._live_user(actor)
         progress = _clean_text(payload.get("progress"), limit=800)
         blocker = _clean_text(payload.get("blocker"), limit=500)
         issue, _ = validate_meaningful_work_detail(progress, purpose="progress update")
         if issue:
             raise ValueError(issue)
-        lock = self.runtime._user_session_lock(actor.user_key)
+        lock = self.runtime._user_session_lock(user.user_key)
         async with lock:
-            session, now = self._live_session(actor)
+            session, now = self._live_session(user)
             if session.stage != "active" or session.clocked_out_at:
                 raise ValueError("Start or resume live work before posting a checkpoint.")
             previous = self.runtime._clone_session_state(session)
             session.latest_status = progress
             session.latest_blocker = blocker or None
             self._append_live_event(
-                actor,
+                user,
                 session,
                 now,
                 f"Checkpoint: {progress}" + (f" Blocker: {blocker}" if blocker else ""),
             )
-            await self._persist_live_action(actor, session, previous, now, "portal_checkpoint")
+            await self._persist_live_action(user, session, previous, now, "portal_checkpoint")
         return "Checkpoint saved to the durable work record and queued for ClickUp sync."
 
     async def _start_live_short_rest(self, actor: PortalActor) -> str:
-        if not isinstance(actor, UserProfile):
-            raise ValueError("This portal account is not attached to a live worker record.")
-        lock = self.runtime._user_session_lock(actor.user_key)
+        user = self._live_user(actor)
+        lock = self.runtime._user_session_lock(user.user_key)
         async with lock:
-            session, now = self._live_session(actor)
+            session, now = self._live_session(user)
             previous = self.runtime._clone_session_state(session)
             if session.stage != "active":
                 raise ValueError("Short rest is available only while actively working.")
-            await self.runtime._maybe_start_short_rest_break(None, actor, session, now)
-            await self._persist_live_action(actor, session, previous, now, "portal_short_rest")
+            await self.runtime._maybe_start_short_rest_break(None, user, session, now)
+            await self._persist_live_action(user, session, previous, now, "portal_short_rest")
         return "Paid short rest started. Check back in within 10 minutes or Don Pollo will clock you out at the cutoff."
 
     async def _start_live_lunch(self, actor: PortalActor) -> str:
-        if not isinstance(actor, UserProfile):
-            raise ValueError("This portal account is not attached to a live worker record.")
-        lock = self.runtime._user_session_lock(actor.user_key)
+        user = self._live_user(actor)
+        lock = self.runtime._user_session_lock(user.user_key)
         async with lock:
-            session, now = self._live_session(actor)
+            session, now = self._live_session(user)
             previous = self.runtime._clone_session_state(session)
             if session.stage != "active":
                 raise ValueError("Lunch is available only while actively working.")
-            await self.runtime._maybe_start_lunch_break(None, actor, session, now)
-            await self._persist_live_action(actor, session, previous, now, "portal_lunch")
+            await self.runtime._maybe_start_lunch_break(None, user, session, now)
+            await self._persist_live_action(user, session, previous, now, "portal_lunch")
         return "Unpaid lunch started. Work and ClickUp time are paused for at least 30 minutes."
 
     async def _return_from_live_break(self, actor: PortalActor) -> str:
-        if not isinstance(actor, UserProfile):
-            raise ValueError("This portal account is not attached to a live worker record.")
-        lock = self.runtime._user_session_lock(actor.user_key)
+        user = self._live_user(actor)
+        lock = self.runtime._user_session_lock(user.user_key)
         async with lock:
-            session, now = self._live_session(actor)
+            session, now = self._live_session(user)
             previous = self.runtime._clone_session_state(session)
             if self.runtime._active_short_rest_break(session):
                 self.runtime._finish_short_rest_break(session, now, outcome="returned_via_portal")
                 await self._notify_live(
-                    actor,
+                    user,
                     session,
                     now,
                     "Welcome back. Your paid short rest ended and live task time continues.",
                 )
                 result = "Checked back in. Live task time continues."
             elif session.stage == "on_lunch_break":
-                await self.runtime._end_lunch_break(None, actor, session, now)
+                await self.runtime._end_lunch_break(None, user, session, now)
                 if session.stage == "on_lunch_break":
                     raise ValueError("The unpaid lunch minimum has not ended yet. Don Pollo sent the remaining time in Slack.")
                 result = "Checked back in. Live work and ClickUp task time resumed."
             else:
                 raise ValueError("There is no active break to return from.")
-            await self._persist_live_action(actor, session, previous, now, "portal_break_return")
+            await self._persist_live_action(user, session, previous, now, "portal_break_return")
         return result
 
     async def _clock_out_live(self, actor: PortalActor, payload: dict[str, Any]) -> str:
-        if not isinstance(actor, UserProfile):
-            raise ValueError("This portal account is not attached to a live worker record.")
-        lock = self.runtime._user_session_lock(actor.user_key)
+        user = self._live_user(actor)
+        lock = self.runtime._user_session_lock(user.user_key)
         async with lock:
-            session, now = self._live_session(actor)
+            session, now = self._live_session(user)
             if session.stage == "clocked_out" or session.clocked_out_at:
                 raise ValueError("You are already clocked out.")
             progress = _clean_text(payload.get("progress"), limit=800) or str(session.latest_status or "")
@@ -939,7 +967,7 @@ class WorkerPortalService:
             if self.runtime._active_short_rest_break(session):
                 self.runtime._finish_short_rest_break(session, now, outcome="manual_clock_out_via_portal")
             note = await self.runtime._finalize_clickup_day(
-                actor,
+                user,
                 session,
                 now,
                 allow_status_completion=False,
@@ -954,32 +982,31 @@ class WorkerPortalService:
             session.pending_clickup_sync = True
             session.metadata["clock_out_source"] = "worker_portal"
             self._append_live_event(
-                actor,
+                user,
                 session,
                 now,
                 f"Clocked out. Result: {progress}" + (f" Blocker: {blocker}" if blocker else ""),
             )
             await self._notify_live(
-                actor,
+                user,
                 session,
                 now,
                 "You are clocked out. Your result is saved and the task timer is stopped."
                 + (f"\n\n{note}" if note else ""),
             )
-            await self._persist_live_action(actor, session, previous, now, "portal_clock_out")
+            await self._persist_live_action(user, session, previous, now, "portal_clock_out")
         return "Clocked out. The durable time record and task timer are closed."
 
     async def _enforce_live_deadlines(self, actor: PortalActor) -> None:
-        if not isinstance(actor, UserProfile):
-            return
-        lock = self.runtime._user_session_lock(actor.user_key)
+        user = self._live_user(actor)
+        lock = self.runtime._user_session_lock(user.user_key)
         async with lock:
-            session, now = self._live_session(actor)
+            session, now = self._live_session(user)
             previous = self.runtime._clone_session_state(session)
-            changed = await self.runtime._maybe_check_short_rest_break(None, actor, session, now)
+            changed = await self.runtime._maybe_check_short_rest_break(None, user, session, now)
             if changed:
                 await self._persist_live_action(
-                    actor,
+                    user,
                     session,
                     previous,
                     now,
@@ -991,9 +1018,8 @@ class WorkerPortalService:
         actor: PortalActor,
         state: dict[str, Any],
     ) -> None:
-        if not isinstance(actor, UserProfile):
-            return
-        session, _ = self._live_session(actor)
+        user = self._live_user(actor)
+        session, _ = self._live_session(user)
         work = state["work"]
         active_short_rest = self.runtime._active_short_rest_break(session)
         if session.stage == "on_lunch_break":

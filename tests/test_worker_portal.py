@@ -476,3 +476,55 @@ def test_roster_worker_portal_uses_one_live_session_and_idempotent_timer(tmp_pat
     assert any("Live work started" in message for _, message in runtime.slack.messages)
     assert any("clocked out" in message.lower() for _, message in runtime.slack.messages)
     assert runtime.dashboard_writes == 2
+
+
+def test_admin_portal_tracks_projects_live_but_uses_salary_nonpayroll_identity(tmp_path) -> None:
+    runtime = _LiveRuntime(tmp_path)
+    admin = AdminProfile(
+        name="Erik",
+        discord_user_id=999,
+        slack_user_id="UERIK",
+        clickup_user_id="123",
+    )
+    runtime.config.slack.worker_portal_beta_slack_user_ids.append("UERIK")
+    runtime.admin_profile_by_slack_user_id = (
+        lambda slack_user_id: admin if slack_user_id == "UERIK" else None
+    )
+    token = _token_from_link(build_worker_portal_link(runtime, admin))
+    service = WorkerPortalService(runtime)
+
+    initial = asyncio.run(service.build_payload(token))
+    assert initial["live"] is True
+    live_admin = service._live_user(admin)
+    assert live_admin.worker_type == "admin"
+    assert live_admin.compensation_plan == "salary"
+    assert live_admin.overtime_approval_required is False
+
+    asyncio.run(
+        service.apply_action(
+            token,
+            {
+                "action": "select_task",
+                "task_id": "assigned",
+                "task_name": "Build test fixture",
+                "task_location": "Hardware / Flight fixture",
+            },
+        )
+    )
+    started = asyncio.run(
+        service.apply_action(
+            token,
+            {
+                "action": "start",
+                "outcome": "A reviewed fixture delivery plan with owners and the next milestone recorded",
+                "first_step": "Open the fixture task and verify its owner, deadline, and acceptance criteria",
+                "estimate": "1 hour",
+                "checkpoint": "60 minutes",
+            },
+        )
+    )
+
+    assert started["work"]["status"] == "active"
+    session, _ = runtime.get_user_session_for_moment(live_admin)
+    assert session.user_key == "portal-admin-erik"
+    assert session.metadata["active_clickup_task_id"] == "assigned"

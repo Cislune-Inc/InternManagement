@@ -1355,13 +1355,12 @@ class InternManagementRuntime:
                     await self.slack.post_message(
                         slack_user_id,
                         (
-                            "Open your Don Pollo Workday beta:\n"
+                            "Open your live Don Pollo Workday portal:\n"
                             f"{portal_url}\n\n"
-                            "The signed link expires in 72 hours and works on the office network or VPN. "
-                            "Its beta clock and profile are isolated from live payroll records. Browsing and "
-                            "choosing are read-only; the clearly labeled Claim action adds you as a ClickUp "
-                            "assignee without removing anyone else. Continue using this Slack DM for the live "
-                            "time-tracking workflow while we test the portal."
+                            "The private signed link expires in 72 hours. The portal and this Slack DM use the "
+                            "same durable work session: starting work claims the ClickUp task without removing "
+                            "co-owners, clocks you in, and starts its task timer. If the link does not open, use "
+                            "this Slack DM as the fallback and report the problem rather than skipping the log."
                         ),
                     )
                     return

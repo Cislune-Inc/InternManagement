@@ -460,7 +460,7 @@ def test_slack_admin_dm_uses_admin_console_without_worker_roster_entry() -> None
     ]
 
 
-def test_slack_admin_portal_command_returns_signed_vpn_beta_link(tmp_path: Path) -> None:
+def test_slack_admin_portal_command_returns_live_link(tmp_path: Path) -> None:
     runtime = _build_runtime(
         admins=[
             AdminProfile(
@@ -506,10 +506,11 @@ def test_slack_admin_portal_command_returns_signed_vpn_beta_link(tmp_path: Path)
     assert routed == []
     assert posted[0][0] == "U01SWQKDTBM"
     assert "http://192.168.4.87:8765/portal?token=" in posted[0][1]
-    assert "isolated" in posted[0][1]
+    assert "same durable work session" in posted[0][1]
+    assert "VPN" not in posted[0][1]
 
 
-def test_slack_worker_portal_command_returns_own_beta_link(tmp_path: Path) -> None:
+def test_slack_worker_portal_command_returns_own_live_link(tmp_path: Path) -> None:
     runtime = _build_runtime()
     aj = UserProfile(
         user_key="AJ",
@@ -546,8 +547,9 @@ def test_slack_worker_portal_command_returns_own_beta_link(tmp_path: Path) -> No
 
     assert posted[0][0] == "U095NMY2U4R"
     assert "http://192.168.4.87:8765/portal?token=" in posted[0][1]
-    assert "office network or VPN" in posted[0][1]
-    assert "Continue using this Slack DM" in posted[0][1]
+    assert "same durable work session" in posted[0][1]
+    assert "Slack DM as the fallback" in posted[0][1]
+    assert "VPN" not in posted[0][1]
 
 
 def test_short_rest_stays_paid_and_requires_return_check_in() -> None:
