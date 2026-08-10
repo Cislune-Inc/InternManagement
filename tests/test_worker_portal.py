@@ -93,26 +93,26 @@ class _FakePortalIntelligence:
     async def coach_plan(self, **kwargs) -> dict:
         self.plan_calls.append(kwargs)
         return {
-            "ready_to_use": True,
+            "ready_to_use": False,
             "outcome": "A mounted test fixture with the alignment checked and review photos attached",
             "first_step": "Measure the fixture mounting points and mark the bracket hole centers",
             "evidence": "Photos of the mounted fixture and the recorded alignment measurements",
             "estimate": "2 hours",
             "checkpoint": "60 minutes",
             "coaching_note": "This gives the work a visible finish line.",
-            "follow_up_question": "",
+            "follow_up_question": "Which interface will you use?",
         }
 
     async def coach_checkpoint(self, **kwargs) -> dict:
         self.checkpoint_calls.append(kwargs)
         return {
-            "ready_to_save": True,
+            "ready_to_save": False,
             "progress": "Mounted the fixture and verified that all four fasteners seat correctly",
             "evidence": "Four mounting photos and the completed fit-check notes",
             "next_step": "Run the alignment measurement and attach the result to the task",
             "blocker": "",
             "coaching_note": "The update now separates completed work from the next action.",
-            "follow_up_question": "",
+            "follow_up_question": "Can you add another detail?",
         }
 
 
@@ -288,6 +288,7 @@ def test_worker_portal_ai_coauthors_but_does_not_start_or_save_work(tmp_path) ->
     assert drafted["work"]["estimate"] == "2 hours"
     assert drafted["work"]["outcome"].startswith("A mounted test fixture")
     assert drafted["ai"]["last_plan_ready"] is True
+    assert drafted["ai"]["last_plan_question"] == ""
     assert drafted["ai"]["tokens_used_today"] == 321
     assert len(intelligence.plan_calls) == 1
 
@@ -320,6 +321,7 @@ def test_worker_portal_ai_coauthors_but_does_not_start_or_save_work(tmp_path) ->
     assert "Evidence:" in checkpoint_draft["work"]["latest_progress"]
     assert "Next:" in checkpoint_draft["work"]["latest_progress"]
     assert checkpoint_draft["ai"]["last_checkpoint_ready"] is True
+    assert checkpoint_draft["ai"]["last_checkpoint_question"] == ""
     assert checkpoint_draft["history"][0]["action"] == "coach_checkpoint"
     assert len(intelligence.checkpoint_calls) == 1
 

@@ -752,11 +752,16 @@ class WorkerPortalService:
             }
         )
         issues, _ = validate_work_commitment(outcome, first_step, evidence=evidence)
-        ready = bool(suggestion.get("ready_to_use")) and not issues
+        # The model may recommend a follow-up, but only the audited validator decides
+        # whether the generated fields are sufficient. AI must not become a second,
+        # opaque gate after producing a plan that already passes the real rules.
+        ready = not issues
         note = _clean_text(suggestion.get("coaching_note"), limit=500)
         question = _clean_text(suggestion.get("follow_up_question"), limit=500)
         if issues and not question:
             question = issues[0]
+        if ready:
+            question = ""
         state["ai"].update(
             {
                 "last_plan_note": note,
@@ -812,11 +817,13 @@ class WorkerPortalService:
             structured_progress,
             purpose="progress update",
         )
-        ready = bool(suggestion.get("ready_to_save")) and not issue
+        ready = issue is None
         note = _clean_text(suggestion.get("coaching_note"), limit=500)
         question = _clean_text(suggestion.get("follow_up_question"), limit=500)
         if issue and not question:
             question = issue
+        if ready:
+            question = ""
         work["latest_progress"] = structured_progress
         work["latest_blocker"] = blocker
         state["ai"].update(
