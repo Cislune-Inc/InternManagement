@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import csv
+from difflib import SequenceMatcher
 import hashlib
 import hmac
 import io
@@ -38,6 +39,59 @@ _GENERIC_WORK_REPLIES = {
 _DEFAULT_WORKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday"]
 _VALID_ESTIMATES = {"30 minutes", "1 hour", "2 hours", "half day", "full day", "multi-day"}
 _VALID_CHECKPOINTS = {"30 minutes", "60 minutes", "90 minutes", "2 hours"}
+_QUALITY_WARNING_KEY = "portal_quality_warning"
+_QUALITY_RESTART_BLOCK_KEY = "portal_quality_restart_blocked"
+_QUALITY_WARNING_MINUTES = 10
+_OVERHEAD_LANES = [
+    {
+        "id": "shop_facilities_safety",
+        "name": "Shop, facilities & safety",
+        "search": "shop safety facilities organize clean maintenance",
+        "example": "A labeled, cleared work area with hazards and missing supplies recorded.",
+    },
+    {
+        "id": "internal_systems_automation",
+        "name": "Internal systems & automation",
+        "search": "internal automation software systems process",
+        "example": "A tested workflow improvement with the before/after behavior documented.",
+    },
+    {
+        "id": "bid_proposal",
+        "name": "Bid & proposal",
+        "search": "proposal bid solicitation sbir sttr",
+        "example": "A reviewed proposal section, compliance item, budget input, or submission decision.",
+    },
+    {
+        "id": "internal_rd",
+        "name": "Internal R&D & capability",
+        "search": "research development capability prototype experiment",
+        "example": "A prototype, experiment result, trade study, or reusable technical capability.",
+    },
+    {
+        "id": "finance_legal_admin",
+        "name": "Finance, legal & administration",
+        "search": "finance accounting legal admin invoice compliance",
+        "example": "A reconciled record, filed document, reviewed agreement, or resolved admin action.",
+    },
+    {
+        "id": "people_company_management",
+        "name": "People & company management",
+        "search": "people management hiring training schedule program management",
+        "example": "A decision, schedule, assignment, review, or documented follow-up with an owner.",
+    },
+    {
+        "id": "business_development",
+        "name": "Business development & outreach",
+        "search": "business development outreach customer partner sales",
+        "example": "A qualified lead, customer follow-up, partner decision, or recorded next action.",
+    },
+    {
+        "id": "conference_travel",
+        "name": "Conferences & proposal travel",
+        "search": "conference travel event proposal meeting",
+        "example": "A booked or completed event action tied to a purpose, contact, or proposal result.",
+    },
+]
 
 
 def build_worker_portal_link(
@@ -129,18 +183,26 @@ def validate_work_commitment(
     outcome: str,
     first_step: str,
     *,
+    evidence: str | None = None,
     previous_fingerprint: str = "",
+    recent_details: list[str] | None = None,
 ) -> tuple[list[str], str]:
     outcome = _clean_text(outcome, limit=800)
     first_step = _clean_text(first_step, limit=500)
+    evidence_text = _clean_text(evidence, limit=500) if evidence is not None else ""
     issues: list[str] = []
     if _is_vague(outcome, minimum_words=6, minimum_characters=28):
         issues.append("Describe the result you expect to point to—not just that you will ‘work on’ the task.")
     if _is_vague(first_step, minimum_words=4, minimum_characters=18):
         issues.append("Name the first concrete action, file, part, test, or person you will start with.")
-    fingerprint = hashlib.sha256(f"{outcome.lower()}\n{first_step.lower()}".encode("utf-8")).hexdigest()
+    if evidence is not None and _is_vague(evidence_text, minimum_words=4, minimum_characters=18):
+        issues.append("Say what evidence will show the result, such as a file, photo, measurement, test, decision, or sent message.")
+    combined = "\n".join(part for part in (outcome, first_step, evidence_text) if part)
+    fingerprint = hashlib.sha256(combined.lower().encode("utf-8")).hexdigest()
     if previous_fingerprint and hmac.compare_digest(previous_fingerprint, fingerprint):
         issues.append("This is the same answer as the last rejected attempt; add the missing specifics before trying again.")
+    if duplicate := _duplicate_detail_issue(combined, recent_details or []):
+        issues.append(duplicate)
     return issues, fingerprint
 
 
@@ -149,19 +211,22 @@ def validate_meaningful_work_detail(
     *,
     purpose: str,
     previous_fingerprint: str = "",
+    recent_details: list[str] | None = None,
 ) -> tuple[str | None, str]:
     cleaned = _clean_text(value, limit=800)
     fingerprint = hashlib.sha256(cleaned.lower().encode("utf-8")).hexdigest()
-    if _is_vague(cleaned, minimum_words=5, minimum_characters=24):
-        return (
-            f"Add a specific {purpose}: name the output, change, test, file, part, or decision another person could recognize.",
-            fingerprint,
-        )
     if previous_fingerprint and hmac.compare_digest(previous_fingerprint, fingerprint):
         return (
             "That repeats the last rejected answer. Add the missing specifics instead of resubmitting the same text.",
             fingerprint,
         )
+    if _is_vague(cleaned, minimum_words=5, minimum_characters=24):
+        return (
+            f"Add a specific {purpose}: name the output, change, test, file, part, or decision another person could recognize.",
+            fingerprint,
+        )
+    if duplicate := _duplicate_detail_issue(cleaned, recent_details or []):
+        return duplicate, fingerprint
     return None, fingerprint
 
 
@@ -221,7 +286,29 @@ class WorkerPortalService:
             state["work"]["selected_task_id"] = task_id
             state["work"]["selected_task_name"] = task_name
             state["work"]["selected_task_location"] = _clean_text(payload.get("task_location"), limit=240)
+            state["work"]["destination_type"] = "clickup_task"
+            state["work"]["overhead_lane_id"] = ""
+            state["work"]["overhead_lane_name"] = ""
             message = f"Selected {task_name}. Add a concrete outcome and first step before starting."
+        elif action == "select_overhead_lane":
+            lane_id = _clean_text(payload.get("lane_id"), limit=80)
+            lane = next((item for item in _OVERHEAD_LANES if item["id"] == lane_id), None)
+            if lane is None:
+                raise ValueError("Choose one of the listed non-contract work categories.")
+            state["work"].update(
+                {
+                    "destination_type": "overhead",
+                    "overhead_lane_id": lane["id"],
+                    "overhead_lane_name": lane["name"],
+                    "selected_task_id": "",
+                    "selected_task_name": "",
+                    "selected_task_location": "",
+                }
+            )
+            message = (
+                f"Selected {lane['name']}. Choose a matching existing ClickUp task below, "
+                "or propose a new one for manager approval."
+            )
         elif action == "claim_task":
             message = await self._claim_task(actor, state, payload)
         elif action == "start":
@@ -233,14 +320,23 @@ class WorkerPortalService:
                 )
             except ValueError as exc:
                 self._record_history(state, "start_rejected", str(exc))
+                if live:
+                    self._sync_state_from_live_session(actor, state)
                 self._save_state(slack_user_id, state)
                 raise
         elif action == "check_in":
-            message = (
-                await self._check_in_live_work(actor, state, payload)
-                if live
-                else self._check_in(state, payload)
-            )
+            try:
+                message = (
+                    await self._check_in_live_work(actor, state, payload)
+                    if live
+                    else self._check_in(state, payload)
+                )
+            except ValueError as exc:
+                self._record_history(state, "check_in_rejected", str(exc))
+                if live:
+                    self._sync_state_from_live_session(actor, state)
+                self._save_state(slack_user_id, state)
+                raise
         elif action == "short_rest":
             message = (
                 await self._start_live_short_rest(actor)
@@ -340,8 +436,12 @@ class WorkerPortalService:
                 "selected_task_id": "",
                 "selected_task_name": "",
                 "selected_task_location": "",
+                "destination_type": "",
+                "overhead_lane_id": "",
+                "overhead_lane_name": "",
                 "outcome": "",
                 "first_step": "",
+                "evidence": "",
                 "estimate": "1 hour",
                 "checkpoint": "60 minutes",
                 "started_at": "",
@@ -355,8 +455,13 @@ class WorkerPortalService:
             "quality": {
                 "date": "",
                 "weak_attempts": 0,
+                "consecutive_rejections": 0,
                 "last_rejected_fingerprint": "",
                 "strong_plans": 0,
+                "recent_details": [],
+                "warning_deadline_at": "",
+                "warning_reasons": [],
+                "auto_clocked_out_at": "",
             },
             "task_requests": [],
             "history": [],
@@ -778,33 +883,58 @@ class WorkerPortalService:
             raise ValueError("Choose a task before starting work.")
         outcome = _clean_text(payload.get("outcome"), limit=800)
         first_step = _clean_text(payload.get("first_step"), limit=500)
+        evidence_provided = "evidence" in payload
+        evidence = _clean_text(payload.get("evidence"), limit=500)
         estimate = _clean_text(payload.get("estimate"), limit=40).lower()
         checkpoint = _clean_text(payload.get("checkpoint"), limit=40).lower()
         if estimate not in _VALID_ESTIMATES or checkpoint not in _VALID_CHECKPOINTS:
             raise ValueError("Choose a time estimate and a checkpoint from the available options.")
-        today = datetime.now(timezone.utc).date().isoformat()
+        session, _ = self._live_session(user)
+        if (
+            session.stage == "active"
+            and not session.clocked_out_at
+            and self.runtime._active_task_id(session) == task_id
+            and str(session.metadata.get("task_onboarding_tangible_result") or "") == outcome
+            and str(session.metadata.get("task_onboarding_plan") or "") == first_step
+            and str(session.metadata.get("task_onboarding_evidence") or "") == evidence
+        ):
+            return "This live task and plan are already running; no duplicate time or Slack update was created."
+        if session.metadata.get(_QUALITY_RESTART_BLOCK_KEY):
+            raise ValueError(
+                "A prior quality warning expired. Submit the corrected plan to a manager and ask Erik or George to run the quality restart approval before work resumes."
+            )
+        today = session.session_date
         quality = state["quality"]
         if quality.get("date") != today:
-            quality.update({"date": today, "weak_attempts": 0, "last_rejected_fingerprint": ""})
+            quality.update(
+                {
+                    "date": today,
+                    "weak_attempts": 0,
+                    "consecutive_rejections": 0,
+                    "last_rejected_fingerprint": "",
+                }
+            )
         issues, fingerprint = validate_work_commitment(
             outcome,
             first_step,
+            evidence=evidence if evidence_provided else None,
             previous_fingerprint=str(quality.get("last_rejected_fingerprint") or ""),
+            recent_details=list(quality.get("recent_details") or []),
         )
         if issues:
-            quality["weak_attempts"] = int(quality.get("weak_attempts") or 0) + 1
-            quality["last_rejected_fingerprint"] = fingerprint
-            attempts = int(quality["weak_attempts"])
-            prefix = "A little more detail will make this useful."
-            if attempts >= 2:
-                prefix = "I’m seeing another vague or repeated answer."
-            if attempts >= 3:
-                prefix = "This is the third incomplete attempt today; manager approval is required before starting."
-            raise ValueError(
-                prefix
-                + " Clear details create a finish line and make handoffs possible. "
-                + " ".join(issues)
+            warning_started = await self._record_live_quality_rejection(
+                actor,
+                state,
+                fingerprint=fingerprint,
+                reasons=issues,
+                context="work plan",
             )
+            lead = (
+                "QUALITY WARNING: correct this within 10 minutes or Don Pollo will clock you out. "
+                if warning_started
+                else "A little more detail will make this useful. "
+            )
+            raise ValueError(lead + " ".join(issues))
 
         # Starting an open task is also the deliberate claim action. Existing co-owners remain assigned.
         await self._claim_task(actor, state, {"task_id": task_id})
@@ -819,14 +949,6 @@ class WorkerPortalService:
             if self.runtime._overtime_restart_blocked(session):
                 raise ValueError("The overtime limit was reached. A manager must approve more time before work restarts.")
             prior_task_id = self.runtime._active_task_id(session)
-            if (
-                session.stage == "active"
-                and not session.clocked_out_at
-                and prior_task_id == task_id
-                and str(session.metadata.get("task_onboarding_tangible_result") or "") == outcome
-                and str(session.metadata.get("task_onboarding_plan") or "") == first_step
-            ):
-                return "This live task and plan are already running; no duplicate time or Slack update was created."
             previous = self.runtime._clone_session_state(session)
             if prior_task_id and prior_task_id != task_id:
                 await self.runtime._pause_current_task_tracking(
@@ -850,6 +972,7 @@ class WorkerPortalService:
                 {
                     "task_onboarding_tangible_result": outcome,
                     "task_onboarding_plan": first_step,
+                    "task_onboarding_evidence": evidence,
                     "task_onboarding_estimate": estimate,
                     "task_onboarding_checkpoint": checkpoint,
                     "clickup_selection_reason": "Selected in live worker portal",
@@ -857,11 +980,16 @@ class WorkerPortalService:
                 }
             )
             await self.runtime._activate_clickup_task(user, session, now, task_id, task_name)
+            self._accept_quality_detail(
+                state,
+                session,
+                "\n".join((outcome, first_step, evidence)),
+            )
             self._append_live_event(
                 user,
                 session,
                 now,
-                f"Started {task_name}. Result: {outcome} First move: {first_step} Estimate: {estimate}; checkpoint: {checkpoint}.",
+                f"Started {task_name}. Result: {outcome} First move: {first_step} Evidence: {evidence} Estimate: {estimate}; checkpoint: {checkpoint}.",
             )
             await self._notify_live(
                 user,
@@ -871,7 +999,6 @@ class WorkerPortalService:
             )
             await self._persist_live_action(user, session, previous, now, "portal_start")
         quality["strong_plans"] = int(quality.get("strong_plans") or 0) + 1
-        quality["last_rejected_fingerprint"] = ""
         return "Live work started. The durable time record and ClickUp task timer are running."
 
     async def _check_in_live_work(
@@ -883,9 +1010,37 @@ class WorkerPortalService:
         user = self._live_user(actor)
         progress = _clean_text(payload.get("progress"), limit=800)
         blocker = _clean_text(payload.get("blocker"), limit=500)
-        issue, _ = validate_meaningful_work_detail(progress, purpose="progress update")
+        quality = state["quality"]
+        current_session, _ = self._live_session(user)
+        if quality.get("date") != current_session.session_date:
+            quality.update(
+                {
+                    "date": current_session.session_date,
+                    "weak_attempts": 0,
+                    "consecutive_rejections": 0,
+                    "last_rejected_fingerprint": "",
+                }
+            )
+        issue, fingerprint = validate_meaningful_work_detail(
+            progress,
+            purpose="progress update",
+            previous_fingerprint=str(quality.get("last_rejected_fingerprint") or ""),
+            recent_details=list(quality.get("recent_details") or []),
+        )
         if issue:
-            raise ValueError(issue)
+            warning_started = await self._record_live_quality_rejection(
+                actor,
+                state,
+                fingerprint=fingerprint,
+                reasons=[issue],
+                context="checkpoint",
+            )
+            lead = (
+                "QUALITY WARNING: correct this within 10 minutes or Don Pollo will clock you out. "
+                if warning_started
+                else "Please make this checkpoint useful. "
+            )
+            raise ValueError(lead + issue)
         lock = self.runtime._user_session_lock(user.user_key)
         async with lock:
             session, now = self._live_session(user)
@@ -894,6 +1049,7 @@ class WorkerPortalService:
             previous = self.runtime._clone_session_state(session)
             session.latest_status = progress
             session.latest_blocker = blocker or None
+            self._accept_quality_detail(state, session, progress)
             self._append_live_event(
                 user,
                 session,
@@ -902,6 +1058,93 @@ class WorkerPortalService:
             )
             await self._persist_live_action(user, session, previous, now, "portal_checkpoint")
         return "Checkpoint saved to the durable work record and queued for ClickUp sync."
+
+    async def _record_live_quality_rejection(
+        self,
+        actor: PortalActor,
+        state: dict[str, Any],
+        *,
+        fingerprint: str,
+        reasons: list[str],
+        context: str,
+    ) -> bool:
+        quality = state["quality"]
+        quality["weak_attempts"] = int(quality.get("weak_attempts") or 0) + 1
+        quality["consecutive_rejections"] = int(quality.get("consecutive_rejections") or 0) + 1
+        quality["last_rejected_fingerprint"] = fingerprint
+        repeated = any(
+            "same answer" in reason.lower()
+            or "copy" in reason.lower()
+            or "identical" in reason.lower()
+            for reason in reasons
+        )
+        user = self._live_user(actor)
+        lock = self.runtime._user_session_lock(user.user_key)
+        async with lock:
+            session, now = self._live_session(user)
+            if session.stage != "active" or session.clocked_out_at:
+                return False
+            previous = self.runtime._clone_session_state(session)
+            existing = session.metadata.get(_QUALITY_WARNING_KEY)
+            existing = existing if isinstance(existing, dict) else {}
+            if existing.get("deadline_at"):
+                quality["warning_deadline_at"] = str(existing.get("deadline_at") or "")
+                quality["warning_reasons"] = list(existing.get("reasons") or reasons)
+                return True
+            # One coached miss per workday is allowed. A second miss, or a
+            # high-confidence repeat/copy, opens the visible correction window.
+            if int(quality["weak_attempts"]) < 2 and not repeated:
+                return False
+            deadline = now + timedelta(minutes=_QUALITY_WARNING_MINUTES)
+            warning = {
+                "status": "pending_correction",
+                "started_at": now.isoformat(),
+                "deadline_at": deadline.isoformat(),
+                "context": context,
+                "reasons": list(dict.fromkeys(reasons))[:4],
+            }
+            session.metadata[_QUALITY_WARNING_KEY] = warning
+            quality["warning_deadline_at"] = deadline.isoformat()
+            quality["warning_reasons"] = list(warning["reasons"])
+            self._append_live_event(
+                user,
+                session,
+                now,
+                f"Quality warning opened for rejected {context}: " + " ".join(reasons),
+            )
+            await self._notify_live(
+                user,
+                session,
+                now,
+                (
+                    "QUALITY WARNING: your submitted work detail was rejected because it was vague or repeated. "
+                    "Submit a specific result/checkpoint and evidence in the worker website within 10 minutes. "
+                    "If it is not corrected, Don Pollo will stop future time at the deadline. "
+                    "Time already recorded remains intact. Stop work at the deadline and contact Erik or George."
+                ),
+            )
+            await self._persist_live_action(user, session, previous, now, "portal_quality_warning")
+            return True
+
+    @staticmethod
+    def _accept_quality_detail(
+        state: dict[str, Any],
+        session: SessionState,
+        detail: str,
+    ) -> None:
+        quality = state["quality"]
+        cleaned = _clean_text(detail, limit=1600)
+        recent = [cleaned] + [
+            str(item)
+            for item in list(quality.get("recent_details") or [])
+            if str(item).strip() and _normalize_detail(str(item)) != _normalize_detail(cleaned)
+        ]
+        quality["recent_details"] = recent[:20]
+        quality["consecutive_rejections"] = 0
+        quality["last_rejected_fingerprint"] = ""
+        quality["warning_deadline_at"] = ""
+        quality["warning_reasons"] = []
+        session.metadata.pop(_QUALITY_WARNING_KEY, None)
 
     async def _start_live_short_rest(self, actor: PortalActor) -> str:
         user = self._live_user(actor)
@@ -1006,14 +1249,20 @@ class WorkerPortalService:
         async with lock:
             session, now = self._live_session(user)
             previous = self.runtime._clone_session_state(session)
-            changed = await self.runtime._maybe_check_short_rest_break(None, user, session, now)
+            enforce_quality = getattr(self.runtime, "_maybe_enforce_portal_quality_warning", None)
+            changed = bool(
+                callable(enforce_quality)
+                and await enforce_quality(None, user, session, now)
+            )
+            if not changed:
+                changed = await self.runtime._maybe_check_short_rest_break(None, user, session, now)
             if changed:
                 await self._persist_live_action(
                     user,
                     session,
                     previous,
                     now,
-                    "portal_short_rest_deadline",
+                    "portal_deadline_enforcement",
                 )
 
     def _sync_state_from_live_session(
@@ -1038,6 +1287,8 @@ class WorkerPortalService:
         active_task_id = str(self.runtime._active_task_id(session) or "")
         active_task_name = str(session.metadata.get("active_clickup_task_name") or "")
         lunch_started = str(session.metadata.get("lunch_started_at") or "")
+        quality_warning = session.metadata.get(_QUALITY_WARNING_KEY)
+        quality_warning = quality_warning if isinstance(quality_warning, dict) else {}
         minimum_end = ""
         if lunch_started:
             parsed = _parse_datetime(lunch_started)
@@ -1060,6 +1311,7 @@ class WorkerPortalService:
                 ),
                 "outcome": str(session.metadata.get("task_onboarding_tangible_result") or work.get("outcome") or ""),
                 "first_step": str(session.metadata.get("task_onboarding_plan") or work.get("first_step") or ""),
+                "evidence": str(session.metadata.get("task_onboarding_evidence") or work.get("evidence") or ""),
                 "estimate": str(session.metadata.get("task_onboarding_estimate") or work.get("estimate") or "1 hour"),
                 "checkpoint": str(session.metadata.get("task_onboarding_checkpoint") or work.get("checkpoint") or "60 minutes"),
                 "started_at": str(session.clocked_in_at or ""),
@@ -1068,12 +1320,22 @@ class WorkerPortalService:
                 "break_minimum_end_at": minimum_end,
                 "latest_progress": str(session.latest_status or ""),
                 "latest_blocker": str(session.latest_blocker or ""),
-                "notice": self._live_notice(status_value),
+                "notice": self._live_notice(status_value, quality_warning=quality_warning),
             }
+        )
+        quality = state["quality"]
+        quality["warning_deadline_at"] = str(quality_warning.get("deadline_at") or "")
+        quality["warning_reasons"] = list(quality_warning.get("reasons") or [])
+        quality["auto_clocked_out_at"] = str(
+            (session.metadata.get(_QUALITY_RESTART_BLOCK_KEY) or {}).get("clocked_out_at")
+            if isinstance(session.metadata.get(_QUALITY_RESTART_BLOCK_KEY), dict)
+            else ""
         )
 
     @staticmethod
-    def _live_notice(status_value: str) -> str:
+    def _live_notice(status_value: str, *, quality_warning: dict[str, Any] | None = None) -> str:
+        if quality_warning and quality_warning.get("deadline_at"):
+            return "A quality correction is due now. Submit concrete progress before the visible deadline."
         return {
             "active": "Live work and ClickUp task time are running.",
             "short_rest": "Paid short rest is live. Check back in before the 10-minute cutoff.",
@@ -1144,6 +1406,8 @@ class WorkerPortalService:
             raise ValueError("Choose a task before starting the timer.")
         outcome = _clean_text(payload.get("outcome"), limit=800)
         first_step = _clean_text(payload.get("first_step"), limit=500)
+        evidence_provided = "evidence" in payload
+        evidence = _clean_text(payload.get("evidence"), limit=500)
         estimate = _clean_text(payload.get("estimate"), limit=40).lower()
         checkpoint = _clean_text(payload.get("checkpoint"), limit=40).lower()
         if estimate not in _VALID_ESTIMATES or checkpoint not in _VALID_CHECKPOINTS:
@@ -1155,7 +1419,9 @@ class WorkerPortalService:
         issues, fingerprint = validate_work_commitment(
             outcome,
             first_step,
+            evidence=evidence if evidence_provided else None,
             previous_fingerprint=str(quality.get("last_rejected_fingerprint") or ""),
+            recent_details=list(quality.get("recent_details") or []),
         )
         if issues:
             quality["weak_attempts"] = int(quality.get("weak_attempts") or 0) + 1
@@ -1175,6 +1441,7 @@ class WorkerPortalService:
                 "status": "active",
                 "outcome": outcome,
                 "first_step": first_step,
+                "evidence": evidence,
                 "estimate": estimate,
                 "checkpoint": checkpoint,
                 "started_at": datetime.now(timezone.utc).isoformat(),
@@ -1186,6 +1453,8 @@ class WorkerPortalService:
         )
         quality["strong_plans"] = int(quality.get("strong_plans") or 0) + 1
         quality["last_rejected_fingerprint"] = ""
+        quality["consecutive_rejections"] = 0
+        quality["recent_details"] = (["\n".join((outcome, first_step, evidence))] + list(quality.get("recent_details") or []))[:20]
         return "Strong plan. The beta timer is running, and your next checkpoint is visible."
 
     def _check_in(self, state: dict[str, Any], payload: dict[str, Any]) -> str:
@@ -1309,6 +1578,7 @@ class WorkerPortalService:
             f"• Task: {task_name}",
             f"• Intended result: {work.get('outcome') or 'not entered'}",
             f"• First step: {work.get('first_step') or 'not entered'}",
+            f"• Evidence: {work.get('evidence') or 'not entered'}",
             f"• Estimate / checkpoint: {work.get('estimate') or '—'} / {work.get('checkpoint') or '—'}",
         ]
         if work.get("latest_progress"):
@@ -1362,6 +1632,7 @@ class WorkerPortalService:
             "work": work,
             "time": self._time_payload(actor, work, now),
             "quality": state["quality"],
+            "overhead_lanes": _OVERHEAD_LANES,
             "task_options": tasks[:5],
             "task_catalog": self._task_catalog(tasks),
             "task_total": len(tasks),
@@ -1554,6 +1825,34 @@ def _is_vague(value: str, *, minimum_words: int, minimum_characters: int) -> boo
     )
 
 
+def _normalize_detail(value: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9][a-z0-9'-]*", _clean_text(value, limit=2000).lower()))
+
+
+def _duplicate_detail_issue(value: str, recent_details: list[str]) -> str | None:
+    normalized = _normalize_detail(value)
+    if not normalized:
+        return None
+    current_tokens = set(normalized.split())
+    for prior in recent_details[-20:]:
+        prior_normalized = _normalize_detail(str(prior))
+        if not prior_normalized:
+            continue
+        if normalized == prior_normalized:
+            return (
+                "This copies a previous submission. Describe what is different now and name the new evidence."
+            )
+        prior_tokens = set(prior_normalized.split())
+        union = current_tokens | prior_tokens
+        overlap = len(current_tokens & prior_tokens) / len(union) if union else 0.0
+        sequence = SequenceMatcher(None, normalized, prior_normalized).ratio()
+        if min(len(current_tokens), len(prior_tokens)) >= 7 and overlap >= 0.86 and sequence >= 0.86:
+            return (
+                "This is nearly identical to a previous submission. State the new result, change, or evidence instead of reusing boilerplate."
+            )
+    return None
+
+
 def _parse_datetime(value: Any) -> datetime | None:
     try:
         parsed = datetime.fromisoformat(str(value or ""))
@@ -1606,6 +1905,13 @@ def _portal_template() -> str:
     .hero-main p { color:#d4e0da; max-width:66ch; }
     .hero-main strong { color:#ffd3ad; }
     .notice { border-left:4px solid var(--orange); padding:12px 14px; border-radius:10px; background:#fff3e8; color:#653819; }
+    .quality-warning { display:none; margin:0 0 14px; border:2px solid var(--danger); border-radius:15px; padding:15px; background:#fff0ed; color:#6d2019; }
+    .quality-warning.show { display:block; }
+    .quality-warning strong { display:block; font-size:1.02rem; }
+    .quality-countdown { font-size:1.5rem; font-weight:900; font-variant-numeric:tabular-nums; }
+    .lane-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:9px; margin-top:12px; }
+    .lane { min-height:68px; text-align:left; border:1px solid var(--line); border-radius:13px; padding:10px 12px; background:white; color:var(--ink); font-weight:800; }
+    .lane.selected { border-color:var(--teal); background:var(--soft); }
     .section-head { display:flex; align-items:flex-end; justify-content:space-between; gap:12px; margin-bottom:14px; }
     .task-grid { display:grid; grid-template-columns:repeat(5,minmax(180px,1fr)); gap:12px; overflow-x:auto; padding:2px 2px 8px; }
     .task { min-height:218px; text-align:left; border:1px solid var(--line); border-radius:17px; padding:16px; background:white; display:flex; flex-direction:column; gap:8px; color:var(--ink); }
@@ -1671,8 +1977,8 @@ def _portal_template() -> str:
     #toast { position:fixed; right:18px; bottom:18px; width:min(420px,calc(100% - 36px)); padding:14px 16px; border-radius:14px; background:var(--ink); color:white; box-shadow:0 12px 40px rgba(0,0,0,.2); transform:translateY(140%); transition:.2s ease; z-index:10; }
     #toast.show { transform:translateY(0); }
     #toast.error { background:var(--danger); }
-    @media (max-width:900px) { .layout { grid-template-columns:1fr; } .topbar { position:static; } .task-grid { grid-template-columns:repeat(5,240px); } }
-    @media (max-width:600px) { .shell { width:min(100% - 16px,100%); margin:8px auto 40px; } .topbar,.panel { border-radius:16px; padding:16px; } .topbar { align-items:flex-start; } .status { display:none; } .time-strip { grid-template-columns:1fr 1fr; } .time-card.primary { grid-column:1/-1; } .form-grid,.profile-summary,.catalog-tools { grid-template-columns:1fr; } .task-grid { grid-template-columns:1fr; overflow:visible; } .task { min-height:0; } .actions .button { min-height:44px; } .work-now .actions .primary { flex:1 1 100%; } .catalog-task { grid-template-columns:1fr; } .catalog-task .button { width:100%; } }
+    @media (max-width:900px) { .layout { grid-template-columns:1fr; } .topbar { position:static; } .task-grid { grid-template-columns:repeat(5,240px); } .lane-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+    @media (max-width:600px) { .shell { width:min(100% - 16px,100%); margin:8px auto 40px; } .topbar,.panel { border-radius:16px; padding:16px; } .topbar { align-items:flex-start; } .status { display:none; } .time-strip { grid-template-columns:1fr 1fr; } .time-card.primary { grid-column:1/-1; } .form-grid,.profile-summary,.catalog-tools,.lane-grid { grid-template-columns:1fr; } .task-grid { grid-template-columns:1fr; overflow:visible; } .task { min-height:0; } .actions .button { min-height:44px; } .work-now .actions .primary { flex:1 1 100%; } .catalog-task { grid-template-columns:1fr; } .catalog-task .button { width:100%; } }
   </style>
 </head>
 <body>
@@ -1683,6 +1989,7 @@ def _portal_template() -> str:
     </header>
     <section class="panel work-now" id="work-now">
       <div class="section-head"><div><div class="eyebrow">Work now</div><h2>Start or continue useful work</h2></div><span class="pill" id="quality-pill">0 strong plans</span></div>
+      <div class="quality-warning" id="quality-warning" role="alert"><strong>Specific correction required</strong><span class="quality-countdown" id="quality-countdown">10:00</span><p id="quality-reasons" style="margin:6px 0"></p><p style="margin:0">Submit a concrete result or checkpoint before the deadline. Otherwise Don Pollo will stop future time. Time already recorded stays intact; stop work and contact Erik or George if the clock stops.</p></div>
       <div class="time-strip" aria-live="polite">
         <div class="time-card primary"><small>Today worked</small><strong class="time-value" id="today-time">0:00:00</strong><span class="time-detail" id="session-state">Not clocked in</span></div>
         <div class="time-card"><small>Current task timer</small><strong class="time-value" id="current-task-time">0:00:00</strong><span class="time-detail" id="current-task-label">No task running</span></div>
@@ -1693,6 +2000,7 @@ def _portal_template() -> str:
       <div class="form-grid">
         <label>By the next checkpoint, what will exist or be demonstrably different?<textarea id="outcome" placeholder="Example: A tested mounting bracket CAD revision with the hole pattern corrected and a screenshot attached."></textarea></label>
         <label>What is the first concrete move?<textarea id="first-step" placeholder="Example: Open revision 3, measure the current hole spacing, and update the sketch constraints."></textarea></label>
+        <label style="grid-column:1/-1">What evidence will show the result?<textarea id="evidence" placeholder="Example: Upload the revised CAD screenshot and record the measured hole spacing in the task."></textarea></label>
         <label>Rough estimate<select id="estimate"><option>30 minutes</option><option selected>1 hour</option><option>2 hours</option><option>half day</option><option>full day</option><option>multi-day</option></select></label>
         <label>Reconsider / ask for help after<select id="checkpoint"><option>30 minutes</option><option selected>60 minutes</option><option>90 minutes</option><option>2 hours</option></select></label>
       </div>
@@ -1703,6 +2011,12 @@ def _portal_template() -> str:
       <details class="chooser-details" id="recommended-details" open>
         <summary class="chooser-summary"><span><span class="eyebrow">Quick choice</span><br><h2>Five best next options</h2></span><span class="pill" id="task-count">5 options</span></summary>
         <div class="chooser-body"><p class="muted">Ranked from your assignments, priorities, active work, interests, and skills.</p><div class="notice" id="task-warning" hidden></div><div class="task-grid" id="task-grid"></div></div>
+      </details>
+    </section>
+    <section class="panel section-space">
+      <details class="chooser-details" id="overhead-details">
+        <summary class="chooser-summary"><span><span class="eyebrow">Non-contract work</span><br><h2>Choose where overhead time belongs</h2></span><span class="pill">8 lanes</span></summary>
+        <div class="chooser-body"><p class="muted">Use these for necessary company work. Don Pollo will help find an existing ClickUp task; a genuinely new task still goes to Erik or George for approval before timing.</p><div class="lane-grid" id="overhead-lanes"></div></div>
       </details>
     </section>
     <section class="panel section-space">
@@ -1736,13 +2050,13 @@ def _portal_template() -> str:
     let renderedProfileSavedAt = null;
     let chooserInitialized = false;
     const dirtyFields = new Set();
-    const editableFieldIds = new Set(['outcome','first-step','estimate','checkpoint','progress','blocker','weekly-hours','start-time','end-time','time-off','interests','skills']);
+    const editableFieldIds = new Set(['outcome','first-step','evidence','estimate','checkpoint','progress','blocker','weekly-hours','start-time','end-time','time-off','interests','skills']);
     function syncInput(id, value) {
       if (!dirtyFields.has(id)) $(id).value = value ?? '';
     }
     function clearSubmittedDraft(action) {
       const submittedFields = {
-        start: ['outcome','first-step','estimate','checkpoint'],
+        start: ['outcome','first-step','evidence','estimate','checkpoint'],
         check_in: ['progress','blocker'],
         clock_out: ['progress','blocker'],
         save_profile: ['weekly-hours','workdays','start-time','end-time','time-off','interests','skills'],
@@ -1783,9 +2097,15 @@ def _portal_template() -> str:
       $('current-task-label').textContent = time.current_task_name || work.selected_task_name || 'No task running';
       const lunchSeconds = Number(time.unpaid_lunch_seconds || 0);
       $('lunch-time').textContent = lunchSeconds > 0 ? `Unpaid lunch excluded: ${formatDuration(lunchSeconds)}` : 'No unpaid lunch recorded';
+      const quality = data.quality || {};
+      const deadline = Date.parse(quality.warning_deadline_at || '');
+      const remaining = Number.isFinite(deadline) ? Math.max(0, Math.ceil((deadline - Date.now()) / 1000)) : 0;
+      $('quality-warning').classList.toggle('show', Number.isFinite(deadline) && remaining >= 0);
+      $('quality-countdown').textContent = `${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2,'0')}`;
     }
     function renderTaskCatalog() {
       const query = String($('task-search').value || '').trim().toLowerCase();
+      const queryTerms = query.split(/\s+/).filter(Boolean);
       const assignedOnly = $('assigned-only').checked;
       const openGroups = new Set([...document.querySelectorAll('#task-catalog details[open]')].map(node => node.dataset.groupKey));
       const contracts = (data.task_catalog || []).map((contract) => {
@@ -1795,7 +2115,7 @@ def _portal_template() -> str:
             const visibleTasks = (taskList.tasks || []).filter((task) => {
               if (assignedOnly && !task.assigned) return false;
               const searchable = [task.name,task.status,task.priority,task.location,contract.name,space.name,taskList.name].join(' ').toLowerCase();
-              return !query || searchable.includes(query);
+              return !query || searchable.includes(query) || queryTerms.some(term => searchable.includes(term));
             });
             if (!visibleTasks.length) return '';
             const rows = visibleTasks.map((task) => { const owners=(task.assignees || []).join(', ') || 'Unassigned'; const due=task.due_date ? ` · Due ${esc(task.due_date)}` : ''; return `<div class="catalog-task"><div><strong>${esc(task.name)}</strong><div class="meta">${task.assigned ? 'Assigned to you · ' : ''}${esc(task.priority)} · ${esc(task.status)}${due} · Owners: ${esc(owners)}</div></div><div class="actions" style="margin:0"><button class="button" data-select-task="${esc(task.id)}" data-task-name="${esc(task.name)}" data-task-location="${esc(task.location)}">Choose</button><button class="button orange" data-claim-task="${esc(task.id)}" data-task-name="${esc(task.name)}" data-task-location="${esc(task.location)}"${task.assigned ? ' disabled' : ''}>${task.assigned ? 'Already mine' : 'Claim'}</button></div></div>`; }).join('');
@@ -1830,6 +2150,7 @@ def _portal_template() -> str:
       $('clock-pill').classList.toggle('running', ['active','short_rest'].includes(work.status));
       renderTimers();
       $('work-notice').innerHTML = work.notice ? `<div class="notice">${esc(work.notice)}</div>` : '';
+      $('quality-reasons').textContent = (quality.warning_reasons || []).join(' ');
       $('schedule-line').textContent = `${Number(profile.weekly_target_hours || 0)} hours/week · ${(profile.regular_workdays || []).map(day => day.slice(0,3)).join(', ')} · ${profile.typical_start_time || '—'}–${profile.typical_end_time || '—'}`;
       $('skills-line').textContent = (profile.skills || []).join(', ') || 'Not set';
       $('interests-line').textContent = (profile.interests || []).join(', ') || 'Not set';
@@ -1839,10 +2160,12 @@ def _portal_template() -> str:
       $('task-count').textContent = `${tasks.length} option${tasks.length === 1 ? '' : 's'}`;
       $('task-total').textContent = `${Number(data.task_total || 0)} open tasks`;
       $('task-grid').innerHTML = tasks.map((task,index) => `<button class="task ${task.id === work.selected_task_id ? 'selected' : ''}" data-select-task="${esc(task.id)}" data-task-name="${esc(task.name)}" data-task-location="${esc(task.location)}"><span class="number">${index+1}</span><h3>${esc(task.name)}</h3><div class="tagrow">${task.recommended ? '<span class="tag recommended">Recommended</span>' : ''}${task.assigned ? '<span class="tag">Assigned to you</span>' : ''}<span class="tag">${esc(task.priority)}</span><span class="tag">${esc(task.status)}</span>${task.due_date ? `<span class="tag">Due ${esc(task.due_date)}</span>` : ''}</div><div class="muted">${esc(task.location)}</div><div class="why">Why: ${esc(task.reason)}</div></button>`).join('');
+      $('overhead-lanes').innerHTML = (data.overhead_lanes || []).map((lane,index) => `<button class="lane ${lane.id === work.overhead_lane_id ? 'selected' : ''}" data-overhead-lane="${esc(lane.id)}" data-lane-search="${esc(lane.search)}" data-lane-name="${esc(lane.name)}"><span class="number">${index+1}</span> ${esc(lane.name)}</button>`).join('');
       renderTaskCatalog();
       $('selected-task').innerHTML = work.selected_task_name ? `<strong>${esc(work.selected_task_name)}</strong><br><span class="muted">${esc(work.selected_task_location || '')}</span>` : 'Choose an option above.';
       syncInput('outcome', work.outcome || '');
       syncInput('first-step', work.first_step || '');
+      syncInput('evidence', work.evidence || '');
       syncInput('estimate', work.estimate || '1 hour');
       syncInput('checkpoint', work.checkpoint || '60 minutes');
       syncInput('progress', work.latest_progress || '');
@@ -1875,7 +2198,7 @@ def _portal_template() -> str:
     }
     function actionPayload(action) {
       const apiAction = action.replaceAll('-','_');
-      if (apiAction === 'start') return {action:apiAction, outcome:$('outcome').value, first_step:$('first-step').value, estimate:$('estimate').value, checkpoint:$('checkpoint').value};
+      if (apiAction === 'start') return {action:apiAction, outcome:$('outcome').value, first_step:$('first-step').value, evidence:$('evidence').value, estimate:$('estimate').value, checkpoint:$('checkpoint').value};
       if (apiAction === 'check_in') return {action:apiAction, progress:$('progress').value, blocker:$('blocker').value};
       if (apiAction === 'clock_out') return {action:apiAction, progress:$('progress').value, blocker:$('blocker').value};
       if (apiAction === 'claim_task') return {action:apiAction, task_id:(data.work || {}).selected_task_id};
@@ -1896,6 +2219,8 @@ def _portal_template() -> str:
       finally { if (button && button.isConnected) { button.disabled = false; button.textContent = original; } }
     }
     document.addEventListener('click', (event) => {
+      const lane = event.target.closest('[data-overhead-lane]');
+      if (lane) return post({action:'select_overhead_lane',lane_id:lane.dataset.overheadLane},lane).then((saved) => { if (!saved) return; $('task-search').value=lane.dataset.laneSearch || lane.dataset.laneName || ''; $('catalog-details').open=true; $('request-type').value='overhead'; $('request-title').placeholder=`Concrete result for ${lane.dataset.laneName || 'overhead work'}`; renderTaskCatalog(); $('catalog-details').scrollIntoView({behavior:'smooth',block:'start'}); });
       const claim = event.target.closest('[data-claim-task]');
       if (claim) return post({action:'claim_task',task_id:claim.dataset.claimTask},claim).then((saved) => { if (!saved) return; $('recommended-details').open=false; $('catalog-details').open=false; if (window.innerWidth <= 600) $('work-now').scrollIntoView({behavior:'smooth',block:'start'}); });
       const task = event.target.closest('[data-select-task]');

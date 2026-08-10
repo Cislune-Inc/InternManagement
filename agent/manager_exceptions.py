@@ -171,6 +171,39 @@ def _person_exceptions(person: dict[str, Any]) -> list[dict[str, Any]]:
                 {"pending_review_count": pending_reviews},
             )
         )
+    quality_warning = person.get("portal_quality_warning")
+    if isinstance(quality_warning, dict) and quality_warning.get("deadline_at"):
+        rows.append(
+            _exception(
+                base,
+                "warning",
+                "quality_correction_due",
+                "Worker has a 10-minute work-detail correction deadline.",
+                {
+                    "deadline_at": quality_warning.get("deadline_at"),
+                    "context": quality_warning.get("context"),
+                    "reasons": quality_warning.get("reasons") or [],
+                    "action": "Worker can clear this by submitting concrete detail before the deadline.",
+                },
+            )
+        )
+    quality_block = person.get("portal_quality_restart_blocked")
+    if isinstance(quality_block, dict) and quality_block:
+        rows.append(
+            _exception(
+                base,
+                "error",
+                "quality_restart_approval",
+                "Worker was clocked out after an uncorrected quality warning and needs manager review.",
+                {
+                    **quality_block,
+                    "approval_command": (
+                        f"run review.quality_restart user={base['user_key']} "
+                        'comments="Reviewed corrected plan and approved scope."'
+                    ),
+                },
+            )
+        )
     active_task_id = str(person.get("active_task_id") or "")
     timer_task_id = str(person.get("active_timer_task_id") or "")
     if active_task_id and timer_task_id and active_task_id != timer_task_id:

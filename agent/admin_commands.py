@@ -1325,6 +1325,26 @@ class AdminCommandRouter:
             comments=comments,
         )
 
+    async def _command_review_quality_restart(
+        self,
+        client: discord.Client | None,
+        snapshots: list[UserDailySnapshot],
+        args: dict[str, str],
+    ) -> str:
+        snapshot = self._snapshot_or_error(args.get("user"), snapshots)
+        if isinstance(snapshot, str):
+            return snapshot
+        comments = (args.get("comments") or "").strip()
+        if not comments:
+            return "I need `comments=` describing the corrected plan or allowed scope."
+        return await self.runtime.approve_portal_quality_restart(
+            client,
+            snapshot.user,
+            snapshot.session,
+            approved_by=self._active_admin_name(),
+            comments=comments,
+        )
+
     async def _command_review_task_proposal_approve(
         self,
         client: discord.Client | None,
@@ -1908,6 +1928,27 @@ class AdminCommandRouter:
                 f"Reason: {comments}"
             ),
             command_id="review.overtime_approve",
+            args=dict(args),
+        )
+
+    async def _preview_review_quality_restart(
+        self,
+        snapshots: list[UserDailySnapshot],
+        args: dict[str, str],
+    ) -> AdminActionPreview:
+        target = self._snapshot_or_error(args.get("user"), snapshots)
+        label = args.get("user") or "that user"
+        if isinstance(target, UserDailySnapshot):
+            label = target.user.display_name
+        comments = (args.get("comments") or "No reviewed correction provided.").strip()
+        return AdminActionPreview(
+            title="Preview `review.quality_restart`",
+            summary=(
+                f"{label}'s quality-based restart gate will be released after review. "
+                "The worker will be told to clock back in before continuing.\n\n"
+                f"Reviewed correction: {comments}"
+            ),
+            command_id="review.quality_restart",
             args=dict(args),
         )
 

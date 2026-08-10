@@ -948,6 +948,75 @@ def test_overtime_compliance_auto_clock_out_notifies_slack_only_worker() -> None
     assert "automatically clocked you out" in posted[0][1]
 
 
+def test_portal_quality_deadline_stops_future_time_and_requires_manager_release() -> None:
+    runtime = _build_runtime()
+    messages: list[str] = []
+
+    async def send_dm(_client, _user, _session, content: str, _now, **_kwargs):
+        messages.append(content)
+        return None
+
+    async def finalize_day(*_args, **_kwargs):
+        return "Task timer stopped."
+
+    runtime._send_dm = send_dm  # type: ignore[method-assign]
+    runtime._finalize_clickup_day = finalize_day  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="aj",
+        display_name="AJ",
+        slack_user_id="UAJ",
+        preferred_transport="slack",
+    )
+    session = SessionState(
+        user_key="aj",
+        session_date="2026-08-10",
+        stage="active",
+        clocked_in_at="2026-08-10T09:00:00-07:00",
+        work_segments=[
+            {"clocked_in_at": "2026-08-10T09:00:00-07:00", "clocked_out_at": None}
+        ],
+        metadata={
+            "portal_quality_warning": {
+                "started_at": "2026-08-10T09:50:00-07:00",
+                "deadline_at": "2026-08-10T10:00:00-07:00",
+                "context": "checkpoint",
+                "reasons": ["The update repeated a prior submission."],
+            }
+        },
+    )
+
+    changed = asyncio.run(
+        runtime._maybe_enforce_portal_quality_warning(
+            None,
+            user,
+            session,
+            datetime.fromisoformat("2026-08-10T10:02:00-07:00"),
+        )
+    )
+
+    assert changed is True
+    assert session.clocked_out_at == "2026-08-10T10:00:00-07:00"
+    assert session.work_segments[0]["clocked_out_at"] == "2026-08-10T10:00:00-07:00"
+    assert session.metadata["portal_quality_restart_blocked"]["status"] == "manager_approval_required"
+    assert session.metadata["auto_clock_out_reason"] == "Worker portal quality correction deadline expired."
+    assert any("Time already recorded remains intact" in message for message in messages)
+
+    approved = asyncio.run(
+        runtime.approve_portal_quality_restart(
+            None,
+            user,
+            session,
+            approved_by="Erik",
+            comments="Reviewed the corrected fixture result and evidence target.",
+            now=datetime.fromisoformat("2026-08-10T10:05:00-07:00"),
+        )
+    )
+    assert "Approved tracked-work restart" in approved
+    assert "portal_quality_restart_blocked" not in session.metadata
+    assert session.stage == "clocked_out"
+    assert any("approved a tracked-work restart" in message for message in messages)
+
+
 def test_overtime_compliance_notifies_admin_only_when_risk_remains_unresolved() -> None:
     runtime = _build_runtime()
     runtime.config.labor.auto_clock_out_at_overtime_limit = False

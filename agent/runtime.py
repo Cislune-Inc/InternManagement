@@ -94,6 +94,8 @@ _PROGRESS_PROBE_HISTORY_KEY = "progress_probe_history"
 _FOLLOW_UP_PROBE_GRACE_WINDOW = timedelta(minutes=1)
 _PROGRESS_PROBE_TIMEOUT = timedelta(minutes=30)
 _AUTO_CLOCK_OUT_WARNING_KEY = "auto_clock_out_warning"
+_PORTAL_QUALITY_WARNING_KEY = "portal_quality_warning"
+_PORTAL_QUALITY_RESTART_BLOCK_KEY = "portal_quality_restart_blocked"
 _SHORT_REST_ACTIVE_KEY = "short_rest_break_active"
 _SHORT_REST_HISTORY_KEY = "short_rest_breaks"
 _SLACK_USER_MIN_POST_INTERVAL = timedelta(minutes=90)
@@ -1666,6 +1668,19 @@ class InternManagementRuntime:
     ) -> bool:
         if session.clocked_in_at or not getattr(signals, "clocked_in", False):
             return False
+        if self._quality_restart_blocked(session):
+            await self._send_dm(
+                client,
+                user,
+                session,
+                (
+                    "A work-detail quality warning expired earlier today. I cannot restart tracked time "
+                    "until Erik or George reviews the corrected plan and approves the restart. "
+                    "Do not work off the clock; report any work already performed so the record can be corrected."
+                ),
+                now,
+            )
+            return True
         session.clocked_in_at = now.isoformat()
         session.clocked_out_at = None
         self._start_new_work_segment(session, now)
@@ -1706,6 +1721,19 @@ class InternManagementRuntime:
                     "You were clocked out at the unapproved overtime limit. "
                     "I cannot restart work time today until Erik or George approves it. "
                     "Any work you actually perform must still be reported so the record can be corrected."
+                ),
+                now,
+            )
+            return True
+        if self._quality_restart_blocked(session):
+            await self._send_dm(
+                client,
+                user,
+                session,
+                (
+                    "A work-detail quality warning expired earlier today. I cannot restart tracked time "
+                    "until Erik or George reviews the corrected plan and approves the restart. "
+                    "Do not work off the clock; report any work already performed so the record can be corrected."
                 ),
                 now,
             )
@@ -1762,6 +1790,10 @@ class InternManagementRuntime:
         return str(session.metadata.get("auto_clock_out_reason") or "") == (
             "Configured overtime limit reached."
         )
+
+    @staticmethod
+    def _quality_restart_blocked(session: SessionState) -> bool:
+        return bool(session.metadata.get(_PORTAL_QUALITY_RESTART_BLOCK_KEY))
 
     async def _begin_daily_clock_in_intake(
         self,
@@ -1911,6 +1943,18 @@ class InternManagementRuntime:
             if normalized_changed:
                 changed = True
                 reasons.append("normalized_session_state")
+            if await self._maybe_enforce_portal_quality_warning(client, user, session, now):
+                changed = True
+                reasons.append("portal_quality_auto_clock_out")
+                await self._persist_session_state(
+                    user,
+                    session,
+                    now=now,
+                    previous_session=previous_session,
+                    trigger="scheduler_tick",
+                    details={"workday": is_workday, "reasons": reasons},
+                )
+                return
             if self._active_short_rest_break(session):
                 if await self._maybe_check_short_rest_break(client, user, session, now):
                     changed = True
@@ -2554,6 +2598,83 @@ class InternManagementRuntime:
         )
         return True
 
+    async def _maybe_enforce_portal_quality_warning(
+        self,
+        client: discord.Client | None,
+        user: UserProfile,
+        session: SessionState,
+        now: datetime,
+    ) -> bool:
+        warning = session.metadata.get(_PORTAL_QUALITY_WARNING_KEY)
+        if not isinstance(warning, dict):
+            return False
+        deadline = self._coerce_datetime_for_reference(
+            str(warning.get("deadline_at") or ""),
+            reference=now,
+            timezone_name=self.resolve_user_timezone_name(user),
+        )
+        if deadline is None:
+            session.metadata.pop(_PORTAL_QUALITY_WARNING_KEY, None)
+            return True
+        if now < deadline:
+            return False
+        if session.clocked_out_at or session.stage == "clocked_out":
+            session.metadata.pop(_PORTAL_QUALITY_WARNING_KEY, None)
+            return True
+        note = await self._finalize_clickup_day(
+            user,
+            session,
+            deadline,
+            allow_status_completion=False,
+            include_next_task_suggestion=False,
+            pause_reason="portal_quality_timeout",
+        )
+        session.clocked_out_at = deadline.isoformat()
+        self._close_current_work_segment(session, deadline)
+        session.stage = "clocked_out"
+        session.awaiting_clock_out_photo = False
+        session.awaiting_clock_out_summary = False
+        session.pending_clickup_sync = True
+        reasons = [str(item) for item in warning.get("reasons") or [] if str(item).strip()]
+        block = {
+            "clocked_out_at": deadline.isoformat(),
+            "detected_at": now.isoformat(),
+            "context": str(warning.get("context") or "work detail"),
+            "reasons": reasons[:4],
+            "status": "manager_approval_required",
+        }
+        session.metadata[_PORTAL_QUALITY_RESTART_BLOCK_KEY] = block
+        session.metadata.pop(_PORTAL_QUALITY_WARNING_KEY, None)
+        session.metadata["auto_clock_out_at"] = deadline.isoformat()
+        session.metadata["auto_clock_out_reference_at"] = str(warning.get("started_at") or "")
+        session.metadata["auto_clock_out_reason"] = "Worker portal quality correction deadline expired."
+        if note:
+            session.metadata["auto_clock_out_note"] = note
+        self._refresh_session_time_summary(session, deadline)
+        worked_seconds = int(session.time_summary.get("clocked_in_total_seconds") or 0)
+        self._append_compliance_event(
+            session,
+            event_type="portal_quality_auto_clocked_out",
+            now=now,
+            worked_seconds=worked_seconds,
+        )
+        try:
+            await self._send_dm(
+                client,
+                user,
+                session,
+                (
+                    "The 10-minute work-detail correction deadline passed, so I stopped future time "
+                    f"effective {deadline.strftime('%I:%M %p').lstrip('0')}. Time already recorded remains intact. "
+                    "Stop work now and contact Erik or George with a concrete corrected plan. "
+                    "A manager must approve the restart. Report any work already performed after the stop so the time record can be corrected."
+                ),
+                now,
+            )
+        except Exception:
+            logger.exception("Failed to send portal quality clock-out notice to %s.", user.user_key)
+        return True
+
     async def _maybe_check_meal_compliance(
         self,
         client: discord.Client,
@@ -2893,6 +3014,69 @@ class InternManagementRuntime:
             f"Approved same-day overtime for {user.display_name}. "
             "The worker and the other configured approver were notified."
         )
+
+    async def approve_portal_quality_restart(
+        self,
+        client: discord.Client | None,
+        user: UserProfile,
+        session: SessionState,
+        *,
+        approved_by: str,
+        comments: str,
+        now: datetime | None = None,
+    ) -> str:
+        block = session.metadata.get(_PORTAL_QUALITY_RESTART_BLOCK_KEY)
+        if not isinstance(block, dict):
+            return f"{user.display_name} does not have a quality-based restart block."
+        approval_reason = comments.strip()
+        if not approval_reason:
+            return "A reviewed correction or restart reason is required."
+        reference_now = now or self.resolve_user_local_now(user)
+        previous_session = self._clone_session_state(session)
+        session.metadata.pop(_PORTAL_QUALITY_RESTART_BLOCK_KEY, None)
+        session.metadata.pop(_PORTAL_QUALITY_WARNING_KEY, None)
+        self._clear_auto_clock_out_metadata(session)
+        approvals = session.metadata.setdefault("portal_quality_restart_approvals", [])
+        if isinstance(approvals, list):
+            approvals.append(
+                {
+                    "approved_at": reference_now.isoformat(),
+                    "approved_by": approved_by,
+                    "comments": approval_reason,
+                    "prior_block": block,
+                }
+            )
+            del approvals[:-20]
+        self._refresh_session_time_summary(session, reference_now)
+        self._append_compliance_event(
+            session,
+            event_type="portal_quality_restart_approved",
+            now=reference_now,
+            worked_seconds=int(session.time_summary.get("clocked_in_total_seconds") or 0),
+        )
+        await self._send_dm(
+            client,
+            user,
+            session,
+            (
+                f"{approved_by} reviewed your correction and approved a tracked-work restart: "
+                f"{approval_reason} You may clock back in, confirm the task, and continue."
+            ),
+            reference_now,
+        )
+        await self._persist_session_state(
+            user,
+            session,
+            now=reference_now,
+            previous_session=previous_session,
+            trigger="portal_quality_restart_approval",
+            details={
+                "approved_by": approved_by,
+                "approval_reason_excerpt": self._excerpt_text(approval_reason),
+            },
+        )
+        await self.write_dashboard()
+        return f"Approved tracked-work restart for {user.display_name}; the worker was notified."
 
     def _pending_follow_up(self, session: SessionState) -> dict[str, Any] | None:
         raw = session.metadata.get(_PENDING_FOLLOW_UP_KEY)

@@ -94,6 +94,9 @@ Handle finished-task reviews and unblocker-task drafts that are waiting on admin
 - `review.overtime_approve` - Approve same-day overtime (mutating)
   - Release a worker's same-day overtime restart gate, notify the worker, and notify the other configured approver.
   - Example: `run review.overtime_approve user=Andrew comments="Approve one hour for testing."`
+- `review.quality_restart` - Approve quality-corrected restart (mutating)
+  - Release a worker's work-detail quality restart gate after reviewing a concrete correction.
+  - Example: `run review.quality_restart user=AJ comments="Reviewed the corrected plan."`
 - `review.close` - Close reviewed task (mutating)
   - Approve an intern's pending task review and close the reviewed task in ClickUp.
   - Example: `run review.close user=Andrew`
@@ -239,6 +242,7 @@ flowchart TD
   start --> scenario_review["Review / Approve Work"]
   scenario_review --> review_pending_tasks["review.pending_tasks"]
   scenario_review --> review_overtime_approve["review.overtime_approve"]
+  scenario_review --> review_quality_restart["review.quality_restart"]
   scenario_review --> review_close["review.close"]
   scenario_review --> review_rework["review.rework"]
   scenario_review --> review_pending_task_proposals["review.pending_task_proposals"]

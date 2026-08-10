@@ -396,6 +396,22 @@ def build_admin_console_registry() -> AdminConsoleRegistry:
             scenarios=("review", "attention"),
         ),
         AdminCommandDefinition(
+            command_id="review.quality_restart",
+            label="Approve quality-corrected restart",
+            help_text="Release a worker's work-detail quality restart gate after reviewing a concrete correction.",
+            group_id="review",
+            read_only=False,
+            confirm_required=True,
+            args=(
+                AdminCommandArgument("user", "Roster user key or display name", example="AJ"),
+                AdminCommandArgument("comments", "Correction reviewed and allowed work scope", example="Reviewed the revised fixture plan and evidence target."),
+            ),
+            handler_name="_command_review_quality_restart",
+            preview_name="_preview_review_quality_restart",
+            examples=('run review.quality_restart user=AJ comments="Reviewed the corrected plan."',),
+            scenarios=("review", "attention"),
+        ),
+        AdminCommandDefinition(
             command_id="review.close",
             label="Close reviewed task",
             help_text="Approve an intern's pending task review and close the reviewed task in ClickUp.",

@@ -91,6 +91,16 @@ async def _build_person_payload(
         "active_timer_task_id": _active_timer_task_id(current_session),
         "active_timer_task_name": _active_timer_task_name(current_session),
         "pending_admin_review_count": len(runtime._pending_admin_reviews(current_session)),
+        "portal_quality_warning": (
+            current_session.metadata.get("portal_quality_warning")
+            if isinstance(current_session.metadata.get("portal_quality_warning"), dict)
+            else {}
+        ),
+        "portal_quality_restart_blocked": (
+            current_session.metadata.get("portal_quality_restart_blocked")
+            if isinstance(current_session.metadata.get("portal_quality_restart_blocked"), dict)
+            else {}
+        ),
         "latest_plan": current_session.latest_plan or "",
         "latest_status": current_session.latest_status or "",
         "latest_blocker": current_session.latest_blocker or "",

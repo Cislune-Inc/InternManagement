@@ -13,6 +13,7 @@ from agent.state_store import StateStore
 from agent.worker_portal import (
     WorkerPortalService,
     build_worker_portal_link,
+    validate_meaningful_work_detail,
     validate_work_commitment,
     validate_worker_portal_token,
 )
@@ -164,6 +165,15 @@ def test_work_commitment_rejects_vague_and_repeated_answers() -> None:
     repeated, _ = validate_work_commitment("make progress", "continue", previous_fingerprint=fingerprint)
     assert any("same answer" in issue for issue in repeated)
 
+    copied, _ = validate_meaningful_work_detail(
+        "Completed the bracket measurement and uploaded the revised drawing for review",
+        purpose="progress update",
+        recent_details=[
+            "Completed the bracket measurement and uploaded the revised drawing for review"
+        ],
+    )
+    assert copied and "copies a previous submission" in copied
+
 
 def test_worker_portal_limits_task_options_and_keeps_beta_state_isolated(tmp_path) -> None:
     runtime, admin, _slack = _runtime(tmp_path)
@@ -195,6 +205,16 @@ def test_worker_portal_limits_task_options_and_keeps_beta_state_isolated(tmp_pat
     assert "due" in due_task["reason"]
     assert other_owned_task["assignees"] == ["George"]
     assert initial["work"]["status"] == "ready"
+    assert len(initial["overhead_lanes"]) == 8
+
+    overhead = asyncio.run(
+        service.apply_action(
+            token,
+            {"action": "select_overhead_lane", "lane_id": "shop_facilities_safety"},
+        )
+    )
+    assert overhead["work"]["overhead_lane_name"] == "Shop, facilities & safety"
+    assert overhead["work"]["selected_task_id"] == ""
 
     selected = asyncio.run(
         service.apply_action(
@@ -238,6 +258,7 @@ def test_worker_portal_limits_task_options_and_keeps_beta_state_isolated(tmp_pat
                 "action": "start",
                 "outcome": "A tested mounting bracket revision with the corrected hole pattern attached",
                 "first_step": "Open revision three and update the sketch constraints from the new measurements",
+                "evidence": "Attach the revised CAD screenshot and record the measured hole spacing in the task",
                 "estimate": "1 hour",
                 "checkpoint": "60 minutes",
             },
@@ -483,6 +504,7 @@ def test_roster_worker_portal_uses_one_live_session_and_idempotent_timer(tmp_pat
         "action": "start",
         "outcome": "A tested fixture assembly with the alignment measurements recorded for review",
         "first_step": "Measure the fixture base and record the first alignment datum in the build sheet",
+        "evidence": "Upload the completed build sheet and an assembly photo showing the alignment marks",
         "estimate": "1 hour",
         "checkpoint": "60 minutes",
     }
@@ -549,6 +571,61 @@ def test_roster_worker_portal_uses_one_live_session_and_idempotent_timer(tmp_pat
     assert runtime.dashboard_writes == 3
 
 
+def test_live_portal_repeated_weak_checkpoint_opens_and_good_detail_clears_warning(tmp_path) -> None:
+    runtime = _LiveRuntime(tmp_path)
+    token = _token_from_link(build_worker_portal_link(runtime, runtime.user))
+    service = WorkerPortalService(runtime)
+    asyncio.run(
+        service.apply_action(
+            token,
+            {
+                "action": "select_task",
+                "task_id": "assigned",
+                "task_name": "Build test fixture",
+                "task_location": "Hardware / Flight fixture",
+            },
+        )
+    )
+    asyncio.run(
+        service.apply_action(
+            token,
+            {
+                "action": "start",
+                "outcome": "A tested fixture base with the alignment measurements recorded for review",
+                "first_step": "Measure the fixture base and enter each datum in the build sheet",
+                "evidence": "Upload the completed build sheet and a photo of the alignment marks",
+                "estimate": "1 hour",
+                "checkpoint": "60 minutes",
+            },
+        )
+    )
+
+    weak = {"action": "check_in", "progress": "working on it", "blocker": ""}
+    with pytest.raises(ValueError, match="make this checkpoint useful"):
+        asyncio.run(service.apply_action(token, weak))
+    with pytest.raises(ValueError, match="QUALITY WARNING"):
+        asyncio.run(service.apply_action(token, weak))
+
+    warned = asyncio.run(service.build_payload(token))
+    assert warned["quality"]["warning_deadline_at"]
+    assert "repeats the last rejected answer" in " ".join(warned["quality"]["warning_reasons"])
+    assert any("QUALITY WARNING" in message for _, message in runtime.slack.messages)
+
+    corrected = asyncio.run(
+        service.apply_action(
+            token,
+            {
+                "action": "check_in",
+                "progress": "Measured all four fixture corners and recorded a 0.8 mm alignment error in the build sheet",
+                "blocker": "Need the revised shim dimension before final assembly",
+            },
+        )
+    )
+    assert corrected["quality"]["warning_deadline_at"] == ""
+    session, _ = runtime.get_user_session_for_moment(runtime.user)
+    assert "portal_quality_warning" not in session.metadata
+
+
 def test_admin_portal_tracks_projects_live_but_uses_salary_nonpayroll_identity(tmp_path) -> None:
     runtime = _LiveRuntime(tmp_path)
     admin = AdminProfile(
@@ -589,6 +666,7 @@ def test_admin_portal_tracks_projects_live_but_uses_salary_nonpayroll_identity(t
                 "action": "start",
                 "outcome": "A reviewed fixture delivery plan with owners and the next milestone recorded",
                 "first_step": "Open the fixture task and verify its owner, deadline, and acceptance criteria",
+                "evidence": "Post the reviewed milestone list with named owners and acceptance criteria in ClickUp",
                 "estimate": "1 hour",
                 "checkpoint": "60 minutes",
             },

@@ -12,6 +12,11 @@ def test_manager_queue_detects_workflow_task_and_time_exceptions():
         "clock_state": "clocked in",
         "latest_blocker": "Waiting for the replacement circuit.",
         "pending_admin_review_count": 1,
+        "portal_quality_restart_blocked": {
+            "clocked_out_at": "2026-07-30T10:00:00-07:00",
+            "status": "manager_approval_required",
+            "reasons": ["Repeated checkpoint text"],
+        },
         "active_task_id": "task-a",
         "active_task_name": "Firmware",
         "active_timer_task_id": "task-b",
@@ -26,6 +31,7 @@ def test_manager_queue_detects_workflow_task_and_time_exceptions():
         "incomplete_clock_out",
         "active_blocker",
         "admin_review",
+        "quality_restart_approval",
         "task_timer_mismatch",
         "long_shift",
     }
