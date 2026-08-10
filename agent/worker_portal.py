@@ -19,6 +19,7 @@ from urllib.parse import quote, urlsplit
 from .config import parse_roster_bytes
 from .models import AdminProfile, MessageRecord, SessionState, UserProfile
 from .persistence import atomic_write_text
+from .portal_intelligence import PortalIntelligence
 
 
 _PORTAL_SECRET_STATE_KEY = "worker_portal_signing_secret"
@@ -234,6 +235,9 @@ class WorkerPortalService:
     def __init__(self, runtime: Any) -> None:
         self.runtime = runtime
         self._task_source_cache: dict[str, tuple[float, list[dict[str, Any]], set[str]]] = {}
+        self.portal_intelligence = getattr(runtime, "portal_intelligence", None) or PortalIntelligence(
+            runtime.state_store
+        )
 
     async def build_payload(self, token: str) -> dict[str, Any]:
         slack_user_id = validate_worker_portal_token(self.runtime, token)
@@ -311,6 +315,10 @@ class WorkerPortalService:
             )
         elif action == "claim_task":
             message = await self._claim_task(actor, state, payload)
+        elif action == "coach_plan":
+            message = await self._coach_plan(slack_user_id, actor, state, payload)
+        elif action == "coach_checkpoint":
+            message = await self._coach_checkpoint(slack_user_id, actor, state, payload)
         elif action == "start":
             try:
                 message = (
@@ -390,7 +398,7 @@ class WorkerPortalService:
         if not isinstance(state, dict):
             return self._default_state(actor)
         default = self._default_state(actor)
-        for key in ("profile", "work", "quality"):
+        for key in ("profile", "work", "quality", "ai"):
             if not isinstance(state.get(key), dict):
                 state[key] = default[key]
             else:
@@ -439,6 +447,7 @@ class WorkerPortalService:
                 "destination_type": "",
                 "overhead_lane_id": "",
                 "overhead_lane_name": "",
+                "plan_intent": "",
                 "outcome": "",
                 "first_step": "",
                 "evidence": "",
@@ -462,6 +471,14 @@ class WorkerPortalService:
                 "warning_deadline_at": "",
                 "warning_reasons": [],
                 "auto_clocked_out_at": "",
+            },
+            "ai": {
+                "last_plan_note": "",
+                "last_plan_question": "",
+                "last_plan_ready": False,
+                "last_checkpoint_note": "",
+                "last_checkpoint_question": "",
+                "last_checkpoint_ready": False,
             },
             "task_requests": [],
             "history": [],
@@ -680,6 +697,141 @@ class WorkerPortalService:
                 }
             )
         return catalog
+
+    async def _coach_plan(
+        self,
+        slack_user_id: str,
+        actor: PortalActor,
+        state: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> str:
+        work = state["work"]
+        task_name = _clean_text(work.get("selected_task_name"), limit=240)
+        if not work.get("selected_task_id") or not task_name:
+            raise ValueError("Choose a task first so Don Pollo can shape the plan in the right project context.")
+        intent = _clean_text(payload.get("intent"), limit=1_200)
+        existing_draft = {
+            "outcome": _clean_text(payload.get("outcome"), limit=800),
+            "first_step": _clean_text(payload.get("first_step"), limit=500),
+            "evidence": _clean_text(payload.get("evidence"), limit=500),
+            "estimate": _clean_text(payload.get("estimate"), limit=40),
+            "checkpoint": _clean_text(payload.get("checkpoint"), limit=40),
+        }
+        if not intent and not any(existing_draft.values()):
+            raise ValueError("Tell Don Pollo what you plan to accomplish, even in rough language.")
+        suggestion = await self.portal_intelligence.coach_plan(
+            slack_user_id=slack_user_id,
+            worker_name=_actor_name(actor),
+            task_name=task_name,
+            task_location=_clean_text(work.get("selected_task_location"), limit=240),
+            profile=state["profile"],
+            intent=intent,
+            existing_draft=existing_draft,
+        )
+        outcome = _clean_text(suggestion.get("outcome"), limit=800) or existing_draft["outcome"]
+        first_step = _clean_text(suggestion.get("first_step"), limit=500) or existing_draft["first_step"]
+        evidence = _clean_text(suggestion.get("evidence"), limit=500) or existing_draft["evidence"]
+        estimate = _clean_text(suggestion.get("estimate"), limit=40).lower()
+        checkpoint = _clean_text(suggestion.get("checkpoint"), limit=40).lower()
+        if estimate not in _VALID_ESTIMATES:
+            estimate = existing_draft["estimate"].lower()
+        if estimate not in _VALID_ESTIMATES:
+            estimate = "1 hour"
+        if checkpoint not in _VALID_CHECKPOINTS:
+            checkpoint = existing_draft["checkpoint"].lower()
+        if checkpoint not in _VALID_CHECKPOINTS:
+            checkpoint = "60 minutes"
+        work.update(
+            {
+                "plan_intent": intent,
+                "outcome": outcome,
+                "first_step": first_step,
+                "evidence": evidence,
+                "estimate": estimate,
+                "checkpoint": checkpoint,
+            }
+        )
+        issues, _ = validate_work_commitment(outcome, first_step, evidence=evidence)
+        ready = bool(suggestion.get("ready_to_use")) and not issues
+        note = _clean_text(suggestion.get("coaching_note"), limit=500)
+        question = _clean_text(suggestion.get("follow_up_question"), limit=500)
+        if issues and not question:
+            question = issues[0]
+        state["ai"].update(
+            {
+                "last_plan_note": note,
+                "last_plan_question": question,
+                "last_plan_ready": ready,
+            }
+        )
+        if ready:
+            return "Don Pollo shaped a concrete draft. Review the details, then start work when they are accurate. No time started yet."
+        return (
+            "Don Pollo drafted what the facts support, but one detail still needs your answer. "
+            + (question or "Review and add the missing concrete detail before starting.")
+        )
+
+    async def _coach_checkpoint(
+        self,
+        slack_user_id: str,
+        actor: PortalActor,
+        state: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> str:
+        work = state["work"]
+        task_name = _clean_text(work.get("selected_task_name"), limit=240)
+        if not work.get("selected_task_id") or not task_name:
+            raise ValueError("Choose and start a task before shaping a checkpoint.")
+        rough_progress = _clean_text(payload.get("progress"), limit=1_200)
+        rough_blocker = _clean_text(payload.get("blocker"), limit=600)
+        if not rough_progress:
+            raise ValueError("Write a rough update first—what changed, failed, passed, or was learned?")
+        suggestion = await self.portal_intelligence.coach_checkpoint(
+            slack_user_id=slack_user_id,
+            worker_name=_actor_name(actor),
+            task_name=task_name,
+            plan={
+                "outcome": _clean_text(work.get("outcome"), limit=800),
+                "first_step": _clean_text(work.get("first_step"), limit=500),
+                "evidence": _clean_text(work.get("evidence"), limit=500),
+            },
+            progress=rough_progress,
+            blocker=rough_blocker,
+        )
+        progress = _clean_text(suggestion.get("progress"), limit=800) or rough_progress
+        evidence = _clean_text(suggestion.get("evidence"), limit=350)
+        next_step = _clean_text(suggestion.get("next_step"), limit=350)
+        blocker = _clean_text(suggestion.get("blocker"), limit=500) or rough_blocker
+        progress_parts = [progress]
+        if evidence:
+            progress_parts.append(f"Evidence: {evidence}")
+        if next_step:
+            progress_parts.append(f"Next: {next_step}")
+        structured_progress = _clean_text(" ".join(progress_parts), limit=800)
+        issue, _ = validate_meaningful_work_detail(
+            structured_progress,
+            purpose="progress update",
+        )
+        ready = bool(suggestion.get("ready_to_save")) and not issue
+        note = _clean_text(suggestion.get("coaching_note"), limit=500)
+        question = _clean_text(suggestion.get("follow_up_question"), limit=500)
+        if issue and not question:
+            question = issue
+        work["latest_progress"] = structured_progress
+        work["latest_blocker"] = blocker
+        state["ai"].update(
+            {
+                "last_checkpoint_note": note,
+                "last_checkpoint_question": question,
+                "last_checkpoint_ready": ready,
+            }
+        )
+        if ready:
+            return "Don Pollo shaped a useful checkpoint draft. Review it, then save it to the work record."
+        return (
+            "Don Pollo preserved your rough update, but it needs one more fact before saving. "
+            + (question or "Add the observable change or result, then save the checkpoint.")
+        )
 
     async def _claim_task(
         self,
@@ -1624,6 +1776,7 @@ class WorkerPortalService:
         now = datetime.now(timezone.utc)
         minimum = _parse_datetime(work.get("break_minimum_end_at"))
         cutoff = _parse_datetime(work.get("break_cutoff_at"))
+        ai_status = self.portal_intelligence.snapshot(str(actor.slack_user_id or ""))
         return {
             "beta": True,
             "live": self._live_enabled(actor),
@@ -1632,6 +1785,7 @@ class WorkerPortalService:
             "work": work,
             "time": self._time_payload(actor, work, now),
             "quality": state["quality"],
+            "ai": {**ai_status, **state["ai"]},
             "overhead_lanes": _OVERHEAD_LANES,
             "task_options": tasks[:5],
             "task_catalog": self._task_catalog(tasks),
@@ -1959,6 +2113,12 @@ def _portal_template() -> str:
     .button.danger { color:var(--danger); }
     .button:disabled { opacity:.45; cursor:not-allowed; }
     .selected-task { padding:12px 14px; border:1px solid var(--line); border-radius:14px; background:var(--soft); margin-bottom:14px; }
+    .ai-composer { padding:14px; border:1px solid rgba(23,110,100,.3); border-radius:16px; background:linear-gradient(135deg,var(--soft),#fff); margin-bottom:14px; }
+    .ai-composer textarea { min-height:76px; }
+    .ai-guidance { margin:9px 0 0; color:var(--teal-dark); font-size:.84rem; }
+    .plan-details { border:1px solid var(--line); border-radius:14px; padding:12px; }
+    .plan-details > summary { color:var(--ink); }
+    .plan-details .form-grid { margin-top:12px; }
     .checklist { margin:10px 0 0; padding-left:20px; color:var(--muted); }
     .checklist li { margin:5px 0; }
     details { border-top:1px solid var(--line); padding-top:13px; }
@@ -1997,13 +2157,18 @@ def _portal_template() -> str:
       </div>
       <div id="work-notice"></div>
       <div class="selected-task"><small class="muted">SELECTED TASK</small><div id="selected-task">Choose an option below.</div></div>
-      <div class="form-grid">
-        <label>By the next checkpoint, what will exist or be demonstrably different?<textarea id="outcome" placeholder="Example: A tested mounting bracket CAD revision with the hole pattern corrected and a screenshot attached."></textarea></label>
-        <label>What is the first concrete move?<textarea id="first-step" placeholder="Example: Open revision 3, measure the current hole spacing, and update the sketch constraints."></textarea></label>
-        <label style="grid-column:1/-1">What evidence will show the result?<textarea id="evidence" placeholder="Example: Upload the revised CAD screenshot and record the measured hole spacing in the task."></textarea></label>
-        <label>Rough estimate<select id="estimate"><option>30 minutes</option><option selected>1 hour</option><option>2 hours</option><option>half day</option><option>full day</option><option>multi-day</option></select></label>
-        <label>Reconsider / ask for help after<select id="checkpoint"><option>30 minutes</option><option selected>60 minutes</option><option>90 minutes</option><option>2 hours</option></select></label>
+      <div class="ai-composer">
+        <label>Explain what you plan to do in your own words<textarea id="plan-intent" placeholder="Example: I want to fix the bracket hole spacing, test the revision against the measurements, and leave the drawing ready for review."></textarea></label>
+        <div class="actions"><button class="button orange" id="coach-plan" data-action="coach-plan">Turn this into a work plan</button><span class="muted" id="ai-usage">Writing helper loading…</span></div>
+        <p class="ai-guidance" id="ai-plan-guidance">Don Pollo will organize your facts into a result, first move, evidence, estimate, and checkpoint for you to review.</p>
       </div>
+      <details class="plan-details" id="plan-details" open><summary>Review / edit the structured work plan</summary><div class="form-grid">
+          <label>By the next checkpoint, what will exist or be demonstrably different?<textarea id="outcome" placeholder="Example: A tested mounting bracket CAD revision with the hole pattern corrected and a screenshot attached."></textarea></label>
+          <label>What is the first concrete move?<textarea id="first-step" placeholder="Example: Open revision 3, measure the current hole spacing, and update the sketch constraints."></textarea></label>
+          <label style="grid-column:1/-1">What evidence will show the result?<textarea id="evidence" placeholder="Example: Upload the revised CAD screenshot and record the measured hole spacing in the task."></textarea></label>
+          <label>Rough estimate<select id="estimate"><option>30 minutes</option><option selected>1 hour</option><option>2 hours</option><option>half day</option><option>full day</option><option>multi-day</option></select></label>
+          <label>Reconsider / ask for help after<select id="checkpoint"><option>30 minutes</option><option selected>60 minutes</option><option>90 minutes</option><option>2 hours</option></select></label>
+      </div></details>
       <div class="actions"><button class="button primary" id="start-button" data-action="start">Start work</button><button class="button orange" id="claim-selected" data-action="claim-task">Claim in ClickUp</button><button class="button subtle" data-action="short-rest">Short rest</button><button class="button subtle" data-action="lunch">Lunch</button><button class="button subtle" data-action="back">Back</button><button class="button danger subtle" data-action="clock-out">Clock out</button></div>
       <p class="muted" id="mode-note" style="margin:12px 0 0">A recognizable result and concrete first move are required.</p>
     </section>
@@ -2030,7 +2195,8 @@ def _portal_template() -> str:
         <section class="panel">
           <div class="eyebrow">Checkpoint</div><h2>Say what changed, not just that you worked.</h2>
           <div class="form-grid"><label>Meaningful progress<textarea id="progress" placeholder="What now exists, changed, passed, failed, or was learned?"></textarea></label><label>Blocker or help needed<textarea id="blocker" placeholder="Optional. Name the decision, dependency, or failed approach."></textarea></label></div>
-          <div class="actions"><button class="button primary" data-action="check-in">Save checkpoint</button><button class="button" data-action="share-slack">Send concise summary to Slack</button></div>
+          <div class="actions"><button class="button orange" id="coach-checkpoint" data-action="coach-checkpoint">Improve with Don Pollo</button><button class="button primary" data-action="check-in">Save checkpoint</button><button class="button" data-action="share-slack">Send concise summary to Slack</button></div>
+          <p class="ai-guidance" id="ai-checkpoint-guidance">Write rough facts first. Don Pollo can organize them, but only Save checkpoint changes the work record.</p>
         </section>
       </div>
       <aside class="stack">
@@ -2050,13 +2216,15 @@ def _portal_template() -> str:
     let renderedProfileSavedAt = null;
     let chooserInitialized = false;
     const dirtyFields = new Set();
-    const editableFieldIds = new Set(['outcome','first-step','evidence','estimate','checkpoint','progress','blocker','weekly-hours','start-time','end-time','time-off','interests','skills']);
+    const editableFieldIds = new Set(['plan-intent','outcome','first-step','evidence','estimate','checkpoint','progress','blocker','weekly-hours','start-time','end-time','time-off','interests','skills']);
     function syncInput(id, value) {
       if (!dirtyFields.has(id)) $(id).value = value ?? '';
     }
     function clearSubmittedDraft(action) {
       const submittedFields = {
         start: ['outcome','first-step','evidence','estimate','checkpoint'],
+        coach_plan: ['plan-intent','outcome','first-step','evidence','estimate','checkpoint'],
+        coach_checkpoint: ['progress','blocker'],
         check_in: ['progress','blocker'],
         clock_out: ['progress','blocker'],
         save_profile: ['weekly-hours','workdays','start-time','end-time','time-off','interests','skills'],
@@ -2135,7 +2303,7 @@ def _portal_template() -> str:
       $('task-catalog').innerHTML = contracts.join('') || '<div class="catalog-empty">No open tasks match this view.</div>';
     }
     function render() {
-      const work = data.work || {}, profile = data.profile || {}, quality = data.quality || {};
+      const work = data.work || {}, profile = data.profile || {}, quality = data.quality || {}, ai = data.ai || {};
       const live = Boolean(data.live);
       $('welcome').textContent = `Welcome, ${(data.actor || {}).name || 'worker'}`;
       $('mode-pill').textContent = live ? 'Live workday' : 'Admin preview';
@@ -2163,6 +2331,7 @@ def _portal_template() -> str:
       $('overhead-lanes').innerHTML = (data.overhead_lanes || []).map((lane,index) => `<button class="lane ${lane.id === work.overhead_lane_id ? 'selected' : ''}" data-overhead-lane="${esc(lane.id)}" data-lane-search="${esc(lane.search)}" data-lane-name="${esc(lane.name)}"><span class="number">${index+1}</span> ${esc(lane.name)}</button>`).join('');
       renderTaskCatalog();
       $('selected-task').innerHTML = work.selected_task_name ? `<strong>${esc(work.selected_task_name)}</strong><br><span class="muted">${esc(work.selected_task_location || '')}</span>` : 'Choose an option above.';
+      syncInput('plan-intent', work.plan_intent || '');
       syncInput('outcome', work.outcome || '');
       syncInput('first-step', work.first_step || '');
       syncInput('evidence', work.evidence || '');
@@ -2170,6 +2339,14 @@ def _portal_template() -> str:
       syncInput('checkpoint', work.checkpoint || '60 minutes');
       syncInput('progress', work.latest_progress || '');
       syncInput('blocker', work.latest_blocker || '');
+      const aiAvailable = Boolean(ai.request_available);
+      $('coach-plan').disabled = !aiAvailable || !work.selected_task_id;
+      $('coach-checkpoint').disabled = !aiAvailable || work.status !== 'active';
+      $('ai-usage').textContent = ai.enabled
+        ? `${Number(ai.worker_calls_today || 0)} helper use${Number(ai.worker_calls_today || 0) === 1 ? '' : 's'} today · ${Number(ai.tokens_used_today || 0).toLocaleString()} tokens`
+        : 'AI helper unavailable · manual fields still work';
+      $('ai-plan-guidance').textContent = ai.last_plan_question || ai.last_plan_note || 'Don Pollo will organize your facts into a result, first move, evidence, estimate, and checkpoint for you to review.';
+      $('ai-checkpoint-guidance').textContent = ai.last_checkpoint_question || ai.last_checkpoint_note || 'Write rough facts first. Don Pollo can organize them, but only Save checkpoint changes the work record.';
       $('quality-pill').textContent = `${Number(quality.strong_plans || 0)} strong plan${Number(quality.strong_plans || 0) === 1 ? '' : 's'}`;
       syncInput('weekly-hours', profile.weekly_target_hours || 40);
       syncInput('start-time', profile.typical_start_time || '09:00');
@@ -2199,6 +2376,8 @@ def _portal_template() -> str:
     function actionPayload(action) {
       const apiAction = action.replaceAll('-','_');
       if (apiAction === 'start') return {action:apiAction, outcome:$('outcome').value, first_step:$('first-step').value, evidence:$('evidence').value, estimate:$('estimate').value, checkpoint:$('checkpoint').value};
+      if (apiAction === 'coach_plan') return {action:apiAction, intent:$('plan-intent').value, outcome:$('outcome').value, first_step:$('first-step').value, evidence:$('evidence').value, estimate:$('estimate').value, checkpoint:$('checkpoint').value};
+      if (apiAction === 'coach_checkpoint') return {action:apiAction, progress:$('progress').value, blocker:$('blocker').value};
       if (apiAction === 'check_in') return {action:apiAction, progress:$('progress').value, blocker:$('blocker').value};
       if (apiAction === 'clock_out') return {action:apiAction, progress:$('progress').value, blocker:$('blocker').value};
       if (apiAction === 'claim_task') return {action:apiAction, task_id:(data.work || {}).selected_task_id};
