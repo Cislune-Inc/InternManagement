@@ -13860,6 +13860,11 @@ class InternManagementRuntime:
         if normalized_reviews != session.metadata.get(_PENDING_ADMIN_REVIEWS_KEY):
             self._set_pending_admin_reviews(session, normalized_reviews)
             changed = True
+        if (
+            session.stage == "awaiting_task_selection"
+            and self._clear_non_authoritative_active_task_context(session)
+        ):
+            changed = True
         if not session.intake_completed_at:
             last_task_onboarding_completed_at = str(
                 session.metadata.get("last_task_onboarding_completed_at") or ""

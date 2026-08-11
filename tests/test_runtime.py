@@ -12788,6 +12788,33 @@ def test_inferred_clickup_task_cannot_post_or_extend_inactivity() -> None:
     assert resolved_reference == reference
 
 
+def test_normalization_clears_legacy_inferred_active_task_context() -> None:
+    runtime = _build_runtime()
+    session = SessionState(
+        user_key="tony",
+        session_date="2026-08-11",
+        stage="awaiting_task_selection",
+        clocked_in_at="2026-08-11T13:05:12-07:00",
+        metadata={
+            "active_clickup_task_id": "website",
+            "active_clickup_task_name": "Website development",
+            "clickup_selection_reason": "keyword overlap: carve, core",
+            "credible_clickup_activity": {
+                "task_id": "website",
+                "observed_at": "2026-08-11T13:40:00-07:00",
+            },
+        },
+    )
+
+    changed = runtime._normalize_session_state(session)
+
+    assert changed is True
+    assert runtime._active_task_id(session) is None
+    assert "active_clickup_task_name" not in session.metadata
+    assert "clickup_selection_reason" not in session.metadata
+    assert "credible_clickup_activity" not in session.metadata
+
+
 def test_typoed_hours_lookup_while_clocked_out_does_not_restart_time() -> None:
     runtime = _build_runtime()
     sent: list[str] = []
