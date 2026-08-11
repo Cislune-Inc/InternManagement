@@ -10,6 +10,7 @@ YES_PATTERNS = [
     r"\bclock me in\b",
     r"\bclock back in\b",
     r"\bclock me back in\b",
+    r"\bresume (?:my )?work\b",
     r"\byes\b",
     r"\byeah\b",
     r"\byep\b",

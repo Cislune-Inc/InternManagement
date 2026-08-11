@@ -25,6 +25,16 @@ def test_production_controls_enforce_ten_minute_short_rest_limit() -> None:
     assert "labor.short_rest_break_minutes" in changed
 
 
+def test_production_controls_use_four_hour_inactivity_backstop() -> None:
+    payload: dict = {}
+
+    changed = apply_controls(payload)
+
+    assert payload["schedule"]["auto_clock_out_after_hours"] == 4
+    assert payload["schedule"]["auto_clock_out_warning_minutes"] == 15
+    assert "schedule.auto_clock_out_after_hours" in changed
+
+
 def test_production_controls_schedule_daily_pacific_digest_and_meal_minimum() -> None:
     payload: dict = {}
 

@@ -224,8 +224,9 @@ _SELF_LOOKUP_STATUS_REQUEST_PATTERNS = {
     "show me my current status",
 }
 _AUTO_CLOCK_OUT_NOTIFICATION_MESSAGE = (
-    "You were automatically clocked out for inactivity. "
-    "If you are still working, message me so I can clock you back in."
+    "I paused your work timer after the inactivity window so it does not keep running unattended. "
+    "If you are continuing work, reply `clock in` or `resume work`. If you were working during "
+    "the gap, tell me what you completed so the time can be reviewed."
 )
 
 
@@ -1767,7 +1768,7 @@ class InternManagementRuntime:
         await self._start_task_selection_resume(client, user, session, now, reason="I marked you clocked back in, but I still need to confirm which task you are resuming.")
         return True
 
-    async def _maybe_resume_after_auto_clock_out_activity(
+    async def _maybe_handle_post_auto_clock_out_activity(
         self,
         client: discord.Client,
         user: UserProfile,
@@ -1782,7 +1783,24 @@ class InternManagementRuntime:
             return False
         if not inbound.content.strip() and not inbound.attachments:
             return False
-        return await self._maybe_resume_same_day_work(client, user, session, now)
+        if inbound.content.strip():
+            session.latest_status = inbound.content.strip()
+            if self._signals_blocked_status(signals):
+                session.latest_blocker = inbound.content.strip()
+        elif inbound.attachments:
+            session.latest_status = "Sent an update while the work timer was paused."
+        await self._send_dm(
+            client,
+            user,
+            session,
+            (
+                "Thanks for checking in. Your work timer is still paused, and I did not restart it "
+                "from this message. If you are continuing work, reply `clock in` or `resume work`; "
+                "otherwise no action is needed."
+            ),
+            now,
+        )
+        return True
 
     def _overtime_restart_blocked(self, session: SessionState) -> bool:
         if session.metadata.get("overtime_approved_at"):
@@ -2115,7 +2133,7 @@ class InternManagementRuntime:
         if getattr(signals, "clocked_in", False):
             if await self._maybe_resume_same_day_work(client, user, session, now):
                 return
-        if await self._maybe_resume_after_auto_clock_out_activity(client, user, session, inbound, signals, now):
+        if await self._maybe_handle_post_auto_clock_out_activity(client, user, session, inbound, signals, now):
             if session.stage != "active":
                 return
         if getattr(signals, "starting_lunch", False):
@@ -3537,6 +3555,16 @@ class InternManagementRuntime:
         )
         if now - reference_at < timedelta(hours=self.config.schedule.auto_clock_out_after_hours):
             return False
+        warning_state = self._auto_clock_out_warning_state(session)
+        if not warning_state or str(warning_state.get("reference_at") or "") != reference_at.isoformat():
+            return False
+        warning_deadline = self._coerce_datetime_for_reference(
+            str(warning_state.get("auto_clock_out_at") or ""),
+            reference=now,
+            timezone_name=self.resolve_user_timezone_name(user),
+        )
+        if warning_deadline is None or now < warning_deadline:
+            return False
         note = await self._finalize_clickup_day(
             user,
             session,
@@ -3592,7 +3620,7 @@ class InternManagementRuntime:
         auto_clock_out_at = reference_at + timedelta(hours=self.config.schedule.auto_clock_out_after_hours)
         warning_minutes = self.config.schedule.auto_clock_out_warning_minutes
         warning_at = auto_clock_out_at - timedelta(minutes=warning_minutes)
-        if now < warning_at or now >= auto_clock_out_at:
+        if now < warning_at:
             return False
         reference_at = await self._inactivity_reference_with_clickup_activity(
             user,
@@ -3604,23 +3632,29 @@ class InternManagementRuntime:
             hours=self.config.schedule.auto_clock_out_after_hours
         )
         warning_at = auto_clock_out_at - timedelta(minutes=warning_minutes)
-        if now < warning_at or now >= auto_clock_out_at:
+        if now < warning_at:
             return False
-        remaining_seconds = max(0, int((auto_clock_out_at - now).total_seconds()))
-        remaining_minutes = max(1, (remaining_seconds + 59) // 60)
         warning_state = self._auto_clock_out_warning_state(session)
         reference_key = reference_at.isoformat()
         if warning_state and str(warning_state.get("reference_at") or "") == reference_key:
             return False
+        warning_deadline = (
+            auto_clock_out_at
+            if now < auto_clock_out_at
+            else now + timedelta(minutes=warning_minutes)
+        )
+        remaining_seconds = max(0, int((warning_deadline - now).total_seconds()))
+        remaining_minutes = max(1, (remaining_seconds + 59) // 60)
         try:
             await self._send_dm(
                 client,
                 user,
                 session,
                 (
-                    "FINAL WARNING: You have been inactive for too long. "
-                    f"If you do not respond within {remaining_minutes} minutes, I will "
-                    "automatically clock you out and stop counting time until you check back in."
+                    "Quick check-in: I have not seen an update for a while. "
+                    "If you are still working, send a short note about what changed or reply "
+                    f"`still working`. If I do not hear back within {remaining_minutes} minutes, "
+                    "I will pause the timer so the record stays accurate."
                 ),
                 now,
             )
@@ -3634,7 +3668,7 @@ class InternManagementRuntime:
         session.metadata[_AUTO_CLOCK_OUT_WARNING_KEY] = {
             "reference_at": reference_key,
             "warning_sent_at": now.isoformat(),
-            "auto_clock_out_at": auto_clock_out_at.isoformat(),
+            "auto_clock_out_at": warning_deadline.isoformat(),
         }
         return True
 

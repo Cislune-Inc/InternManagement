@@ -13,7 +13,7 @@ from typing import Any
 
 CONTROL_VALUES: dict[str, dict[str, Any]] = {
     "schedule": {
-        "auto_clock_out_after_hours": 1,
+        "auto_clock_out_after_hours": 4,
         "auto_clock_out_warning_minutes": 15,
     },
     "labor": {

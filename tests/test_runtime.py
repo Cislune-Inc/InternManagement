@@ -2856,6 +2856,53 @@ def test_runtime_process_inbound_clock_me_in_pollo_resumes_same_day_session() ->
     assert any("clocked back in and resumed" in item.lower() for item in sent)
 
 
+def test_runtime_process_inbound_resume_work_resumes_auto_clocked_out_session() -> None:
+    runtime = _build_runtime()
+    runtime.clickup = None
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime) -> None:
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="andrew",
+        display_name="Andrew",
+        discord_user_id=1,
+        discord_username="andrew",
+        storage_folder_name="AndrewOre",
+    )
+    session = SessionState(
+        user_key="andrew",
+        session_date="2026-05-28",
+        stage="clocked_out",
+        clocked_in_at="2026-05-28T09:00:00",
+        intake_completed_at="2026-05-28T09:20:00",
+        clocked_out_at="2026-05-28T12:30:00",
+        work_segments=[{"clocked_in_at": "2026-05-28T09:00:00", "clocked_out_at": "2026-05-28T12:30:00"}],
+        metadata={
+            "active_clickup_task_id": "868jun6qg",
+            "active_clickup_task_name": "formalize project tree",
+            "auto_clock_out_at": "2026-05-28T12:30:00",
+        },
+    )
+    inbound = MessageRecord(
+        message_id="msg-resume-work",
+        direction="inbound",
+        author_id=1,
+        created_at=datetime.fromisoformat("2026-05-28T13:30:00"),
+        content="resume work",
+        attachments=[],
+    )
+
+    asyncio.run(runtime.process_inbound_event(SimpleNamespace(), user, session, inbound, inbound.created_at))
+
+    assert session.stage == "active"
+    assert session.clocked_out_at is None
+    assert session.work_segments[-1] == {"clocked_in_at": "2026-05-28T13:30:00", "clocked_out_at": None}
+    assert any("clocked back in and resumed" in item.lower() for item in sent)
+
+
 def test_finish_task_onboarding_sets_intake_completed_at_when_missing() -> None:
     runtime = _build_runtime()
     activated: list[tuple[str, str]] = []
@@ -6639,7 +6686,7 @@ def test_runtime_recovered_signal_resumes_task_and_tracking() -> None:
     assert any("confirmed `formalize project tree` is back to `in progress`" in item.lower() for item in sent)
 
 
-def test_runtime_auto_clock_out_activity_resumes_same_day_and_processes_stuck_message() -> None:
+def test_runtime_auto_clock_out_activity_requires_explicit_resume_and_preserves_status() -> None:
     runtime = _build_runtime()
     sent: list[str] = []
     activated: list[tuple[str, str]] = []
@@ -6694,14 +6741,13 @@ def test_runtime_auto_clock_out_activity_resumes_same_day_and_processes_stuck_me
     asyncio.run(runtime._route_message(SimpleNamespace(), user, session, inbound, signals, inbound.created_at))
     asyncio.run(runtime._apply_post_route_clickup_automation(SimpleNamespace(), user, session, inbound, signals, inbound.created_at))
 
-    assert session.stage == "active"
-    assert session.clocked_out_at is None
-    assert "auto_clock_out_at" not in session.metadata
-    assert activated == [("868jun6qg", "formalize project tree")]
+    assert session.stage == "clocked_out"
+    assert session.clocked_out_at == "2026-05-28T15:00:00"
+    assert session.metadata["auto_clock_out_at"] == "2026-05-28T15:00:00"
+    assert activated == []
     assert session.latest_status == "im blocked again"
     assert session.latest_blocker == "im blocked again"
-    assert any("clocked back in and resumed" in item.lower() for item in sent)
-    assert any("what do you want me to do about it" in item.lower() for item in sent)
+    assert any("did not restart it" in item.lower() for item in sent)
 
 
 def test_runtime_persist_session_state_writes_transition_log_only_on_change() -> None:
@@ -8848,6 +8894,11 @@ def test_runtime_auto_clocks_out_after_six_hours_of_inactivity() -> None:
         "started_at": "2026-05-28T09:00:00",
         "source": "local",
     }
+    session.metadata["auto_clock_out_warning"] = {
+        "reference_at": "2026-05-28T09:30:00",
+        "warning_sent_at": "2026-05-28T15:15:00",
+        "auto_clock_out_at": "2026-05-28T15:30:00",
+    }
     changed = asyncio.run(
         runtime._maybe_auto_clock_out_inactive(
             None,
@@ -8890,6 +8941,11 @@ def test_runtime_auto_clock_out_accepts_legacy_naive_last_user_message_at() -> N
         clocked_in_at="2026-05-28T09:00:00",
         last_user_message_at="2026-05-28T09:30:00",
     )
+    session.metadata["auto_clock_out_warning"] = {
+        "reference_at": "2026-05-28T09:30:00-04:00",
+        "warning_sent_at": "2026-05-28T15:15:00-04:00",
+        "auto_clock_out_at": "2026-05-28T15:30:00-04:00",
+    }
 
     changed = asyncio.run(
         runtime._maybe_auto_clock_out_inactive(
@@ -9015,7 +9071,7 @@ def test_runtime_sends_auto_clock_out_warning_once_per_inactivity_window() -> No
     assert first is True
     assert second is False
     assert sent == [
-        "FINAL WARNING: You have been inactive for too long. If you do not respond within 15 minutes, I will automatically clock you out and stop counting time until you check back in."
+        "Quick check-in: I have not seen an update for a while. If you are still working, send a short note about what changed or reply `still working`. If I do not hear back within 15 minutes, I will pause the timer so the record stays accurate."
     ]
     assert session.metadata["auto_clock_out_warning"]["reference_at"] == "2026-05-28T10:00:00"
 
@@ -9050,6 +9106,84 @@ def test_runtime_sends_delayed_inactivity_warning_with_actual_time_remaining() -
 
     assert changed is True
     assert "within 8 minutes" in sent[0]
+
+
+def test_runtime_late_scheduler_tick_starts_fresh_warning_grace_period() -> None:
+    runtime = _build_runtime()
+    runtime.clickup = None
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None):
+        del view
+        sent.append(content)
+        return None
+
+    async def fake_finalize(*_args, **_kwargs):
+        return None
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    runtime._finalize_clickup_day = fake_finalize  # type: ignore[method-assign]
+    user = UserProfile(user_key="andrew", display_name="Andrew", discord_user_id=1)
+    session = SessionState(
+        user_key="andrew",
+        session_date="2026-05-28",
+        stage="active",
+        clocked_in_at="2026-05-28T09:00:00",
+        last_user_message_at="2026-05-28T10:00:00",
+    )
+    late_tick = datetime.fromisoformat("2026-05-28T16:10:00")
+
+    warned = asyncio.run(
+        runtime._maybe_send_auto_clock_out_warning(
+            SimpleNamespace(),
+            user,
+            session,
+            late_tick,
+        )
+    )
+    clocked_out_immediately = asyncio.run(
+        runtime._maybe_auto_clock_out_inactive(None, user, session, late_tick)
+    )
+    clocked_out_after_grace = asyncio.run(
+        runtime._maybe_auto_clock_out_inactive(
+            None,
+            user,
+            session,
+            datetime.fromisoformat("2026-05-28T16:25:00"),
+        )
+    )
+
+    assert warned is True
+    assert "within 15 minutes" in sent[0]
+    assert session.metadata["auto_clock_out_warning"]["auto_clock_out_at"] == "2026-05-28T16:25:00"
+    assert clocked_out_immediately is False
+    assert clocked_out_after_grace is True
+
+
+def test_runtime_never_auto_clocks_out_without_matching_warning() -> None:
+    runtime = _build_runtime()
+    runtime.clickup = None
+    user = UserProfile(user_key="andrew", display_name="Andrew", discord_user_id=1)
+    session = SessionState(
+        user_key="andrew",
+        session_date="2026-05-28",
+        stage="active",
+        clocked_in_at="2026-05-28T09:00:00",
+        last_user_message_at="2026-05-28T10:00:00",
+    )
+
+    changed = asyncio.run(
+        runtime._maybe_auto_clock_out_inactive(
+            None,
+            user,
+            session,
+            datetime.fromisoformat("2026-05-28T16:30:00"),
+        )
+    )
+
+    assert changed is False
+    assert session.stage == "active"
+    assert session.clocked_out_at is None
 
 
 def test_runtime_auto_clock_out_warning_resets_after_new_activity() -> None:
@@ -9221,6 +9355,11 @@ def test_runtime_auto_clock_out_notification_is_sent_when_cutoff_hits() -> None:
         clocked_in_at="2026-05-28T09:00:00",
         last_user_message_at="2026-05-28T09:30:00",
     )
+    session.metadata["auto_clock_out_warning"] = {
+        "reference_at": "2026-05-28T09:30:00",
+        "warning_sent_at": "2026-05-28T15:15:00",
+        "auto_clock_out_at": "2026-05-28T15:30:00",
+    }
 
     changed = asyncio.run(
         runtime._maybe_auto_clock_out_inactive(
@@ -9235,7 +9374,7 @@ def test_runtime_auto_clock_out_notification_is_sent_when_cutoff_hits() -> None:
     assert session.stage == "clocked_out"
     assert session.metadata["auto_clock_out_reason"] == "No inbound check-in for 6 hours."
     assert sent == [
-        "You were automatically clocked out for inactivity. If you are still working, message me so I can clock you back in."
+        "I paused your work timer after the inactivity window so it does not keep running unattended. If you are continuing work, reply `clock in` or `resume work`. If you were working during the gap, tell me what you completed so the time can be reviewed."
     ]
 
 
@@ -9265,6 +9404,11 @@ def test_runtime_auto_clock_out_notification_failure_does_not_block_clock_out(ca
         clocked_in_at="2026-05-28T09:00:00",
         last_user_message_at="2026-05-28T09:30:00",
     )
+    session.metadata["auto_clock_out_warning"] = {
+        "reference_at": "2026-05-28T09:30:00",
+        "warning_sent_at": "2026-05-28T15:15:00",
+        "auto_clock_out_at": "2026-05-28T15:30:00",
+    }
 
     with caplog.at_level(logging.ERROR):
         changed = asyncio.run(
