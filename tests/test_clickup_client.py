@@ -483,6 +483,26 @@ def test_build_assigned_task_hierarchy_renders_parent_chain_once() -> None:
     assert "Sensor Calibration | id=child-2 [assigned | recommended]" in rendered
 
 
+def test_match_task_hint_accepts_parent_id_name_and_natural_placement_wording() -> None:
+    client = FakeClickUpClient({})
+    candidates = [
+        {
+            "id": "868jyxv77",
+            "name": "CARVE CORE Variant",
+            "list_id": "901113819433",
+        }
+    ]
+
+    for hint in (
+        "868jyxv77",
+        "CARVE CORE Variant",
+        "Create a new task under CARVE CORE Variant",
+    ):
+        match = client.match_task_hint(candidates, hint)
+        assert match is not None
+        assert match["id"] == "868jyxv77"
+
+
 def test_create_task_includes_parent_when_creating_subtask() -> None:
     client = FakeClickUpClient(
         {

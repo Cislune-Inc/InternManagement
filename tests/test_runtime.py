@@ -9712,7 +9712,10 @@ def test_recent_clickup_task_activity_defers_inactivity_clockout() -> None:
         stage="active",
         clocked_in_at="2026-05-28T09:00:00-07:00",
         last_user_message_at="2026-05-28T10:00:00-07:00",
-        metadata={"active_clickup_task_id": "task-1"},
+        metadata={
+            "active_clickup_task_id": "task-1",
+            "clickup_selection_reason": "Confirmed by intern during task onboarding.",
+        },
     )
 
     changed = asyncio.run(
@@ -12546,3 +12549,351 @@ def test_runtime_scheduler_keeps_confirmed_task_after_passive_flush() -> None:
     assert session.metadata["active_clickup_task_name"] == "secondary cleanup"
     assert session.metadata["clickup_selection_reason"] == "Confirmed by intern during task onboarding."
     assert "clickup_prompt" not in session.metadata
+
+
+def test_task_creation_placement_options_include_rendered_ancestors_without_expanding_active_choices() -> None:
+    runtime = _build_runtime()
+    user = UserProfile(
+        user_key="tony",
+        display_name="Tony",
+        discord_user_id=1,
+        discord_username="tony",
+        storage_folder_name="Tony",
+    )
+    child = {
+        "id": "child-1",
+        "name": "Website development",
+        "parent": "parent-1",
+        "status": {"status": "to do", "type": "open"},
+        "list": {"id": "list-1"},
+    }
+    parent = {
+        "id": "parent-1",
+        "name": "CARVE CORE Variant",
+        "status": {"status": "to do", "type": "open"},
+        "list": {"id": "list-1"},
+    }
+
+    async def fake_hierarchy(_user, *, tasks=None, limit=25):
+        del tasks, limit
+        return {
+            "tasks_by_id": {"parent-1": parent, "child-1": child},
+            "assigned_task_ids": ["child-1"],
+            "root_ids": ["parent-1"],
+            "children_by_parent_id": {"parent-1": ["child-1"]},
+        }
+
+    runtime.clickup.build_assigned_task_hierarchy = fake_hierarchy  # type: ignore[method-assign]
+    runtime.clickup.render_assigned_task_hierarchy = (  # type: ignore[method-assign]
+        lambda *_args, **_kwargs: (
+            "\\- CARVE CORE Variant | id=parent-1\n"
+            "   \\- Website development | id=child-1 [assigned]"
+        )
+    )
+
+    context = asyncio.run(runtime._task_selection_context(user, tasks=[child]))
+
+    assert [item["id"] for item in context["candidate_tasks"]] == ["child-1"]
+    assert [item["id"] for item in context["placement_candidates"]] == [
+        "parent-1",
+        "child-1",
+    ]
+    assert context["placement_candidates"][0]["list_id"] == "list-1"
+
+
+def test_legacy_task_creation_prompt_refreshes_and_accepts_rendered_parent() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+    user = UserProfile(
+        user_key="tony",
+        display_name="Tony",
+        discord_user_id=1,
+        discord_username="tony",
+        storage_folder_name="Tony",
+    )
+    session = SessionState(
+        user_key="tony",
+        session_date="2026-08-11",
+        stage="awaiting_task_selection",
+    )
+    prompt = {
+        "type": "task_creation",
+        "source": "same_day_reclockin",
+        "step": "placement",
+        "tree_text": "\\- CARVE CORE Variant | id=parent-1",
+        "placement_candidates": [
+            {"id": "child-1", "name": "Website development", "list_id": "list-1"}
+        ],
+        "draft": {},
+    }
+    session.metadata["clickup_prompt"] = prompt
+
+    async def fake_context(_user, _session):
+        return {
+            "message": "choose",
+            "tree_text": "\\- CARVE CORE Variant | id=parent-1",
+            "candidate_tasks": [
+                {"id": "child-1", "name": "Website development", "list_id": "list-1"}
+            ],
+            "placement_candidates": [
+                {"id": "parent-1", "name": "CARVE CORE Variant", "list_id": "list-1"},
+                {"id": "child-1", "name": "Website development", "list_id": "list-1"},
+            ],
+            "hidden_count": 0,
+        }
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None):
+        del view
+        sent.append(content)
+        return None
+
+    runtime._task_selection_context = fake_context  # type: ignore[method-assign]
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    inbound = MessageRecord(
+        message_id="msg-tony-parent",
+        direction="inbound",
+        author_id=1,
+        created_at=datetime.fromisoformat("2026-08-11T13:06:23-07:00"),
+        content="CARVE CORE Variant",
+        attachments=[],
+    )
+
+    handled = asyncio.run(
+        runtime._handle_task_creation_prompt(
+            SimpleNamespace(),
+            user,
+            session,
+            inbound,
+            inbound.created_at,
+            prompt,
+        )
+    )
+
+    assert handled is True
+    assert prompt["placement_context_version"] == 2
+    assert prompt["step"] == "title"
+    assert prompt["draft"]["parent_task_id"] == "parent-1"
+    assert "CARVE CORE Variant" in sent[-1]
+    assert "What should the new task be called?" in sent[-1]
+
+
+def test_task_selection_suppresses_passive_clickup_flush() -> None:
+    runtime = _build_runtime()
+    called = False
+
+    async def fake_flush(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return True
+
+    runtime._flush_clickup_for_session = fake_flush  # type: ignore[method-assign]
+    user = UserProfile(user_key="tony", display_name="Tony", discord_user_id=1)
+    session = SessionState(
+        user_key="tony",
+        session_date="2026-08-11",
+        stage="awaiting_task_selection",
+        last_user_message_at="2026-08-11T13:00:00-07:00",
+        pending_clickup_sync=True,
+        metadata={
+            "active_clickup_task_id": "website",
+            "clickup_selection_reason": "keyword overlap: carve, core",
+            "clickup_prompt": {"type": "task_creation", "step": "placement"},
+        },
+    )
+
+    changed = asyncio.run(
+        runtime._maybe_flush_clickup(
+            user,
+            session,
+            datetime.fromisoformat("2026-08-11T13:30:00-07:00"),
+        )
+    )
+
+    assert changed is False
+    assert called is False
+
+
+def test_inferred_clickup_task_cannot_post_or_extend_inactivity() -> None:
+    runtime = _build_runtime()
+    get_task_called = False
+    post_called = False
+    user = UserProfile(user_key="tony", display_name="Tony", discord_user_id=1)
+    session = SessionState(
+        user_key="tony",
+        session_date="2026-08-11",
+        stage="active",
+        metadata={
+            "active_clickup_task_id": "website",
+            "active_clickup_task_name": "Website development",
+            "clickup_selection_reason": "keyword overlap: carve, core",
+        },
+    )
+    runtime.state_store.append_message(
+        user.user_key,
+        session.session_date,
+        MessageRecord(
+            message_id="msg-menu",
+            direction="inbound",
+            author_id=1,
+            created_at=datetime.fromisoformat("2026-08-11T09:00:00-07:00"),
+            content="create task",
+            attachments=[],
+        ),
+    )
+
+    async def fake_tracking(_user, _session):
+        return {
+            "active_task_id": "website",
+            "active_task_name": "Website development",
+            "timer_task_id": None,
+            "timer_task_name": None,
+            "timer_running": False,
+        }
+
+    async def fake_get_task(_task_id):
+        nonlocal get_task_called
+        get_task_called = True
+        return {"id": "website", "date_updated": "0"}
+
+    async def fake_post(*_args, **_kwargs):
+        nonlocal post_called
+        post_called = True
+        return "website"
+
+    runtime._get_task_tracking_state = fake_tracking  # type: ignore[method-assign]
+    runtime.clickup.get_task = fake_get_task  # type: ignore[method-assign]
+    runtime.clickup.post_update = fake_post  # type: ignore[attr-defined]
+
+    changed = asyncio.run(
+        runtime._flush_clickup_for_session(
+            user,
+            session,
+            datetime.fromisoformat("2026-08-11T10:00:00-07:00"),
+            force=True,
+        )
+    )
+    reference = datetime.fromisoformat("2026-08-11T09:00:00-07:00")
+    resolved_reference = asyncio.run(
+        runtime._inactivity_reference_with_clickup_activity(
+            user,
+            session,
+            reference_at=reference,
+            now=datetime.fromisoformat("2026-08-11T10:00:00-07:00"),
+        )
+    )
+
+    assert changed is False
+    assert post_called is False
+    assert get_task_called is False
+    assert resolved_reference == reference
+
+
+def test_typoed_hours_lookup_while_clocked_out_does_not_restart_time() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, now: datetime, *, view=None):
+        del view
+        sent.append(content)
+        return MessageRecord(
+            message_id=f"bot-{len(sent)}",
+            direction="outbound",
+            author_id=0,
+            created_at=now,
+            content=content,
+            attachments=[],
+        )
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="tony",
+        display_name="Tony",
+        discord_user_id=1,
+        timezone="America/Los_Angeles",
+    )
+    original_segments = [
+        {
+            "clocked_in_at": "2026-08-11T08:15:36-07:00",
+            "clocked_out_at": "2026-08-11T10:25:12-07:00",
+        }
+    ]
+    session = SessionState(
+        user_key="tony",
+        session_date="2026-08-11",
+        stage="clocked_out",
+        clocked_in_at="2026-08-11T08:15:36-07:00",
+        clocked_out_at="2026-08-11T10:25:12-07:00",
+        latest_status="working on the PCB",
+        work_segments=deepcopy(original_segments),
+        metadata={
+            "auto_clock_out_at": "2026-08-11T10:25:12-07:00",
+            "auto_clock_out_reason": "No inbound check-in for 1 hours.",
+        },
+    )
+    inbound = MessageRecord(
+        message_id="msg-typo-hours",
+        direction="inbound",
+        author_id=1,
+        created_at=datetime.fromisoformat("2026-08-11T10:51:44-07:00"),
+        content="what ar emy hours",
+        attachments=[],
+    )
+
+    asyncio.run(runtime.process_inbound_event(SimpleNamespace(), user, session, inbound, inbound.created_at))
+
+    assert session.stage == "clocked_out"
+    assert session.clocked_out_at == "2026-08-11T10:25:12-07:00"
+    assert session.work_segments == original_segments
+    assert session.latest_status == "working on the PCB"
+    assert session.metadata["self_lookup_prompt"]["step"] == "chooser"
+    assert "hours or your status" in sent[0]
+
+
+def test_natural_hours_lookup_uses_ai_fallback_without_changing_workflow() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+    runtime.interface_intelligence.resolve_self_lookup_intent = (  # type: ignore[attr-defined]
+        lambda _text, **_kwargs: asyncio.sleep(
+            0,
+            result=SimpleNamespace(action="hours", confidence=0.94),
+        )
+    )
+
+    async def fake_send(_client, _user, _session, content: str, now: datetime, *, view=None):
+        del view
+        sent.append(content)
+        return MessageRecord(
+            message_id=f"bot-{len(sent)}",
+            direction="outbound",
+            author_id=0,
+            created_at=now,
+            content=content,
+            attachments=[],
+        )
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(user_key="tony", display_name="Tony", discord_user_id=1)
+    session = SessionState(
+        user_key="tony",
+        session_date="2026-08-11",
+        stage="awaiting_admin_review",
+        latest_status="PCB work ready for review",
+        metadata={
+            "pending_admin_reviews": [{"task_id": "pcb", "task_name": "PCB work"}]
+        },
+    )
+    inbound = MessageRecord(
+        message_id="msg-natural-hours",
+        direction="inbound",
+        author_id=1,
+        created_at=datetime.fromisoformat("2026-08-11T11:00:00-07:00"),
+        content="could you let me know where my tracked time is at",
+        attachments=[],
+    )
+
+    asyncio.run(runtime.process_inbound_event(SimpleNamespace(), user, session, inbound, inbound.created_at))
+
+    assert session.stage == "awaiting_admin_review"
+    assert session.latest_status == "PCB work ready for review"
+    assert session.metadata["self_lookup_prompt"]["step"] == "chooser"
+    assert "hours or your status" in sent[0]

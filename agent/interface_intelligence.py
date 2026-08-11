@@ -32,6 +32,13 @@ class DailyAvailabilityIntentMatch:
     reason: str | None = None
 
 
+@dataclass(slots=True)
+class SelfLookupIntentMatch:
+    action: str
+    confidence: float
+    reason: str | None = None
+
+
 class InterfaceIntelligence:
     def __init__(self) -> None:
         api_key = os.environ.get("OPENAI_API_KEY")
@@ -165,6 +172,42 @@ class InterfaceIntelligence:
         if match_type == "no_match" or action != "not_working_today" or confidence < 0.72:
             return None
         return DailyAvailabilityIntentMatch(action=action, confidence=confidence, reason=reason)
+
+    async def resolve_self_lookup_intent(
+        self,
+        user_text: str,
+        *,
+        stage: str,
+    ) -> SelfLookupIntentMatch | None:
+        if not self.enabled or not self.client or not user_text.strip():
+            return None
+        prompt = (
+            "You are classifying a Discord DM from an intern in a work-tracking workflow.\n"
+            "Decide whether the intern is asking to see their own hours/time-tracking record or their current work status.\n"
+            "Allow natural wording and minor spelling mistakes. Only match a self-lookup request.\n"
+            "Do not match progress reports, statements about hours already worked, permission questions about future schedules, "
+            "clock-in/clock-out commands, or requests about another person.\n"
+            "Return strict JSON with keys: match_type, action, confidence, reason.\n"
+            "match_type must be one of intent_match or no_match.\n"
+            "action must be hours, status, or no_match.\n\n"
+            f"Workflow stage: {stage}\n"
+            f"Intern message:\n{user_text}"
+        )
+        try:
+            response = await self._create_response(prompt)
+        except Exception:
+            self.enabled = False
+            return None
+        payload = _extract_json(response.output_text)
+        if not isinstance(payload, dict):
+            return None
+        match_type = str(payload.get("match_type") or "").strip().lower()
+        action = str(payload.get("action") or "").strip().lower()
+        confidence = _coerce_confidence(payload.get("confidence"))
+        reason = str(payload.get("reason") or "").strip() or None
+        if match_type == "no_match" or action not in {"hours", "status"} or confidence < 0.75:
+            return None
+        return SelfLookupIntentMatch(action=action, confidence=confidence, reason=reason)
 
     async def enrich_intern_signals(self, text: str, stage: str, signals: MessageSignals) -> MessageSignals:
         if not text.strip() or not self.enabled or not self.client:

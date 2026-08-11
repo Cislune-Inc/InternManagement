@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import difflib
 import hashlib
 import json
 import logging
@@ -111,6 +112,8 @@ _SELF_LOOKUP_PROMPT_KEY = "self_lookup_prompt"
 _DAY_SUPPRESSION_PROMPT_KEY = "day_suppression_prompt"
 _DAY_SUPPRESSION_STATE_KEY = "day_suppression"
 _LUNCH_WINDOWS_KEY = "lunch_windows"
+_ACTIVE_TASK_AUTHORITY_KEY = "active_clickup_task_authority"
+_TASK_PLACEMENT_CONTEXT_VERSION = 2
 _TASK_CORRECTION_WITH_HINT_PATTERNS = (
     re.compile(r"^(?:actually\s+)?switch\s+task\s+to\s+(.+)$", re.IGNORECASE),
     re.compile(r"^(?:actually\s+)?use\s+(.+?)\s+instead\.?$", re.IGNORECASE),
@@ -1429,6 +1432,11 @@ class InternManagementRuntime:
         if not session.first_sign_of_life_at:
             session.first_sign_of_life_at = now.isoformat()
         self_lookup_request = self._self_lookup_request_kind(inbound.content)
+        if not self_lookup_request and self._could_be_self_lookup_request(inbound.content):
+            self_lookup_request = await self._resolve_self_lookup_request_kind(
+                inbound.content,
+                stage=session.stage,
+            )
         if self_lookup_request:
             if self._progress_probe_prompt(session):
                 await self._close_progress_probe(
@@ -1751,7 +1759,7 @@ class InternManagementRuntime:
         if not session.intake_completed_at:
             await self._begin_daily_clock_in_intake(client, user, session, now, source="same_day_reclockin")
             return True
-        active_task_id = self._active_task_id(session)
+        active_task_id = self._authoritative_active_task_id(session)
         active_task_name = str(session.metadata.get("active_clickup_task_name") or "")
         if active_task_id:
             session.stage = "active"
@@ -1825,6 +1833,7 @@ class InternManagementRuntime:
         *,
         source: str,
     ) -> None:
+        self._clear_non_authoritative_active_task_context(session)
         session.stage = "awaiting_task_selection"
         session.awaiting_start_photo = False
         session.clocked_out_at = None
@@ -1925,6 +1934,7 @@ class InternManagementRuntime:
         *,
         reason: str,
     ) -> None:
+        self._clear_non_authoritative_active_task_context(session)
         session.stage = "awaiting_task_selection"
         session.awaiting_start_photo = False
         session.awaiting_clock_out_photo = False
@@ -3833,10 +3843,15 @@ class InternManagementRuntime:
         session: SessionState,
         now: datetime,
     ) -> bool:
-        if session.stage == "awaiting_clock_out_artifacts":
+        if session.stage in {"awaiting_task_selection", "awaiting_clock_out_artifacts", "clocked_out"}:
             return False
         prompt = session.metadata.get(_CLICKUP_PROMPT_KEY)
-        if isinstance(prompt, dict) and str(prompt.get("type") or "") in {"task_onboarding", "progress_probe"}:
+        if isinstance(prompt, dict) and str(prompt.get("type") or "") in {
+            "task_onboarding",
+            "task_creation",
+            "task_creation_pending_approval",
+            "progress_probe",
+        }:
             return False
         if self._pending_follow_up(session) or self._pending_follow_up_aggregation(session):
             return False
@@ -3877,6 +3892,8 @@ class InternManagementRuntime:
         *,
         force: bool,
     ) -> bool:
+        if session.stage in {"awaiting_task_selection", "awaiting_clock_out_artifacts"}:
+            return False
         messages = self.list_session_messages(user.user_key, session)
         if session.last_clickup_sync_at and not force:
             cutoff = self._coerce_datetime(
@@ -3889,7 +3906,9 @@ class InternManagementRuntime:
             return False
         tracking = await self._get_task_tracking_state(user, session)
         self._reconcile_active_task_with_tracking(session, tracking)
-        authoritative_task_id = str(tracking.get("timer_task_id") or self._active_task_id(session) or "") or None
+        authoritative_task_id = self._authoritative_active_task_id(session, tracking=tracking)
+        if not authoritative_task_id:
+            return False
         authoritative_task_name = str(
             tracking.get("timer_task_name")
             or session.metadata.get("active_clickup_task_name")
@@ -5563,6 +5582,8 @@ class InternManagementRuntime:
         preserve_active_task: bool = False,
     ) -> None:
         if not preserve_active_task or not self._active_task_id(session):
+            session.metadata.pop(_ACTIVE_TASK_AUTHORITY_KEY, None)
+            session.metadata.pop("credible_clickup_activity", None)
             if bundle.active_task_id:
                 session.metadata["active_clickup_task_id"] = bundle.active_task_id
             else:
@@ -7553,6 +7574,7 @@ class InternManagementRuntime:
                 "message": "Tell me which ClickUp task you are working on right now.",
                 "tree_text": "",
                 "candidate_tasks": [],
+                "placement_candidates": [],
                 "hidden_count": 0,
             }
         assigned_tasks = list(tasks) if tasks is not None else await self.clickup.list_assigned_tasks(user, limit=8)
@@ -7592,6 +7614,7 @@ class InternManagementRuntime:
                 "message": message,
                 "tree_text": "",
                 "candidate_tasks": [],
+                "placement_candidates": [],
                 "hidden_count": hidden_count,
             }
         recommended_task_id = str((recommended_task or {}).get("id") or "")
@@ -7605,6 +7628,7 @@ class InternManagementRuntime:
         workspace_visible = workspace_options[: max(0, 5 - len(assigned_visible))]
 
         raw_tasks_by_id: dict[str, dict[str, Any]] = {}
+        hierarchy: dict[str, Any] = {}
         tree_text = ""
         if assigned_visible and hasattr(self.clickup, "build_assigned_task_hierarchy") and hasattr(self.clickup, "render_assigned_task_hierarchy"):
             hierarchy = await self.clickup.build_assigned_task_hierarchy(
@@ -7652,6 +7676,55 @@ class InternManagementRuntime:
             if str(task.get("id") or "")
         ]
         candidate_tasks = (assigned_candidates + workspace_candidates)[:5]
+        placement_candidates: list[dict[str, Any]] = []
+        seen_placement_ids: set[str] = set()
+
+        def _add_placement_candidate(task: dict[str, Any], *, workspace_option: bool = False) -> None:
+            task_id = str(task.get("id") or "").strip()
+            list_id = self._extract_task_list_id(task) or str(task.get("list_id") or "").strip()
+            status_payload = task.get("status")
+            status_payload = status_payload if isinstance(status_payload, dict) else {}
+            status_name = str(status_payload.get("status") or "").strip().lower()
+            status_type = str(status_payload.get("type") or "").strip().lower()
+            if not task_id or not list_id or task_id in seen_placement_ids:
+                return
+            if status_type == "closed" or status_name in {"closed", "complete", "completed"}:
+                return
+            candidate = {
+                "id": task_id,
+                "name": str(task.get("name") or task_id),
+                "parent_task_id": self._extract_task_parent_id(task)
+                or str(task.get("parent_task_id") or ""),
+                "list_id": list_id,
+            }
+            if workspace_option:
+                candidate["workspace_option"] = True
+                candidate["location"] = str(
+                    task.get("location") or self._task_option_location_label(task)
+                )
+            placement_candidates.append(candidate)
+            seen_placement_ids.add(task_id)
+
+        raw_children = hierarchy.get("children_by_parent_id") if isinstance(hierarchy, dict) else {}
+        raw_children = raw_children if isinstance(raw_children, dict) else {}
+
+        def _walk_placement(task_id: str) -> None:
+            task = raw_tasks_by_id.get(task_id)
+            if isinstance(task, dict):
+                _add_placement_candidate(task)
+            child_ids = raw_children.get(task_id)
+            if isinstance(child_ids, list):
+                for child_id in child_ids:
+                    _walk_placement(str(child_id))
+
+        root_ids = hierarchy.get("root_ids") if isinstance(hierarchy, dict) else []
+        if isinstance(root_ids, list):
+            for root_id in root_ids:
+                _walk_placement(str(root_id))
+        for task in assigned_visible:
+            _add_placement_candidate(task)
+        for task in workspace_candidates:
+            _add_placement_candidate(task, workspace_option=True)
         lines = [
             "I need to confirm your active ClickUp task before you continue.",
             "",
@@ -7702,6 +7775,7 @@ class InternManagementRuntime:
             "message": "\n".join(lines),
             "tree_text": tree_text,
             "candidate_tasks": candidate_tasks,
+            "placement_candidates": placement_candidates,
             "hidden_count": hidden_count,
         }
 
@@ -7715,6 +7789,7 @@ class InternManagementRuntime:
     ) -> None:
         source = str(prompt.get("source") or "task_onboarding")
         selection_context = await self._task_selection_context(user, session)
+        self._clear_non_authoritative_active_task_context(session)
         session.stage = "awaiting_task_selection"
         session.metadata[_CLICKUP_PROMPT_KEY] = {
             "type": "task_creation",
@@ -7722,7 +7797,11 @@ class InternManagementRuntime:
             "reason": str(prompt.get("reason") or ""),
             "step": "placement",
             "tree_text": selection_context["tree_text"],
-            "placement_candidates": selection_context["candidate_tasks"],
+            "placement_candidates": selection_context.get(
+                "placement_candidates",
+                selection_context["candidate_tasks"],
+            ),
+            "placement_context_version": _TASK_PLACEMENT_CONTEXT_VERSION,
             "draft": {},
         }
         session.metadata["last_task_onboarding_prompt_at"] = now.isoformat()
@@ -7930,6 +8009,17 @@ class InternManagementRuntime:
         if not isinstance(raw, list):
             return []
         return [item for item in raw if isinstance(item, dict)]
+
+    async def _refresh_legacy_task_creation_placement_context(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        prompt: dict[str, Any],
+    ) -> None:
+        context = await self._task_selection_context(user, session)
+        prompt["tree_text"] = context.get("tree_text") or ""
+        prompt["placement_candidates"] = context.get("placement_candidates") or []
+        prompt["placement_context_version"] = _TASK_PLACEMENT_CONTEXT_VERSION
 
     def _match_task_creation_parent_candidate(
         self,
@@ -8195,6 +8285,17 @@ class InternManagementRuntime:
                 )
                 return True
             candidate = self._match_task_creation_parent_candidate(prompt, text)
+            if (
+                not candidate
+                and int(prompt.get("placement_context_version") or 0)
+                < _TASK_PLACEMENT_CONTEXT_VERSION
+            ):
+                await self._refresh_legacy_task_creation_placement_context(
+                    user,
+                    session,
+                    prompt,
+                )
+                candidate = self._match_task_creation_parent_candidate(prompt, text)
             if not candidate:
                 await self._send_dm(
                     client,
@@ -8418,6 +8519,7 @@ class InternManagementRuntime:
         else:
             selection_reason = "Confirmed by intern during task onboarding."
         session.metadata["clickup_selection_reason"] = selection_reason
+        session.metadata[_ACTIVE_TASK_AUTHORITY_KEY] = "intern_confirmed"
         if source in {"intern_switch", "review_rework_switch"}:
             self._clear_pending_intern_task_switch(session)
         session.stage = "active"
@@ -10852,6 +10954,7 @@ class InternManagementRuntime:
         session.metadata["active_clickup_task_id"] = task_id
         if task_name:
             session.metadata["active_clickup_task_name"] = task_name
+        session.metadata.setdefault(_ACTIVE_TASK_AUTHORITY_KEY, "activated")
         status_name = await self._safe_set_task_state(session, task_id, "in_progress")
         await self._start_task_timer(user, session, now, task_id, task_name)
         tracking_state = await self._get_task_tracking_state(user, session)
@@ -11072,6 +11175,9 @@ class InternManagementRuntime:
         if active_task_id != timer_task_id:
             session.metadata["active_clickup_task_id"] = timer_task_id
             tracking["active_task_id"] = timer_task_id
+            changed = True
+        if not session.metadata.get(_ACTIVE_TASK_AUTHORITY_KEY):
+            session.metadata[_ACTIVE_TASK_AUTHORITY_KEY] = "timer_recovered"
             changed = True
         if timer_task_name:
             if active_task_name != timer_task_name:
@@ -13116,7 +13222,7 @@ class InternManagementRuntime:
         reference_at: datetime,
         now: datetime,
     ) -> datetime:
-        task_id = str(self._active_task_id(session) or "").strip()
+        task_id = str(self._authoritative_active_task_id(session) or "").strip()
         if not self.clickup or not task_id:
             return reference_at
         cache = session.metadata.get("credible_clickup_activity")
@@ -13234,6 +13340,58 @@ class InternManagementRuntime:
 
     def _clear_active_task_metadata(self, session: SessionState) -> None:
         SessionMetadata(session).clear_active_task()
+        session.metadata.pop(_ACTIVE_TASK_AUTHORITY_KEY, None)
+        session.metadata.pop("credible_clickup_activity", None)
+
+    def _authoritative_active_task_id(
+        self,
+        session: SessionState,
+        *,
+        tracking: dict[str, Any] | None = None,
+    ) -> str | None:
+        tracking_state = tracking if isinstance(tracking, dict) else session.metadata.get("clickup_time_tracking")
+        if isinstance(tracking_state, dict) and not tracking_state.get("closed_at"):
+            timer_task_id = str(
+                tracking_state.get("timer_task_id") or tracking_state.get("task_id") or ""
+            ).strip()
+            if timer_task_id:
+                return timer_task_id
+        active_task_id = str(self._active_task_id(session) or "").strip()
+        authority = str(session.metadata.get(_ACTIVE_TASK_AUTHORITY_KEY) or "").strip().lower()
+        if active_task_id and authority in {
+            "intern_confirmed",
+            "activated",
+            "timer_recovered",
+            "admin_confirmed",
+        }:
+            return active_task_id
+        selection_reason = str(session.metadata.get("clickup_selection_reason") or "").strip().lower()
+        if active_task_id and (
+            selection_reason.startswith("confirmed by intern")
+            or selection_reason.startswith("started by the intern")
+            or selection_reason.startswith("recovered from the running task timer")
+        ):
+            return active_task_id
+        if active_task_id and session.intake_completed_at and not selection_reason:
+            return active_task_id
+        for review in self._pending_admin_reviews(session):
+            review_task_id = str(review.get("task_id") or "").strip()
+            if review_task_id and (not active_task_id or review_task_id == active_task_id):
+                return review_task_id
+        return None
+
+    def _clear_non_authoritative_active_task_context(self, session: SessionState) -> bool:
+        if self._authoritative_active_task_id(session):
+            return False
+        changed = bool(
+            self._active_task_id(session)
+            or session.metadata.get("active_clickup_task_name")
+            or session.metadata.get("clickup_selection_reason")
+            or session.metadata.get("credible_clickup_activity")
+        )
+        self._clear_active_task_metadata(session)
+        session.metadata.pop("clickup_selection_reason", None)
+        return changed
 
     def _pending_admin_unblocker_task(self, session: SessionState) -> dict[str, Any] | None:
         value = session.metadata.get("pending_admin_unblocker_task")
@@ -13386,7 +13544,47 @@ class InternManagementRuntime:
             return True
         if "hours" not in token_set:
             return False
-        return bool(token_set & _SELF_LOOKUP_HOURS_REPORT_TOKENS)
+        if token_set & _SELF_LOOKUP_HOURS_REPORT_TOKENS:
+            return True
+        if len(normalized_text.split()) <= 8:
+            return any(
+                difflib.SequenceMatcher(None, normalized_text, pattern).ratio() >= 0.82
+                for pattern in _SELF_LOOKUP_HOURS_REQUEST_PATTERNS
+            )
+        return False
+
+    def _could_be_self_lookup_request(self, text: str) -> bool:
+        normalized = self._normalize_freeform_lookup_text(text)
+        if not normalized or len(normalized.split()) > 20:
+            return False
+        tokens = set(normalized.split())
+        hours_topic = "hours" in tokens or any(
+            phrase in normalized for phrase in _SELF_LOOKUP_TIME_TRACKING_PHRASES
+        )
+        status_topic = "status" in tokens and bool(
+            tokens & {"my", "mine", "current", "show", "what", "whats"}
+        )
+        if not (hours_topic or status_topic):
+            return False
+        progress_markers = {"worked", "spent", "finished", "completed", "today"}
+        if hours_topic and not (
+            "?" in text or normalized.startswith(_SELF_LOOKUP_HOURS_REQUEST_PREFIXES)
+        ):
+            return not bool(tokens & progress_markers)
+        return True
+
+    async def _resolve_self_lookup_request_kind(self, text: str, *, stage: str) -> str | None:
+        interpreter = getattr(self, "interface_intelligence", None)
+        if not interpreter or not hasattr(interpreter, "resolve_self_lookup_intent"):
+            return None
+        try:
+            match = await interpreter.resolve_self_lookup_intent(text, stage=stage)
+        except Exception:
+            return None
+        if not match:
+            return None
+        action = str(getattr(match, "action", "") or "").strip().lower()
+        return action if action in {"hours", "status"} else None
 
     def _self_lookup_request_kind(self, text: str) -> str | None:
         normalized = self._normalize_freeform_lookup_text(text)
