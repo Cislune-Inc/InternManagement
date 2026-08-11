@@ -298,6 +298,99 @@ def test_adaptive_follow_up_interval_uses_task_estimate_and_user_override() -> N
     assert runtime._adaptive_follow_up_interval_minutes(user, session) == 110
 
 
+def test_worker_checkpoint_drives_one_friendly_reminder() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, now: datetime):
+        sent.append(content)
+        return MessageRecord(
+            message_id=f"bot-{len(sent)}",
+            direction="outbound",
+            author_id=0,
+            created_at=now,
+            content=content,
+            attachments=[],
+        )
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(
+        user_key="alex",
+        display_name="Alex",
+        discord_user_id=1,
+        discord_username="alex",
+        storage_folder_name="Alex",
+    )
+    session = SessionState(
+        user_key="alex",
+        session_date="2026-08-11",
+        stage="active",
+        clocked_in_at="2026-08-11T09:00:00-07:00",
+        intake_completed_at="2026-08-11T09:00:00-07:00",
+    )
+    selected_at = datetime.fromisoformat("2026-08-11T09:10:00-07:00")
+    runtime._set_worker_checkpoint(
+        session,
+        selected_at,
+        "60 minutes",
+        source="worker_portal",
+    )
+
+    early = asyncio.run(
+        runtime._maybe_send_follow_up(
+            SimpleNamespace(),
+            user,
+            session,
+            datetime.fromisoformat("2026-08-11T10:09:00-07:00"),
+        )
+    )
+    due = asyncio.run(
+        runtime._maybe_send_follow_up(
+            SimpleNamespace(),
+            user,
+            session,
+            datetime.fromisoformat("2026-08-11T10:10:00-07:00"),
+        )
+    )
+    repeated = asyncio.run(
+        runtime._maybe_send_follow_up(
+            SimpleNamespace(),
+            user,
+            session,
+            datetime.fromisoformat("2026-08-11T12:10:00-07:00"),
+        )
+    )
+
+    assert early is False
+    assert due is True
+    assert repeated is False
+    assert len(sent) == 1
+    assert "you chose 60 minutes" in sent[0]
+    assert "still clocked in" in sent[0]
+    assert session.metadata["worker_checkpoint"]["reminder_sent"] is True
+
+
+def test_clear_communicators_receive_more_quiet_time_without_explicit_checkpoint() -> None:
+    runtime = _build_runtime()
+    runtime.config.schedule.follow_up_interval_minutes = 90
+    user = UserProfile(user_key="alex", display_name="Alex", discord_user_id=1)
+    session = SessionState(
+        user_key="alex",
+        session_date="2026-08-11",
+        metadata={"task_onboarding_estimated_duration": "3 hours"},
+    )
+    now = datetime.fromisoformat("2026-08-11T10:00:00-07:00")
+    for index in range(3):
+        runtime._record_checkpoint_quality(
+            session,
+            now + timedelta(minutes=index),
+            meaningful=True,
+            source="scheduled_check_in",
+        )
+
+    assert runtime._adaptive_follow_up_interval_minutes(user, session) == 105
+
+
 def test_slack_feedback_reaction_flags_update_for_manager_review() -> None:
     runtime = _build_runtime()
     runtime.config.slack.enabled = True
@@ -2486,8 +2579,8 @@ def test_runtime_follow_up_probe_starts_after_one_minute_of_silence() -> None:
     prompt = session.metadata["clickup_prompt"]
     assert prompt["type"] == "progress_probe"
     assert "follow_up_response_aggregation" not in session.metadata
-    assert any("I still cannot tell what progress was made" in item for item in sent)
-    assert any("Would you like to see their response to the progress probe?" in item for item in admin_notices)
+    assert any("I need one concrete detail" in item for item in sent)
+    assert admin_notices == []
 
 
 def test_runtime_follow_up_probe_accepts_concrete_combined_reply() -> None:

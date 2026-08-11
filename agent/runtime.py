@@ -91,6 +91,9 @@ _SLACK_SENT_USING_MARKER_RE = re.compile(
 )
 _FOLLOW_UP_RESPONSE_AGGREGATION_KEY = "follow_up_response_aggregation"
 _PROGRESS_PROBE_HISTORY_KEY = "progress_probe_history"
+_WORKER_CHECKPOINT_KEY = "worker_checkpoint"
+_CHECKPOINT_QUALITY_HISTORY_KEY = "checkpoint_quality_history"
+_STILL_WORKING_ACK_KEY = "still_working_ack"
 _FOLLOW_UP_PROBE_GRACE_WINDOW = timedelta(minutes=1)
 _PROGRESS_PROBE_TIMEOUT = timedelta(minutes=30)
 _AUTO_CLOCK_OUT_WARNING_KEY = "auto_clock_out_warning"
@@ -2293,6 +2296,12 @@ class InternManagementRuntime:
         prompt = session.metadata.get(_CLICKUP_PROMPT_KEY)
         if isinstance(prompt, dict) and str(prompt.get("type") or "") in {"task_onboarding", "progress_probe"}:
             return False
+        pending_follow_up = self._pending_follow_up(session)
+        if pending_follow_up and bool(pending_follow_up.get("awaiting_reply", True)):
+            # A checkpoint gets one friendly reminder. The four-hour inactivity
+            # backstop is responsible for an unattended session; repeating the
+            # same question only creates notification fatigue.
+            return False
         if self._pending_follow_up_aggregation(session):
             return False
         if not session.intake_completed_at:
@@ -2305,31 +2314,56 @@ class InternManagementRuntime:
         )
         if not intake_completed:
             return False
-        follow_up_interval = self._adaptive_follow_up_interval_minutes(user, session)
-        if now - intake_completed < timedelta(minutes=follow_up_interval):
-            return False
-        if session.last_follow_up_at:
-            last_follow_up = self._coerce_datetime_for_reference(
-                session.last_follow_up_at,
+        worker_checkpoint = self._worker_checkpoint(session)
+        if worker_checkpoint:
+            if bool(worker_checkpoint.get("reminder_sent")):
+                return False
+            due_at = self._coerce_datetime_for_reference(
+                str(worker_checkpoint.get("due_at") or ""),
                 reference=now,
                 timezone_name=timezone_name,
             )
-            if last_follow_up and now - last_follow_up < timedelta(minutes=follow_up_interval):
+            if not due_at or now < due_at:
                 return False
+        else:
+            follow_up_interval = self._adaptive_follow_up_interval_minutes(user, session)
+            if now - intake_completed < timedelta(minutes=follow_up_interval):
+                return False
+            if session.last_follow_up_at:
+                last_follow_up = self._coerce_datetime_for_reference(
+                    session.last_follow_up_at,
+                    reference=now,
+                    timezone_name=timezone_name,
+                )
+                if last_follow_up and now - last_follow_up < timedelta(minutes=follow_up_interval):
+                    return False
         questions = self.config.prompts.follow_up_questions
         if not questions:
             logger.warning("Skipping follow-up for user %s because prompts.follow_up_questions is empty.", user.user_key)
             return False
         index = int(session.metadata.get("follow_up_index", 0)) % len(questions)
-        sent = await self._send_dm(client, user, session, questions[index], now)
+        selected_choice = str((worker_checkpoint or {}).get("choice") or "").strip()
+        question_text = (
+            "Quick checkpoint—what changed, what is next, or is anything blocked? "
+            "One concise line is enough. You are still clocked in; this is not a clock-out warning."
+        )
+        if selected_choice:
+            question_text = (
+                f"Quick checkpoint—you chose {selected_choice}. What changed, what is next, "
+                "or is anything blocked? One concise line is enough. You are still clocked in."
+            )
+        sent = await self._send_dm(client, user, session, question_text, now)
         session.metadata["follow_up_index"] = index + 1
         session.last_follow_up_at = now.isoformat()
         session.metadata[_PENDING_FOLLOW_UP_KEY] = {
             "message_id": sent.message_id if isinstance(sent, MessageRecord) else f"follow-up:{int(now.timestamp())}",
-            "question_text": questions[index],
+            "question_text": question_text,
             "sent_at": now.isoformat(),
             "awaiting_reply": True,
         }
+        if worker_checkpoint is not None:
+            worker_checkpoint["reminder_sent"] = True
+            worker_checkpoint["reminder_sent_at"] = now.isoformat()
         return True
 
     def _adaptive_follow_up_interval_minutes(
@@ -2344,14 +2378,99 @@ class InternManagementRuntime:
             str(session.metadata.get("task_onboarding_estimated_duration") or "")
         )
         if estimated_minutes is None:
-            return base_interval
-        if estimated_minutes <= 60:
-            return 45
-        if estimated_minutes <= 3 * 60:
-            return 75
-        if estimated_minutes <= 8 * 60:
-            return 90
-        return min(120, max(90, base_interval))
+            interval = base_interval
+        elif estimated_minutes <= 60:
+            interval = 45
+        elif estimated_minutes <= 3 * 60:
+            interval = 75
+        elif estimated_minutes <= 8 * 60:
+            interval = 90
+        else:
+            interval = min(120, max(90, base_interval))
+        if self._useful_checkpoint_streak(session) >= 3:
+            # Clear communicators earn a little more uninterrupted focus time
+            # when they have not explicitly chosen a portal checkpoint.
+            interval = min(180, interval + 30)
+        return interval
+
+    def _worker_checkpoint(self, session: SessionState) -> dict[str, Any] | None:
+        value = session.metadata.get(_WORKER_CHECKPOINT_KEY)
+        return value if isinstance(value, dict) else None
+
+    def _set_worker_checkpoint(
+        self,
+        session: SessionState,
+        now: datetime,
+        choice: str,
+        *,
+        source: str,
+    ) -> dict[str, Any]:
+        normalized = " ".join(str(choice or "").strip().lower().split())
+        if normalized == "when result is ready":
+            interval_minutes = 120
+        else:
+            interval_minutes = self._estimated_task_duration_minutes(normalized) or 60
+        interval_minutes = max(30, min(120, interval_minutes))
+        checkpoint = {
+            "choice": normalized or "60 minutes",
+            "set_at": now.isoformat(),
+            "due_at": (now + timedelta(minutes=interval_minutes)).isoformat(),
+            "interval_minutes": interval_minutes,
+            "source": source,
+            "reminder_sent": False,
+        }
+        session.metadata[_WORKER_CHECKPOINT_KEY] = checkpoint
+        session.metadata["task_onboarding_checkpoint"] = checkpoint["choice"]
+        self._clear_follow_up_probe_tracking(session)
+        return checkpoint
+
+    def _record_checkpoint_quality(
+        self,
+        session: SessionState,
+        now: datetime,
+        *,
+        meaningful: bool,
+        source: str,
+    ) -> None:
+        history = session.metadata.get(_CHECKPOINT_QUALITY_HISTORY_KEY)
+        if not isinstance(history, list):
+            history = []
+        history.append(
+            {
+                "recorded_at": now.isoformat(),
+                "meaningful": bool(meaningful),
+                "source": source,
+            }
+        )
+        session.metadata[_CHECKPOINT_QUALITY_HISTORY_KEY] = history[-10:]
+        if meaningful:
+            session.metadata.pop(_STILL_WORKING_ACK_KEY, None)
+
+    def _renew_checkpoint_after_response(
+        self,
+        session: SessionState,
+        now: datetime,
+        *,
+        source: str,
+    ) -> None:
+        worker_checkpoint = self._worker_checkpoint(session)
+        choice = str((worker_checkpoint or {}).get("choice") or "").strip()
+        if choice:
+            self._set_worker_checkpoint(session, now, choice, source=source)
+            return
+        self._clear_follow_up_probe_tracking(session)
+        session.last_follow_up_at = now.isoformat()
+
+    def _useful_checkpoint_streak(self, session: SessionState) -> int:
+        history = session.metadata.get(_CHECKPOINT_QUALITY_HISTORY_KEY)
+        if not isinstance(history, list):
+            return 0
+        streak = 0
+        for item in reversed(history):
+            if not isinstance(item, dict) or not bool(item.get("meaningful")):
+                break
+            streak += 1
+        return streak
 
     def _estimated_task_duration_minutes(self, value: str) -> int | None:
         normalized = value.strip().lower()
@@ -3263,14 +3382,16 @@ class InternManagementRuntime:
                     "What is the next step or blocker?",
                 ]
             return (
-                "I still cannot tell what actually changed from that update. Be concrete.\n\n"
+                "Thanks for checking in. I just need one concrete detail for the project record.\n\n"
                 + "\n".join(f"{index}. {question}" for index, question in enumerate(cleaned, start=1))
+                + "\n\nOne concise reply is enough; you are still clocked in."
             )
         if not cleaned:
             cleaned = self._default_progress_probe_questions()
         return (
-            "I still cannot tell what progress was made from that update, so I need a more specific check-in before I count it as project progress.\n\n"
+            "Thanks for checking in. I need one concrete detail before I can count this as project progress.\n\n"
             + "\n".join(f"{index}. {question}" for index, question in enumerate(cleaned, start=1))
+            + "\n\nOne concise reply is enough; you are still clocked in."
         )
 
     def _progress_probe_closure_message(self, reason: str) -> str:
@@ -3430,25 +3551,9 @@ class InternManagementRuntime:
             message_id=sent.message_id if isinstance(sent, MessageRecord) else None,
         )
         prompt["last_activity_at"] = now.isoformat()
-        await self._send_admin_notice(
-            client,
-            (
-                f"{user.display_name} sent a weak scheduled check-in reply.\n\n"
-                f"Scheduled follow-up:\n{str(aggregate.get('question_text') or 'Unknown question')}\n\n"
-                f"Aggregated reply after the 1-minute wait:\n{original_reply_text or 'No text captured.'}\n\n"
-                f"Reason: {reason}\n\n"
-                "Would you like to see their response to the progress probe?"
-            ),
-            user=user,
-            session=session,
-            view_factory=lambda admin: _AdminProgressProbeView(
-                self,
-                admin,
-                user_key=user.user_key,
-                session_date=session.session_date,
-                probe_id=probe_id,
-            ),
-        )
+        # A vague check-in is coaching context, not an admin exception. Managers
+        # are only pulled in by a blocker, a real labor/compliance exception, or
+        # an explicit worker request.
 
     async def _maybe_assess_pending_follow_up_probe(
         self,
@@ -3473,7 +3578,17 @@ class InternManagementRuntime:
             return False
         combined_text = self._combined_follow_up_reply_text(aggregate)
         if not combined_text and int(aggregate.get("attachment_count") or 0) > 0:
-            self._clear_follow_up_probe_tracking(session)
+            self._record_checkpoint_quality(
+                session,
+                now,
+                meaningful=True,
+                source="scheduled_check_in_attachment",
+            )
+            self._renew_checkpoint_after_response(
+                session,
+                now,
+                source="scheduled_check_in_attachment",
+            )
             return True
         if not combined_text:
             self._clear_follow_up_probe_tracking(session)
@@ -3490,7 +3605,17 @@ class InternManagementRuntime:
         )
         session.latest_status = combined_text
         if assessment.meaningful_progress or not assessment.needs_probe:
-            self._clear_follow_up_probe_tracking(session)
+            self._record_checkpoint_quality(
+                session,
+                now,
+                meaningful=True,
+                source="scheduled_check_in",
+            )
+            self._renew_checkpoint_after_response(
+                session,
+                now,
+                source="scheduled_check_in_reply",
+            )
             return True
         await self._start_progress_probe(
             client,
@@ -6372,12 +6497,23 @@ class InternManagementRuntime:
         )
         if assessment.meaningful_progress or not assessment.needs_probe:
             session.latest_status = text
+            self._record_checkpoint_quality(
+                session,
+                now,
+                meaningful=True,
+                source="scheduled_clarification",
+            )
             await self._close_progress_probe(
                 client,
                 user,
                 session,
                 now,
                 reason="captured_meaningful_progress",
+            )
+            self._renew_checkpoint_after_response(
+                session,
+                now,
+                source="scheduled_clarification_reply",
             )
             await self._send_dm(
                 client,
@@ -6387,28 +6523,12 @@ class InternManagementRuntime:
                 now,
             )
             return True
-        if self._progress_probe_round(prompt) < 2:
-            clarification_text = self._progress_probe_prompt_text(
-                assessment.probe_questions or self._default_progress_probe_questions(),
-                clarification=True,
-            )
-            prompt["probe_round"] = self._progress_probe_round(prompt) + 1
-            sent = await self._send_dm(client, user, session, clarification_text, now)
-            self._record_progress_probe_exchange_entry(
-                prompt,
-                role="bot",
-                content=clarification_text,
-                message_id=sent.message_id if isinstance(sent, MessageRecord) else None,
-            )
-            prompt["last_activity_at"] = now.isoformat()
-            await self._notify_progress_probe_subscribers(
-                client,
-                user,
-                session,
-                prompt,
-                f"Don Pollo asked a follow-up progress probe:\n\n{clarification_text}",
-            )
-            return True
+        self._record_checkpoint_quality(
+            session,
+            now,
+            meaningful=False,
+            source="scheduled_clarification",
+        )
         await self._close_progress_probe(
             client,
             user,
@@ -6416,13 +6536,18 @@ class InternManagementRuntime:
             now,
             reason="probe_exhausted",
         )
+        self._renew_checkpoint_after_response(
+            session,
+            now,
+            source="scheduled_clarification_exhausted",
+        )
         await self._send_dm(
             client,
             user,
             session,
             (
-                "I still could not tell what changed from that response, so I am ending the probe for now. "
-                "On the next check-in, tell me one concrete change, the exact part you worked on, and the next step or blocker."
+                "No problem—keep working. I will not keep interrupting. "
+                "At the next natural checkpoint, use one concrete change, the next step, or the blocker so the update is useful to the team."
             ),
             now,
         )

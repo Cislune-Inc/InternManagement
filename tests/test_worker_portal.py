@@ -334,7 +334,10 @@ def test_worker_portal_html_exposes_review_before_submit_ai_controls(tmp_path) -
 
     assert 'data-action="coach-plan"' in html
     assert 'data-action="coach-checkpoint"' in html
-    assert "only Save checkpoint changes the work record" in html
+    assert 'data-progress-kind="still_working"' in html
+    assert 'id="next-checkpoint"' in html
+    assert 'id="checkpoint-panel"' in html
+    assert "only Save update changes the work record" in html
     assert "Review / edit the structured work plan" in html
 
 
@@ -668,6 +671,9 @@ def test_roster_worker_portal_uses_one_live_session_and_idempotent_timer(tmp_pat
     assert len(live_session.work_segments) == 1
     assert live_session.metadata["clickup_time_tracking"]["task_id"] == "assigned"
     assert live_session.metadata.get("clickup_time_tracking_history", []) == []
+    assert live_session.metadata["task_onboarding_estimated_duration"] == "1 hour"
+    assert live_session.metadata["worker_checkpoint"]["choice"] == "60 minutes"
+    assert live_session.metadata["worker_checkpoint"]["reminder_sent"] is False
 
     checkpoint = asyncio.run(
         service.apply_action(
@@ -676,15 +682,20 @@ def test_roster_worker_portal_uses_one_live_session_and_idempotent_timer(tmp_pat
                 # Existing open pages used the DOM-style action name. The API
                 # intentionally accepts it so a deploy fixes them immediately.
                 "action": "check-in",
+                "progress_kind": "blocked",
                 "progress": "Completed the base measurements and recorded the first alignment datum in the build sheet",
                 "blocker": "Waiting for the revised fastener dimensions before final assembly",
+                "checkpoint": "2 hours",
             },
         )
     )
-    assert "Checkpoint saved" in checkpoint["message"]
+    assert "Blocker saved" in checkpoint["message"]
     live_session, _ = runtime.get_user_session_for_moment(runtime.user)
     assert live_session.latest_status.startswith("Completed the base measurements")
     assert live_session.latest_blocker == "Waiting for the revised fastener dimensions before final assembly"
+    assert live_session.metadata["checkpoint_status"] == "blocked"
+    assert live_session.metadata["worker_checkpoint"]["choice"] == "2 hours"
+    assert live_session.metadata["checkpoint_quality_history"][-1]["meaningful"] is True
 
     clocked_out = asyncio.run(
         service.apply_action(
@@ -705,6 +716,84 @@ def test_roster_worker_portal_uses_one_live_session_and_idempotent_timer(tmp_pat
     assert any("Live work started" in message for _, message in runtime.slack.messages)
     assert any("clocked out" in message.lower() for _, message in runtime.slack.messages)
     assert runtime.dashboard_writes == 3
+
+
+def test_live_portal_allows_one_still_working_ack_between_useful_updates(tmp_path) -> None:
+    runtime = _LiveRuntime(tmp_path)
+    token = _token_from_link(build_worker_portal_link(runtime, runtime.user))
+    service = WorkerPortalService(runtime)
+    asyncio.run(
+        service.apply_action(
+            token,
+            {
+                "action": "select_task",
+                "task_id": "assigned",
+                "task_name": "Build test fixture",
+                "task_location": "Hardware / Flight fixture",
+            },
+        )
+    )
+    asyncio.run(
+        service.apply_action(
+            token,
+            {
+                "action": "start",
+                "outcome": "A tested fixture base with alignment measurements recorded for review",
+                "first_step": "Measure the base and enter each datum in the build sheet",
+                "evidence": "Upload the build sheet and a photo of the alignment marks",
+                "estimate": "2 hours",
+                "checkpoint": "60 minutes",
+            },
+        )
+    )
+
+    first = asyncio.run(
+        service.apply_action(
+            token,
+            {
+                "action": "check_in",
+                "progress_kind": "still_working",
+                "progress": "",
+                "blocker": "",
+                "checkpoint": "30 minutes",
+            },
+        )
+    )
+    assert "no penalty" in first["message"]
+    session, _ = runtime.get_user_session_for_moment(runtime.user)
+    assert session.metadata["worker_checkpoint"]["choice"] == "30 minutes"
+    assert isinstance(session.metadata["still_working_ack"], dict)
+
+    with pytest.raises(ValueError, match="okay once"):
+        asyncio.run(
+            service.apply_action(
+                token,
+                {
+                    "action": "check_in",
+                    "progress_kind": "still_working",
+                    "progress": "",
+                    "blocker": "",
+                    "checkpoint": "30 minutes",
+                },
+            )
+        )
+
+    corrected = asyncio.run(
+        service.apply_action(
+            token,
+            {
+                "action": "check_in",
+                "progress_kind": "made_progress",
+                "progress": "Measured all four fixture corners and recorded the alignment error in the build sheet",
+                "blocker": "",
+                "checkpoint": "when result is ready",
+            },
+        )
+    )
+    assert "Checkpoint saved" in corrected["message"]
+    session, _ = runtime.get_user_session_for_moment(runtime.user)
+    assert "still_working_ack" not in session.metadata
+    assert session.metadata["worker_checkpoint"]["interval_minutes"] == 120
 
 
 def test_live_portal_repeated_weak_checkpoint_opens_and_good_detail_clears_warning(tmp_path) -> None:

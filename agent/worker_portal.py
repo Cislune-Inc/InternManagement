@@ -39,7 +39,8 @@ _GENERIC_WORK_REPLIES = {
 }
 _DEFAULT_WORKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday"]
 _VALID_ESTIMATES = {"30 minutes", "1 hour", "2 hours", "half day", "full day", "multi-day"}
-_VALID_CHECKPOINTS = {"30 minutes", "60 minutes", "90 minutes", "2 hours"}
+_VALID_CHECKPOINTS = {"30 minutes", "60 minutes", "90 minutes", "2 hours", "when result is ready"}
+_VALID_PROGRESS_KINDS = {"made_progress", "result_ready", "blocked", "changed_plan", "still_working"}
 _QUALITY_WARNING_KEY = "portal_quality_warning"
 _QUALITY_RESTART_BLOCK_KEY = "portal_quality_restart_blocked"
 _QUALITY_WARNING_MINUTES = 10
@@ -453,6 +454,8 @@ class WorkerPortalService:
                 "evidence": "",
                 "estimate": "1 hour",
                 "checkpoint": "60 minutes",
+                "checkpoint_due_at": "",
+                "progress_kind": "made_progress",
                 "started_at": "",
                 "break_started_at": "",
                 "break_minimum_end_at": "",
@@ -1045,7 +1048,11 @@ class WorkerPortalService:
         evidence_provided = "evidence" in payload
         evidence = _clean_text(payload.get("evidence"), limit=500)
         estimate = _clean_text(payload.get("estimate"), limit=40).lower()
-        checkpoint = _clean_text(payload.get("checkpoint"), limit=40).lower()
+        checkpoint = (
+            _clean_text(payload.get("checkpoint"), limit=40)
+            or _clean_text(state["work"].get("checkpoint"), limit=40)
+            or "60 minutes"
+        ).lower()
         if estimate not in _VALID_ESTIMATES or checkpoint not in _VALID_CHECKPOINTS:
             raise ValueError("Choose a time estimate and a checkpoint from the available options.")
         session, _ = self._live_session(user)
@@ -1133,12 +1140,14 @@ class WorkerPortalService:
                     "task_onboarding_plan": first_step,
                     "task_onboarding_evidence": evidence,
                     "task_onboarding_estimate": estimate,
+                    "task_onboarding_estimated_duration": estimate,
                     "task_onboarding_checkpoint": checkpoint,
                     "clickup_selection_reason": "Selected in live worker portal",
                     "portal_last_started_at": now.isoformat(),
                 }
             )
             await self.runtime._activate_clickup_task(user, session, now, task_id, task_name)
+            self._schedule_live_checkpoint(session, now, checkpoint, source="portal_start")
             self._accept_quality_detail(
                 state,
                 session,
@@ -1169,6 +1178,16 @@ class WorkerPortalService:
         user = self._live_user(actor)
         progress = _clean_text(payload.get("progress"), limit=800)
         blocker = _clean_text(payload.get("blocker"), limit=500)
+        progress_kind = _clean_text(payload.get("progress_kind"), limit=40).lower() or "made_progress"
+        checkpoint = (
+            _clean_text(payload.get("checkpoint"), limit=40)
+            or _clean_text(state["work"].get("checkpoint"), limit=40)
+            or "60 minutes"
+        ).lower()
+        if progress_kind not in _VALID_PROGRESS_KINDS:
+            raise ValueError("Choose one of the quick update options.")
+        if checkpoint not in _VALID_CHECKPOINTS:
+            raise ValueError("Choose when Don Pollo should check in next.")
         quality = state["quality"]
         current_session, _ = self._live_session(user)
         if quality.get("date") != current_session.session_date:
@@ -1180,6 +1199,36 @@ class WorkerPortalService:
                     "last_rejected_fingerprint": "",
                 }
             )
+        if progress_kind == "still_working":
+            lock = self.runtime._user_session_lock(user.user_key)
+            async with lock:
+                session, now = self._live_session(user)
+                if session.stage != "active" or session.clocked_out_at:
+                    raise ValueError("Start or resume live work before posting a checkpoint.")
+                if isinstance(session.metadata.get("still_working_ack"), dict):
+                    raise ValueError(
+                        "Still working is okay once between concrete updates. This time choose Made progress, Result ready, Blocked, or Changed plan and add one useful fact."
+                    )
+                previous = self.runtime._clone_session_state(session)
+                session.metadata["still_working_ack"] = {
+                    "recorded_at": now.isoformat(),
+                    "source": "worker_portal",
+                }
+                self._schedule_live_checkpoint(session, now, checkpoint, source="portal_still_working")
+                self._append_live_event(
+                    user,
+                    session,
+                    now,
+                    f"Still working acknowledged; next checkpoint: {checkpoint}.",
+                )
+                await self._persist_live_action(user, session, previous, now, "portal_still_working")
+            state["work"]["progress_kind"] = progress_kind
+            state["work"]["checkpoint"] = checkpoint
+            return "Thanks for checking in. Keep going—no penalty and no extra reminder before your next checkpoint."
+        if progress_kind == "blocked":
+            if not blocker:
+                raise ValueError("Name the blocker, dependency, or decision you need help with.")
+            progress = progress or f"Blocked: {blocker}"
         issue, fingerprint = validate_meaningful_work_detail(
             progress,
             purpose="progress update",
@@ -1208,15 +1257,31 @@ class WorkerPortalService:
             previous = self.runtime._clone_session_state(session)
             session.latest_status = progress
             session.latest_blocker = blocker or None
+            session.metadata["checkpoint_status"] = progress_kind
+            if progress_kind == "changed_plan":
+                session.metadata["latest_plan_change"] = {
+                    "changed_at": now.isoformat(),
+                    "detail": progress,
+                }
+            self._schedule_live_checkpoint(session, now, checkpoint, source="portal_checkpoint")
+            self._record_live_checkpoint_quality(session, now, meaningful=True)
             self._accept_quality_detail(state, session, progress)
             self._append_live_event(
                 user,
                 session,
                 now,
-                f"Checkpoint: {progress}" + (f" Blocker: {blocker}" if blocker else ""),
+                f"Checkpoint ({progress_kind.replace('_', ' ')}): {progress}"
+                + (f" Blocker: {blocker}" if blocker else "")
+                + f" Next checkpoint: {checkpoint}.",
             )
             await self._persist_live_action(user, session, previous, now, "portal_checkpoint")
-        return "Checkpoint saved to the durable work record and queued for ClickUp sync."
+        state["work"]["progress_kind"] = progress_kind
+        state["work"]["checkpoint"] = checkpoint
+        return {
+            "result_ready": "Result-ready update saved. The task stays live until you finish or switch it deliberately.",
+            "blocked": "Blocker saved to the durable work record so Don Pollo can route useful help.",
+            "changed_plan": "Plan change saved with the reason and next checkpoint.",
+        }.get(progress_kind, "Checkpoint saved to the durable work record and queued for ClickUp sync.")
 
     async def _record_live_quality_rejection(
         self,
@@ -1473,6 +1538,12 @@ class WorkerPortalService:
                 "evidence": str(session.metadata.get("task_onboarding_evidence") or work.get("evidence") or ""),
                 "estimate": str(session.metadata.get("task_onboarding_estimate") or work.get("estimate") or "1 hour"),
                 "checkpoint": str(session.metadata.get("task_onboarding_checkpoint") or work.get("checkpoint") or "60 minutes"),
+                "checkpoint_due_at": str(
+                    (session.metadata.get("worker_checkpoint") or {}).get("due_at") or ""
+                    if isinstance(session.metadata.get("worker_checkpoint"), dict)
+                    else ""
+                ),
+                "progress_kind": str(session.metadata.get("checkpoint_status") or work.get("progress_kind") or "made_progress"),
                 "started_at": str(session.clocked_in_at or ""),
                 "break_started_at": str((active_short_rest or {}).get("started_at") or lunch_started),
                 "break_cutoff_at": str((active_short_rest or {}).get("deadline_at") or ""),
@@ -1559,6 +1630,68 @@ class WorkerPortalService:
         if callable(write_dashboard):
             await write_dashboard()
 
+    def _schedule_live_checkpoint(
+        self,
+        session: SessionState,
+        now: datetime,
+        checkpoint: str,
+        *,
+        source: str,
+    ) -> None:
+        scheduler = getattr(self.runtime, "_set_worker_checkpoint", None)
+        if callable(scheduler):
+            scheduler(session, now, checkpoint, source=source)
+            return
+        normalized = " ".join(str(checkpoint or "").strip().lower().split())
+        minutes = {
+            "30 minutes": 30,
+            "60 minutes": 60,
+            "90 minutes": 90,
+            "2 hours": 120,
+            "when result is ready": 120,
+        }.get(normalized, 60)
+        session.metadata["worker_checkpoint"] = {
+            "choice": normalized or "60 minutes",
+            "set_at": now.isoformat(),
+            "due_at": (now + timedelta(minutes=minutes)).isoformat(),
+            "interval_minutes": minutes,
+            "source": source,
+            "reminder_sent": False,
+        }
+        session.metadata["task_onboarding_checkpoint"] = normalized or "60 minutes"
+        session.metadata.pop("pending_follow_up", None)
+        session.metadata.pop("follow_up_response_aggregation", None)
+
+    def _record_live_checkpoint_quality(
+        self,
+        session: SessionState,
+        now: datetime,
+        *,
+        meaningful: bool,
+    ) -> None:
+        recorder = getattr(self.runtime, "_record_checkpoint_quality", None)
+        if callable(recorder):
+            recorder(
+                session,
+                now,
+                meaningful=meaningful,
+                source="worker_portal",
+            )
+            return
+        history = session.metadata.get("checkpoint_quality_history")
+        if not isinstance(history, list):
+            history = []
+        history.append(
+            {
+                "recorded_at": now.isoformat(),
+                "meaningful": bool(meaningful),
+                "source": "worker_portal",
+            }
+        )
+        session.metadata["checkpoint_quality_history"] = history[-10:]
+        if meaningful:
+            session.metadata.pop("still_working_ack", None)
+
     def _start_work(self, state: dict[str, Any], payload: dict[str, Any]) -> str:
         work = state["work"]
         if not work.get("selected_task_id"):
@@ -1568,7 +1701,11 @@ class WorkerPortalService:
         evidence_provided = "evidence" in payload
         evidence = _clean_text(payload.get("evidence"), limit=500)
         estimate = _clean_text(payload.get("estimate"), limit=40).lower()
-        checkpoint = _clean_text(payload.get("checkpoint"), limit=40).lower()
+        checkpoint = (
+            _clean_text(payload.get("checkpoint"), limit=40)
+            or _clean_text(work.get("checkpoint"), limit=40)
+            or "60 minutes"
+        ).lower()
         if estimate not in _VALID_ESTIMATES or checkpoint not in _VALID_CHECKPOINTS:
             raise ValueError("Choose a time estimate and a checkpoint from the available options.")
         today = datetime.now(timezone.utc).date().isoformat()
@@ -1622,12 +1759,63 @@ class WorkerPortalService:
             raise ValueError("Start or resume work before posting a checkpoint.")
         progress = _clean_text(payload.get("progress"), limit=800)
         blocker = _clean_text(payload.get("blocker"), limit=500)
+        progress_kind = _clean_text(payload.get("progress_kind"), limit=40).lower() or "made_progress"
+        checkpoint = (
+            _clean_text(payload.get("checkpoint"), limit=40)
+            or _clean_text(work.get("checkpoint"), limit=40)
+            or "60 minutes"
+        ).lower()
+        if progress_kind not in _VALID_PROGRESS_KINDS:
+            raise ValueError("Choose one of the quick update options.")
+        if checkpoint not in _VALID_CHECKPOINTS:
+            raise ValueError("Choose when Don Pollo should check in next.")
+        if progress_kind == "still_working":
+            if work.get("still_working_acknowledged"):
+                raise ValueError(
+                    "Still working is okay once between concrete updates. Add one useful fact this time."
+                )
+            work["still_working_acknowledged"] = True
+            work["progress_kind"] = progress_kind
+            work["checkpoint"] = checkpoint
+            work["checkpoint_due_at"] = (
+                datetime.now(timezone.utc)
+                + timedelta(
+                    minutes={
+                        "30 minutes": 30,
+                        "60 minutes": 60,
+                        "90 minutes": 90,
+                        "2 hours": 120,
+                        "when result is ready": 120,
+                    }.get(checkpoint, 60)
+                )
+            ).isoformat()
+            work["notice"] = "Still working acknowledged. No extra reminder before the next checkpoint."
+            return "Thanks for checking in. Keep going—no penalty."
+        if progress_kind == "blocked":
+            if not blocker:
+                raise ValueError("Name the blocker, dependency, or decision you need help with.")
+            progress = progress or f"Blocked: {blocker}"
         if _is_vague(progress, minimum_words=5, minimum_characters=24):
             raise ValueError(
                 "Name what changed, what now exists, or what you learned. This keeps updates useful to the next person reading them."
             )
         work["latest_progress"] = progress
         work["latest_blocker"] = blocker
+        work["progress_kind"] = progress_kind
+        work["checkpoint"] = checkpoint
+        work["still_working_acknowledged"] = False
+        work["checkpoint_due_at"] = (
+            datetime.now(timezone.utc)
+            + timedelta(
+                minutes={
+                    "30 minutes": 30,
+                    "60 minutes": 60,
+                    "90 minutes": 90,
+                    "2 hours": 120,
+                    "when result is ready": 120,
+                }.get(checkpoint, 60)
+            )
+        ).isoformat()
         work["notice"] = "Checkpoint captured."
         return "Checkpoint captured with meaningful progress detail."
 
@@ -2123,6 +2311,10 @@ def _portal_template() -> str:
     .ai-composer { padding:14px; border:1px solid rgba(23,110,100,.3); border-radius:16px; background:linear-gradient(135deg,var(--soft),#fff); margin-bottom:14px; }
     .ai-composer textarea { min-height:76px; }
     .ai-guidance { margin:9px 0 0; color:var(--teal-dark); font-size:.84rem; }
+    .progress-choices { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:8px; margin:12px 0 14px; }
+    .progress-choice { border:1px solid var(--line); border-radius:12px; padding:10px 8px; background:white; color:var(--ink); font-weight:800; min-height:46px; }
+    .progress-choice.selected { border-color:var(--teal); background:var(--soft); color:var(--teal-dark); box-shadow:inset 0 0 0 1px var(--teal); }
+    .checkpoint-meta { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-top:10px; color:var(--muted); font-size:.84rem; }
     .plan-details { border:1px solid var(--line); border-radius:14px; padding:12px; }
     .plan-details > summary { color:var(--ink); }
     .plan-details .form-grid { margin-top:12px; }
@@ -2145,7 +2337,7 @@ def _portal_template() -> str:
     #toast.show { transform:translateY(0); }
     #toast.error { background:var(--danger); }
     @media (max-width:900px) { .layout { grid-template-columns:1fr; } .topbar { position:static; } .task-grid { grid-template-columns:repeat(5,240px); } .lane-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
-    @media (max-width:600px) { .shell { width:min(100% - 16px,100%); margin:8px auto 40px; } .topbar,.panel { border-radius:16px; padding:16px; } .topbar { align-items:flex-start; } .status { display:none; } .time-strip { grid-template-columns:1fr 1fr; } .time-card.primary { grid-column:1/-1; } .form-grid,.profile-summary,.catalog-tools,.lane-grid { grid-template-columns:1fr; } .task-grid { grid-template-columns:1fr; overflow:visible; } .task { min-height:0; } .actions .button { min-height:44px; } .work-now .actions .primary { flex:1 1 100%; } .catalog-task { grid-template-columns:1fr; } .catalog-task .button { width:100%; } }
+    @media (max-width:600px) { .shell { width:min(100% - 16px,100%); margin:8px auto 40px; } .topbar,.panel { border-radius:16px; padding:16px; } .topbar { align-items:flex-start; } .status { display:none; } .time-strip { grid-template-columns:1fr 1fr; } .time-card.primary { grid-column:1/-1; } .form-grid,.profile-summary,.catalog-tools,.lane-grid { grid-template-columns:1fr; } .task-grid { grid-template-columns:1fr; overflow:visible; } .task { min-height:0; } .actions .button { min-height:44px; } .work-now .actions .primary { flex:1 1 100%; } .catalog-task { grid-template-columns:1fr; } .catalog-task .button { width:100%; } .progress-choices { grid-template-columns:1fr 1fr; } .progress-choice:last-child { grid-column:1/-1; } .checkpoint-meta { align-items:flex-start; flex-direction:column; } }
   </style>
 </head>
 <body>
@@ -2174,10 +2366,24 @@ def _portal_template() -> str:
           <label>What is the first concrete move?<textarea id="first-step" placeholder="Example: Open revision 3, measure the current hole spacing, and update the sketch constraints."></textarea></label>
           <label style="grid-column:1/-1">What evidence will show the result?<textarea id="evidence" placeholder="Example: Upload the revised CAD screenshot and record the measured hole spacing in the task."></textarea></label>
           <label>Rough estimate<select id="estimate"><option>30 minutes</option><option selected>1 hour</option><option>2 hours</option><option>half day</option><option>full day</option><option>multi-day</option></select></label>
-          <label>Reconsider / ask for help after<select id="checkpoint"><option>30 minutes</option><option selected>60 minutes</option><option>90 minutes</option><option>2 hours</option></select></label>
+          <label>Reconsider / ask for help after<select id="checkpoint"><option>30 minutes</option><option selected>60 minutes</option><option>2 hours</option><option value="when result is ready">When result is ready</option></select></label>
       </div></details>
       <div class="actions"><button class="button primary" id="start-button" data-action="start">Start work</button><button class="button orange" id="claim-selected" data-action="claim-task">Claim in ClickUp</button><button class="button subtle" data-action="short-rest">Short rest</button><button class="button subtle" data-action="lunch">Lunch</button><button class="button subtle" data-action="back">Back</button><button class="button danger subtle" data-action="clock-out">Clock out</button></div>
       <p class="muted" id="mode-note" style="margin:12px 0 0">A recognizable result and concrete first move are required.</p>
+    </section>
+    <section class="panel section-space" id="checkpoint-panel" hidden>
+      <div class="section-head"><div><div class="eyebrow">Quick checkpoint</div><h2>What is true now?</h2></div><span class="pill" id="next-checkpoint-label">Next check-in not set</span></div>
+      <div class="progress-choices" role="group" aria-label="Update type">
+        <button class="progress-choice selected" data-progress-kind="made_progress">Made progress</button>
+        <button class="progress-choice" data-progress-kind="result_ready">Result ready</button>
+        <button class="progress-choice" data-progress-kind="blocked">Blocked</button>
+        <button class="progress-choice" data-progress-kind="changed_plan">Changed plan</button>
+        <button class="progress-choice" data-progress-kind="still_working">Still working</button>
+      </div>
+      <div class="form-grid"><label>What changed, or what will you do differently?<textarea id="progress" placeholder="Name the output, test result, file, part, decision, or lesson another person could recognize."></textarea></label><label>Blocker or help needed<textarea id="blocker" placeholder="Optional unless Blocked is selected. Name the dependency, decision, or failed approach."></textarea></label></div>
+      <div class="checkpoint-meta"><label>Check in next<select id="next-checkpoint"><option>30 minutes</option><option selected>60 minutes</option><option>2 hours</option><option value="when result is ready">When result is ready</option></select></label><span id="checkpoint-help">One concise, concrete update is enough. Still working is okay once between useful updates.</span></div>
+      <div class="actions"><button class="button orange" id="coach-checkpoint" data-action="coach-checkpoint">Improve with Don Pollo</button><button class="button primary" data-action="check-in">Save update</button><button class="button" data-action="share-slack">Send concise summary to Slack</button></div>
+      <p class="ai-guidance" id="ai-checkpoint-guidance">Write rough facts first. Don Pollo can organize them, but only Save update changes the work record.</p>
     </section>
     <section class="panel section-space">
       <details class="chooser-details" id="recommended-details" open>
@@ -2198,15 +2404,7 @@ def _portal_template() -> str:
       </details>
     </section>
     <div class="layout">
-      <div class="stack">
-        <section class="panel">
-          <div class="eyebrow">Checkpoint</div><h2>Say what changed, not just that you worked.</h2>
-          <div class="form-grid"><label>Meaningful progress<textarea id="progress" placeholder="What now exists, changed, passed, failed, or was learned?"></textarea></label><label>Blocker or help needed<textarea id="blocker" placeholder="Optional. Name the decision, dependency, or failed approach."></textarea></label></div>
-          <div class="actions"><button class="button orange" id="coach-checkpoint" data-action="coach-checkpoint">Improve with Don Pollo</button><button class="button primary" data-action="check-in">Save checkpoint</button><button class="button" data-action="share-slack">Send concise summary to Slack</button></div>
-          <p class="ai-guidance" id="ai-checkpoint-guidance">Write rough facts first. Don Pollo can organize them, but only Save checkpoint changes the work record.</p>
-        </section>
-      </div>
-      <aside class="stack">
+      <aside class="stack" style="grid-column:1/-1">
         <section class="panel"><div class="eyebrow">Worker context</div><h2 id="welcome">Welcome</h2><p class="muted" id="schedule-line"></p><div class="profile-summary"><div class="fact"><small>Skills</small><span id="skills-line">—</span></div><div class="fact"><small>Interests</small><span id="interests-line">—</span></div></div><details id="profile-details" open><summary id="profile-summary-label">Set schedule & fit</summary><div style="margin-top:12px" class="stack"><label>Weekly target hours<input id="weekly-hours" type="number" min="1" max="80" step="0.5"></label><label>Regular workdays<div class="days" id="workdays"></div></label><div class="form-grid"><label>Typical start<input id="start-time" type="time"></label><label>Typical end<input id="end-time" type="time"></label></div><label>Planned time off<input id="time-off" placeholder="2026-08-21, 2026-08-24"></label><label>Interests<input id="interests" placeholder="robotics, fabrication, flight testing"></label><label>Skills<input id="skills" placeholder="CAD, Python, assembly"></label><button class="button" data-action="save-profile">Save worker context</button></div></details></section>
         <section class="panel"><div class="section-head"><div><div class="eyebrow" id="history-eyebrow">Recent portal activity</div><h2>Audit trail</h2></div></div><div class="history" id="history"></div><div class="actions"><button class="button subtle danger" id="reset-beta" data-action="reset-beta">Reset preview</button></div></section>
       </aside>
@@ -2222,8 +2420,9 @@ def _portal_template() -> str:
     const esc = (value) => String(value ?? '').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#39;');
     let renderedProfileSavedAt = null;
     let chooserInitialized = false;
+    let selectedProgressKind = null;
     const dirtyFields = new Set();
-    const editableFieldIds = new Set(['plan-intent','outcome','first-step','evidence','estimate','checkpoint','progress','blocker','weekly-hours','start-time','end-time','time-off','interests','skills']);
+    const editableFieldIds = new Set(['plan-intent','outcome','first-step','evidence','estimate','checkpoint','progress','blocker','next-checkpoint','weekly-hours','start-time','end-time','time-off','interests','skills']);
     function syncInput(id, value) {
       if (!dirtyFields.has(id)) $(id).value = value ?? '';
     }
@@ -2232,11 +2431,12 @@ def _portal_template() -> str:
         start: ['outcome','first-step','evidence','estimate','checkpoint'],
         coach_plan: ['plan-intent','outcome','first-step','evidence','estimate','checkpoint'],
         coach_checkpoint: ['progress','blocker'],
-        check_in: ['progress','blocker'],
+        check_in: ['progress','blocker','next-checkpoint'],
         clock_out: ['progress','blocker'],
         save_profile: ['weekly-hours','workdays','start-time','end-time','time-off','interests','skills'],
       }[action] || [];
       submittedFields.forEach((id) => dirtyFields.delete(id));
+      if (action === 'check_in') selectedProgressKind = null;
     }
     function formatDuration(value) {
       const total = Math.max(0, Math.floor(Number(value) || 0));
@@ -2343,9 +2543,15 @@ def _portal_template() -> str:
       syncInput('first-step', work.first_step || '');
       syncInput('evidence', work.evidence || '');
       syncInput('estimate', work.estimate || '1 hour');
-      syncInput('checkpoint', work.checkpoint || '60 minutes');
+      const checkpointChoice = work.checkpoint === '90 minutes' ? '2 hours' : (work.checkpoint || '60 minutes');
+      syncInput('checkpoint', checkpointChoice);
+      syncInput('next-checkpoint', checkpointChoice);
       syncInput('progress', work.latest_progress || '');
       syncInput('blocker', work.latest_blocker || '');
+      $('checkpoint-panel').hidden = work.status !== 'active';
+      document.querySelectorAll('[data-progress-kind]').forEach((button) => button.classList.toggle('selected', button.dataset.progressKind === (selectedProgressKind || work.progress_kind || 'made_progress')));
+      const checkpointDue = Date.parse(work.checkpoint_due_at || '');
+      $('next-checkpoint-label').textContent = Number.isFinite(checkpointDue) ? `Next ${new Date(checkpointDue).toLocaleTimeString([], {hour:'numeric',minute:'2-digit'})}` : 'Choose next check-in';
       const aiAvailable = Boolean(ai.request_available);
       $('coach-plan').disabled = !aiAvailable || !work.selected_task_id;
       $('coach-checkpoint').disabled = !aiAvailable || work.status !== 'active';
@@ -2353,7 +2559,7 @@ def _portal_template() -> str:
         ? `${Number(ai.worker_calls_today || 0)} helper use${Number(ai.worker_calls_today || 0) === 1 ? '' : 's'} today · ${Number(ai.tokens_used_today || 0).toLocaleString()} tokens`
         : 'AI helper unavailable · manual fields still work';
       $('ai-plan-guidance').textContent = ai.last_plan_question || ai.last_plan_note || 'Don Pollo will organize your facts into a result, first move, evidence, estimate, and checkpoint for you to review.';
-      $('ai-checkpoint-guidance').textContent = ai.last_checkpoint_question || ai.last_checkpoint_note || 'Write rough facts first. Don Pollo can organize them, but only Save checkpoint changes the work record.';
+      $('ai-checkpoint-guidance').textContent = ai.last_checkpoint_question || ai.last_checkpoint_note || 'Write rough facts first. Don Pollo can organize them, but only Save update changes the work record.';
       $('quality-pill').textContent = `${Number(quality.strong_plans || 0)} strong plan${Number(quality.strong_plans || 0) === 1 ? '' : 's'}`;
       syncInput('weekly-hours', profile.weekly_target_hours || 40);
       syncInput('start-time', profile.typical_start_time || '09:00');
@@ -2369,6 +2575,7 @@ def _portal_template() -> str:
       if (!chooserInitialized) {
         $('recommended-details').open = !work.selected_task_id;
         $('catalog-details').open = !work.selected_task_id;
+        $('plan-details').open = work.status !== 'active';
         chooserInitialized = true;
       }
       $('history').innerHTML = (data.history || []).length ? (data.history || []).map(item => `<article><strong>${esc(String(item.action || '').replaceAll('_',' '))}</strong><br>${esc(item.message)}<br><time>${new Date(item.at).toLocaleString()}</time></article>`).join('') : '<p class="muted">No portal actions yet.</p>';
@@ -2385,7 +2592,7 @@ def _portal_template() -> str:
       if (apiAction === 'start') return {action:apiAction, outcome:$('outcome').value, first_step:$('first-step').value, evidence:$('evidence').value, estimate:$('estimate').value, checkpoint:$('checkpoint').value};
       if (apiAction === 'coach_plan') return {action:apiAction, intent:$('plan-intent').value, outcome:$('outcome').value, first_step:$('first-step').value, evidence:$('evidence').value, estimate:$('estimate').value, checkpoint:$('checkpoint').value};
       if (apiAction === 'coach_checkpoint') return {action:apiAction, progress:$('progress').value, blocker:$('blocker').value};
-      if (apiAction === 'check_in') return {action:apiAction, progress:$('progress').value, blocker:$('blocker').value};
+      if (apiAction === 'check_in') return {action:apiAction, progress_kind:selectedProgressKind || (data.work || {}).progress_kind || 'made_progress', progress:$('progress').value, blocker:$('blocker').value, checkpoint:$('next-checkpoint').value};
       if (apiAction === 'clock_out') return {action:apiAction, progress:$('progress').value, blocker:$('blocker').value};
       if (apiAction === 'claim_task') return {action:apiAction, task_id:(data.work || {}).selected_task_id};
       if (apiAction === 'save_profile') return {action:apiAction, weekly_target_hours:$('weekly-hours').value, regular_workdays:[...document.querySelectorAll('#workdays input:checked')].map(node => node.value), typical_start_time:$('start-time').value, typical_end_time:$('end-time').value, planned_time_off:$('time-off').value, interests:$('interests').value, skills:$('skills').value};
@@ -2405,6 +2612,14 @@ def _portal_template() -> str:
       finally { if (button && button.isConnected) { button.disabled = false; button.textContent = original; } }
     }
     document.addEventListener('click', (event) => {
+      const progressChoice = event.target.closest('[data-progress-kind]');
+      if (progressChoice) {
+        selectedProgressKind = progressChoice.dataset.progressKind;
+        render();
+        if (progressChoice.dataset.progressKind === 'blocked') $('blocker').focus();
+        else if (progressChoice.dataset.progressKind !== 'still_working') $('progress').focus();
+        return;
+      }
       const lane = event.target.closest('[data-overhead-lane]');
       if (lane) return post({action:'select_overhead_lane',lane_id:lane.dataset.overheadLane},lane).then((saved) => { if (!saved) return; $('task-search').value=lane.dataset.laneSearch || lane.dataset.laneName || ''; $('catalog-details').open=true; $('request-type').value='overhead'; $('request-title').placeholder=`Concrete result for ${lane.dataset.laneName || 'overhead work'}`; renderTaskCatalog(); $('catalog-details').scrollIntoView({behavior:'smooth',block:'start'}); });
       const claim = event.target.closest('[data-claim-task]');
