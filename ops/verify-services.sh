@@ -3,6 +3,8 @@ set -euo pipefail
 
 repo_root="${0:A:h:h}"
 uid="$(id -u)"
+[[ "$(git -C "${repo_root}" branch --show-current)" == "main" ]]
+[[ -z "$(git -C "${repo_root}" status --porcelain)" ]]
 launchctl print "gui/${uid}/com.pm.internmanagement.bot" | grep -q "state = running"
 launchctl print "gui/${uid}/com.pm.internmanagement.time-tracking" | grep -q "state = running"
 launchctl print "gui/${uid}/com.pm.internmanagement.backup" >/dev/null

@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import os
+import subprocess
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,6 +24,7 @@ async def run_integration_checks(
     *,
     dashboard_url: str = _DEFAULT_DASHBOARD_URL,
     backups_path: Path = Path("backups"),
+    repo_path: Path | None = None,
     now: datetime | None = None,
     request: Callable[..., requests.Response] = requests.request,
 ) -> dict[str, Any]:
@@ -31,6 +33,7 @@ async def run_integration_checks(
         _check_database(runtime),
         _check_bot_lock(runtime),
         _check_backup(backups_path, reference),
+        _check_production_checkout(repo_path),
         _http_check(
             "dashboard",
             "GET",
@@ -80,7 +83,11 @@ async def run_integration_checks(
             continue
         await runtime.operations.report(
             category="integration_health",
-            severity="critical" if name in {"database", "bot", "dashboard"} else "warning",
+            severity=(
+                "critical"
+                if name in {"database", "bot", "dashboard", "production_checkout"}
+                else "warning"
+            ),
             summary=f"{name.title()} health check failed.",
             details={
                 "check": name,
@@ -152,6 +159,42 @@ def _check_backup(
         return _result("backup", "error", started, error=str(exc))
 
 
+def _check_production_checkout(repo_path: Path | None) -> dict[str, Any]:
+    started = time.monotonic()
+    if repo_path is None:
+        return _result("production_checkout", "disabled", started)
+    try:
+        root = repo_path.resolve()
+        branch = _git_output(root, "branch", "--show-current")
+        if branch != "main":
+            raise RuntimeError(
+                f"Production checkout is on {branch or 'a detached HEAD'}, not main."
+            )
+        dirty = _git_output(root, "status", "--porcelain")
+        if dirty:
+            raise RuntimeError("Production checkout contains uncommitted tracked changes.")
+        revision = _git_output(root, "rev-parse", "HEAD")
+        return _result(
+            "production_checkout",
+            "ok",
+            started,
+            details={"branch": branch, "revision": revision},
+        )
+    except Exception as exc:
+        return _result("production_checkout", "error", started, error=str(exc))
+
+
+def _git_output(repo_path: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repo_path), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    return result.stdout.strip()
+
+
 def _http_check(
     name: str,
     method: str,
@@ -204,6 +247,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dashboard-url", default=_DEFAULT_DASHBOARD_URL)
     parser.add_argument("--backups", type=Path, default=Path("backups"))
     parser.add_argument(
+        "--repo",
+        type=Path,
+        default=Path(__file__).resolve().parents[1],
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=Path("data/integration_health.json"),
@@ -221,6 +269,7 @@ def main(argv: list[str] | None = None) -> None:
             runtime,
             dashboard_url=args.dashboard_url,
             backups_path=args.backups,
+            repo_path=args.repo,
         )
     )
     atomic_write_json(args.output, payload)

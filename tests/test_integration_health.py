@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
-from agent.integration_health import run_integration_checks
+from agent.integration_health import _check_production_checkout, run_integration_checks
 from agent.models import SlackConfig
 from agent.operations import OperationalIssueReporter, issue_fingerprint
 from agent.state_store import StateStore
@@ -86,6 +86,7 @@ def test_integration_checks_record_success_and_resolve_prior_failure(tmp_path, m
         "database",
         "bot",
         "backup",
+        "production_checkout",
         "dashboard",
         "discord",
         "slack",
@@ -116,3 +117,29 @@ def test_failed_check_enters_issue_queue(tmp_path):
     summaries = {issue["summary"] for issue in issues}
     assert "Dashboard health check failed." in summaries
     assert "Backup health check failed." in summaries
+
+
+def test_production_checkout_check_accepts_clean_main(tmp_path, monkeypatch):
+    outputs = iter(["main\n", "", "abc123\n"])
+
+    def run(*args, **kwargs):
+        return SimpleNamespace(stdout=next(outputs))
+
+    monkeypatch.setattr("agent.integration_health.subprocess.run", run)
+
+    result = _check_production_checkout(tmp_path)
+
+    assert result["status"] == "ok"
+    assert result["details"] == {"branch": "main", "revision": "abc123"}
+
+
+def test_production_checkout_check_rejects_feature_branch(tmp_path, monkeypatch):
+    def run(*args, **kwargs):
+        return SimpleNamespace(stdout="agent/repair-tony-task-tracking\n")
+
+    monkeypatch.setattr("agent.integration_health.subprocess.run", run)
+
+    result = _check_production_checkout(tmp_path)
+
+    assert result["status"] == "error"
+    assert "not main" in result["error"]
