@@ -3,9 +3,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from agent.models import SessionState, UserProfile
 from agent.runtime import InternManagementRuntime
@@ -378,8 +383,24 @@ def main() -> None:
     )
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--legacy-date", default="2026-08-05")
+    parser.add_argument("--summary", action="store_true")
     args = parser.parse_args()
-    print(json.dumps(asyncio.run(run(apply=args.apply, legacy_date=args.legacy_date)), indent=2))
+    result = asyncio.run(run(apply=args.apply, legacy_date=args.legacy_date))
+    if args.summary:
+        action_counts: dict[str, int] = {}
+        for item in result["plan"]:
+            for action in item["actions"]:
+                action_name = str(action["action"])
+                action_counts[action_name] = action_counts.get(action_name, 0) + 1
+        result = {
+            "mode": result["mode"],
+            "legacy_date": result["legacy_date"],
+            "planned_session_count": result["planned_session_count"],
+            "planned_action_count": sum(action_counts.values()),
+            "action_counts": action_counts,
+            "applied_session_count": len(result.get("applied") or []),
+        }
+    print(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":
