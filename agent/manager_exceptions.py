@@ -44,6 +44,7 @@ async def build_manager_exceptions_payload(
                 "occurrence_count": int(issue.get("occurrence_count") or 1),
             }
         )
+    exceptions = _deduplicate_exceptions(exceptions)
     severity_order = {"critical": 0, "error": 1, "warning": 2, "info": 3}
     exceptions.sort(
         key=lambda item: (
@@ -249,6 +250,44 @@ def _person_exceptions(person: dict[str, Any]) -> list[dict[str, Any]]:
             )
         )
     return rows
+
+
+def _deduplicate_exceptions(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    missing_task_rows = {
+        (str(row.get("user_key") or ""), str(row.get("session_date") or "")): row
+        for row in rows
+        if row.get("category") == "missing_active_task"
+    }
+    deduplicated: list[dict[str, Any]] = []
+    for row in rows:
+        if row.get("category") != "slack_update_missing_task":
+            deduplicated.append(row)
+            continue
+        key = (str(row.get("user_key") or ""), str(row.get("session_date") or ""))
+        target = missing_task_rows.get(key)
+        if target is None:
+            deduplicated.append(row)
+            continue
+        target["source"] = "session+operational_issue"
+        target["last_seen_at"] = max(
+            str(target.get("last_seen_at") or ""),
+            str(row.get("last_seen_at") or ""),
+        )
+        target["occurrence_count"] = int(target.get("occurrence_count") or 1) + int(
+            row.get("occurrence_count") or 1
+        )
+        details = target.get("details")
+        details = dict(details) if isinstance(details, dict) else {}
+        details["slack_update_hold"] = {
+            "summary": str(row.get("summary") or ""),
+            "worker_prompted": bool(
+                (row.get("details") if isinstance(row.get("details"), dict) else {}).get(
+                    "worker_prompted"
+                )
+            ),
+        }
+        target["details"] = details
+    return deduplicated
 
 
 def _exception(

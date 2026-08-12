@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from agent.manager_exceptions import _person_exceptions, render_manager_exceptions_html
+from agent.manager_exceptions import (
+    _deduplicate_exceptions,
+    _person_exceptions,
+    render_manager_exceptions_html,
+)
 
 
 def test_manager_queue_detects_workflow_task_and_time_exceptions():
@@ -57,3 +61,36 @@ def test_manager_queue_html_has_filters_and_work_correction_link():
     assert "Manager Exception Queue" in html
     assert "All categories" in html
     assert "Review worker and correct ClickUp task" in html
+
+
+def test_manager_queue_merges_missing_task_session_and_slack_hold() -> None:
+    rows = _deduplicate_exceptions(
+        [
+            {
+                "id": "missing_active_task:Tony:2026-08-11",
+                "category": "missing_active_task",
+                "user_key": "Tony",
+                "session_date": "2026-08-11",
+                "source": "session",
+                "last_seen_at": "2026-08-11T14:40:00-07:00",
+                "occurrence_count": 1,
+                "details": {"stage": "awaiting_task_selection"},
+            },
+            {
+                "id": "operation-fingerprint",
+                "category": "slack_update_missing_task",
+                "user_key": "Tony",
+                "session_date": "2026-08-11",
+                "source": "operational_issue",
+                "summary": "Tony reported work without a confirmed task.",
+                "last_seen_at": "2026-08-11T14:45:00-07:00",
+                "occurrence_count": 1,
+                "details": {"worker_prompted": True},
+            },
+        ]
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["source"] == "session+operational_issue"
+    assert rows[0]["occurrence_count"] == 2
+    assert rows[0]["details"]["slack_update_hold"]["worker_prompted"] is True

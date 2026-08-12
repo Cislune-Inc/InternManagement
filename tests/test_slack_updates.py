@@ -72,9 +72,57 @@ def test_slack_policy_rejects_vague_progress_and_break_commands() -> None:
     assert policy.is_interesting("Project is going good.") is False
     assert policy.is_interesting("Put me on break pollo") is False
     assert policy.is_interesting("Working on it for the project") is False
+    assert policy.is_interesting("You didn’t even ask me anything") is False
     assert policy.is_interesting(
         "Installed the revised sensor bracket and measured a 3 mm clearance."
     ) is True
+
+
+def test_slack_daily_update_omits_bot_complaint_from_public_progress(tmp_path: Path) -> None:
+    runtime = _build_runtime(tmp_path)
+    user = UserProfile(
+        user_key="alex",
+        display_name="Alex",
+        discord_user_id=1,
+        storage_folder_name="Alex",
+        slack_user_id="U123",
+    )
+    session = SessionState(
+        user_key="alex",
+        session_date="2026-07-13",
+        stage="active",
+        clocked_in_at="2026-07-13T09:00:00-07:00",
+        latest_status="You didn’t even ask me anything",
+        latest_plan="Print the revised funnel parts and verify that the lid closes cleanly.",
+        metadata={
+            "active_clickup_task_id": "task-1",
+            "active_clickup_task_name": "Solar wifi diagnostics",
+        },
+    )
+    complaint = MessageRecord(
+        message_id="complaint",
+        direction="inbound",
+        author_id=1,
+        created_at=datetime.fromisoformat("2026-07-13T11:00:00-07:00"),
+        content="You didn’t even ask me anything",
+    )
+    runtime.state_store = SimpleNamespace(
+        list_messages=lambda _user_key, _session_date: [complaint]
+    )
+
+    posted = asyncio.run(
+        runtime._maybe_post_slack_daily_update(
+            user,
+            session,
+            datetime.fromisoformat("2026-07-13T11:15:00-07:00"),
+        )
+    )
+
+    assert posted is True
+    message = runtime.slack.messages[0][1]
+    assert "didn’t even ask" not in message
+    assert "What changed" not in message
+    assert "Plan today" in message
 
 
 class _FakeClickUp:

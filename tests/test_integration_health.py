@@ -143,3 +143,45 @@ def test_production_checkout_check_rejects_feature_branch(tmp_path, monkeypatch)
 
     assert result["status"] == "error"
     assert "not main" in result["error"]
+
+
+def test_controlled_deploy_suppresses_transient_bot_and_dashboard_failures(tmp_path):
+    runtime = _runtime(tmp_path)
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    (backups / "current.tar.gz.enc").write_bytes(b"encrypted")
+    now = datetime.now(timezone.utc)
+    marker = tmp_path / "data" / "deploy_maintenance.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "reason": "controlled deployment",
+                "started_at": now.isoformat(),
+                "expires_at": now.replace(year=now.year + 1).isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "data" / "agent.lock").write_text(
+        json.dumps({"pid": 99999999}), encoding="utf-8"
+    )
+
+    def request(method, url, **kwargs):
+        if "127.0.0.1" in url:
+            raise RuntimeError("dashboard restarting")
+        return _Response({"ok": True})
+
+    result = asyncio.run(
+        run_integration_checks(
+            runtime,
+            backups_path=backups,
+            now=now,
+            request=request,
+        )
+    )
+
+    statuses = {item["name"]: item["status"] for item in result["checks"]}
+    assert result["overall_status"] == "ok"
+    assert statuses["bot"] == "maintenance"
+    assert statuses["dashboard"] == "maintenance"
+    assert runtime.state_store.list_operational_issues(status="open") == []

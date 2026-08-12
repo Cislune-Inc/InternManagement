@@ -1043,7 +1043,7 @@ def _dashboard_template() -> str:
           editorControls = `<div class="muted">Not editable: ${escapeHtml(row.edit_block_reason || 'Unknown reason.')}</div>`;
         }
       }
-      return `<details class="day-card"><summary>${escapeHtml(row.session_date)} | ${renderReviewBadge(reviewStatus)} | ${formatSeconds(Number(row.clocked_in_total_seconds || 0))} clocked-in | ${formatSeconds(Number(row.task_tracked_total_seconds || 0))} task</summary><div class="detail-body"><div class="key-grid"><div><span class="label">Review status</span>${renderReviewBadge(reviewStatus)}</div><div><span class="label">Review summary</span>${escapeHtml(row.review_summary || 'No review summary.')}</div><div><span class="label">Clocked vs task gap</span>${escapeHtml(row.review_gap_human || '0m')}</div><div><span class="label">Latest audit confidence</span>${escapeHtml(row.latest_audit_confidence || row.retro_backfill_confidence || 'Not available')}</div><div><span class="label">Manual edits</span>${String(row.manual_edit_count || 0)}</div><div><span class="label">Latest audit warnings</span>${String(row.latest_audit_warning_count || row.retro_backfill_warning_count || 0)}</div><div><span class="label">Timezone</span>${escapeHtml(row.timezone || '')}</div><div><span class="label">Clocked-in</span>${formatSeconds(Number(row.clocked_in_total_seconds || 0))}</div><div><span class="label">Work segments</span>${String(row.work_segment_count || 0)}</div><div><span class="label">Open segment</span>${row.has_open_work_segment ? 'Yes' : 'No'}</div><div><span class="label">Task timer running</span>${row.active_task_timer_running ? 'Yes' : 'No'}</div></div><div><span class="label">Review notes</span>${reviewNotes}</div><div><span class="label">Segment windows</span>${segments}</div><div><span class="label">Task breakdown</span>${tasks}</div><div><span class="label">Latest manual edit</span>${manualEdit}</div><div><span class="label">Manual edit log</span>${manualEditLog}</div><div><span class="label">Session file</span>${sessionPath}</div>${editorControls}</div></details>`;
+      return `<details class="day-card"><summary>${escapeHtml(row.session_date)} | ${renderReviewBadge(reviewStatus)} | ${formatSeconds(Number(row.clocked_in_total_seconds || 0))} clocked-in | ${formatSeconds(Number(row.task_tracked_total_seconds || 0))} task</summary><div class="detail-body"><div class="key-grid"><div><span class="label">Review status</span>${renderReviewBadge(reviewStatus)}</div><div><span class="label">Review summary</span>${escapeHtml(row.review_summary || 'No review summary.')}</div><div><span class="label">Record origin</span>${escapeHtml(row.time_record_origin === 'legacy_migration' ? 'Legacy migration' : 'Live Don Pollo')}</div><div><span class="label">Clocked vs task gap</span>${escapeHtml(row.review_gap_human || '0m')}</div><div><span class="label">Latest audit confidence</span>${escapeHtml(row.latest_audit_confidence || row.retro_backfill_confidence || 'Not available')}</div><div><span class="label">Manual edits</span>${String(row.manual_edit_count || 0)}</div><div><span class="label">Latest audit warnings</span>${String(row.latest_audit_warning_count || row.retro_backfill_warning_count || 0)}</div><div><span class="label">Timezone</span>${escapeHtml(row.timezone || '')}</div><div><span class="label">Clocked-in</span>${formatSeconds(Number(row.clocked_in_total_seconds || 0))}</div><div><span class="label">Work segments</span>${String(row.work_segment_count || 0)}</div><div><span class="label">Open segment</span>${row.has_open_work_segment ? 'Yes' : 'No'}</div><div><span class="label">Task timer running</span>${row.active_task_timer_running ? 'Yes' : 'No'}</div></div><div><span class="label">Review notes</span>${reviewNotes}</div><div><span class="label">Segment windows</span>${segments}</div><div><span class="label">Task breakdown</span>${tasks}</div><div><span class="label">Latest manual edit</span>${manualEdit}</div><div><span class="label">Manual edit log</span>${manualEditLog}</div><div><span class="label">Session file</span>${sessionPath}</div>${editorControls}</div></details>`;
     }
 
     function renderAuditGroupRow(group) {
@@ -1474,6 +1474,7 @@ def _load_hours_rows(report_path: Path) -> list[dict[str, Any]]:
                 "latest_manual_edit": _load_json_value(row.get("latest_manual_edit_json"), None),
                 "retro_backfill_confidence": str(row.get("retro_backfill_confidence") or ""),
                 "retro_backfill_warning_count": _to_int(row.get("retro_backfill_warning_count")),
+                "time_record_origin": str(row.get("time_record_origin") or "live"),
             }
             loaded_row.update(_load_review_fields(row, loaded_row))
             if not isinstance(loaded_row.get("latest_manual_edit"), dict):
@@ -1509,6 +1510,7 @@ def _fallback_review_fields(row: dict[str, Any]) -> dict[str, Any]:
     retro_confidence = str(row.get("retro_backfill_confidence") or "")
     retro_warning_count = _to_int(row.get("retro_backfill_warning_count"))
     manual_edit_count = _to_int(row.get("manual_edit_count"))
+    time_record_origin = str(row.get("time_record_origin") or "live")
     gap_seconds = abs(clocked_seconds - task_seconds)
     severity = 0
     reasons: list[str] = []
@@ -1527,8 +1529,9 @@ def _fallback_review_fields(row: dict[str, Any]) -> dict[str, Any]:
         add_reason(2, "Clocked-in time exists, but no work segments were stored.")
     if task_seconds - clocked_seconds > 5 * 60:
         add_reason(2, f"Task-tracked time exceeds clocked-in time by {_format_duration(task_seconds - clocked_seconds)}.")
-    elif clocked_seconds >= 4 * 60 * 60 and task_seconds == 0:
-        add_reason(1, f"No task-tracked time was recorded for a {_format_duration(clocked_seconds)} day.")
+    elif task_seconds == 0:
+        if clocked_seconds >= 4 * 60 * 60 and time_record_origin != "legacy_migration":
+            add_reason(1, f"No task-tracked time was recorded for a {_format_duration(clocked_seconds)} day.")
     elif clocked_seconds - task_seconds >= 2 * 60 * 60 and task_seconds > 0:
         add_reason(1, f"Clocked-in time exceeds task-tracked time by {_format_duration(clocked_seconds - task_seconds)}.")
 
@@ -1538,8 +1541,12 @@ def _fallback_review_fields(row: dict[str, Any]) -> dict[str, Any]:
         add_reason(1, "Retro backfill confidence is low for this day.")
     if retro_warning_count > 0:
         add_reason(1, f"Retro backfill recorded {retro_warning_count} warning(s) for this day.")
-    if manual_edit_count > 1:
+    if manual_edit_count > 1 and time_record_origin != "legacy_migration":
         add_reason(1, f"This day has been manually corrected {manual_edit_count} times.")
+    if time_record_origin == "legacy_migration":
+        reasons.append(
+            "Legacy migration record; task allocation was not imported and is not treated as a current Don Pollo failure."
+        )
 
     review_status = "likely_correct"
     if severity >= 2:

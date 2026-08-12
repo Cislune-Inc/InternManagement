@@ -1602,6 +1602,224 @@ def test_runtime_clock_out_request_bypasses_missing_task_onboarding_prompt() -> 
     assert sent == ["clock out"]
 
 
+def test_runtime_clock_out_request_stops_attendance_and_task_timer_immediately() -> None:
+    runtime = _build_runtime()
+    runtime.clickup = None
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None):
+        del view
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(user_key="alex", display_name="Alex", discord_user_id=1)
+    session = SessionState(
+        user_key="alex",
+        session_date="2026-08-11",
+        stage="active",
+        clocked_in_at="2026-08-11T09:00:00-07:00",
+        work_segments=[
+            {"clocked_in_at": "2026-08-11T09:00:00-07:00", "clocked_out_at": None}
+        ],
+        metadata={
+            "active_clickup_task_id": "task-1",
+            "active_clickup_task_name": "Build fixture",
+            "clickup_time_tracking": {
+                "task_id": "task-1",
+                "task_name": "Build fixture",
+                "started_at": "2026-08-11T09:05:00-07:00",
+                "source": "local",
+            },
+        },
+    )
+    now = datetime.fromisoformat("2026-08-11T17:00:00-07:00")
+    inbound = MessageRecord(
+        message_id="clock-out-now",
+        direction="inbound",
+        author_id=1,
+        created_at=now,
+        content="clock out",
+        attachments=[],
+    )
+
+    asyncio.run(runtime._start_clock_out(SimpleNamespace(), user, session, inbound, now))
+
+    assert session.stage == "awaiting_clock_out_artifacts"
+    assert session.clocked_out_at == now.isoformat()
+    assert session.work_segments == [
+        {"clocked_in_at": "2026-08-11T09:00:00-07:00", "clocked_out_at": now.isoformat()}
+    ]
+    assert "clickup_time_tracking" not in session.metadata
+    assert session.metadata["clickup_time_tracking_history"][-1]["closed_at"] == now.isoformat()
+    assert session.metadata["clickup_time_tracking_history"][-1]["end_reason"] == "clock_out_requested"
+    assert sent == ["clock out"]
+
+
+def test_runtime_clock_out_still_closes_local_time_when_clickup_fails() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    class FailingClickUp:
+        async def set_task_state(self, _task_id: str, _state: str):
+            raise RuntimeError("ClickUp unavailable")
+
+        async def resolve_clickup_user_id(self, _user):
+            raise RuntimeError("ClickUp unavailable")
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None):
+        del view
+        sent.append(content)
+
+    runtime.clickup = FailingClickUp()
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(user_key="alex", display_name="Alex", discord_user_id=1)
+    session = SessionState(
+        user_key="alex",
+        session_date="2026-08-11",
+        stage="active",
+        clocked_in_at="2026-08-11T09:00:00-07:00",
+        work_segments=[
+            {"clocked_in_at": "2026-08-11T09:00:00-07:00", "clocked_out_at": None}
+        ],
+        metadata={
+            "active_clickup_task_id": "task-1",
+            "active_clickup_task_name": "Build fixture",
+            "clickup_time_tracking": {
+                "task_id": "task-1",
+                "task_name": "Build fixture",
+                "started_at": "2026-08-11T09:05:00-07:00",
+                "source": "local",
+            },
+        },
+    )
+    now = datetime.fromisoformat("2026-08-11T17:00:00-07:00")
+    inbound = MessageRecord(
+        message_id="clock-out-clickup-down",
+        direction="inbound",
+        author_id=1,
+        created_at=now,
+        content="clock out",
+        attachments=[],
+    )
+
+    asyncio.run(runtime._start_clock_out(SimpleNamespace(), user, session, inbound, now))
+
+    assert session.clocked_out_at == now.isoformat()
+    assert "clickup_time_tracking" not in session.metadata
+    assert session.metadata["clickup_time_tracking_history"][-1]["sync_result"] == "local_only"
+    assert sent == ["clock out"]
+
+
+def test_runtime_redundant_clock_out_does_not_add_overlapping_segment() -> None:
+    runtime = _build_runtime()
+    sent: list[str] = []
+
+    async def fake_send(_client, _user, _session, content: str, _now: datetime, *, view=None):
+        del view
+        sent.append(content)
+
+    runtime._send_dm = fake_send  # type: ignore[method-assign]
+    user = UserProfile(user_key="alex", display_name="Alex", discord_user_id=1)
+    session = SessionState(
+        user_key="alex",
+        session_date="2026-08-11",
+        stage="clocked_out",
+        clocked_in_at="2026-08-11T09:00:00-07:00",
+        clocked_out_at="2026-08-11T17:00:00-07:00",
+        work_segments=[
+            {
+                "clocked_in_at": "2026-08-11T09:00:00-07:00",
+                "clocked_out_at": "2026-08-11T17:00:00-07:00",
+            }
+        ],
+    )
+    now = datetime.fromisoformat("2026-08-11T17:10:00-07:00")
+    inbound = MessageRecord(
+        message_id="redundant-clock-out",
+        direction="inbound",
+        author_id=1,
+        created_at=now,
+        content="clock out",
+        attachments=[],
+    )
+
+    asyncio.run(runtime._start_clock_out(SimpleNamespace(), user, session, inbound, now))
+
+    assert session.stage == "clocked_out"
+    assert len(session.work_segments) == 1
+    assert "already clocked out" in sent[-1].lower()
+
+
+def test_runtime_overlapping_work_segments_count_time_once_and_raise_review_issue() -> None:
+    runtime = _build_runtime()
+    user = UserProfile(
+        user_key="alex",
+        display_name="Alex",
+        discord_user_id=1,
+        timezone="America/Los_Angeles",
+    )
+    session = SessionState(
+        user_key="alex",
+        session_date="2026-08-10",
+        stage="clocked_out",
+        clocked_in_at="2026-08-10T09:00:00-07:00",
+        clocked_out_at="2026-08-10T17:00:00-07:00",
+        work_segments=[
+            {
+                "clocked_in_at": "2026-08-10T09:00:00-07:00",
+                "clocked_out_at": "2026-08-10T12:00:00-07:00",
+            },
+            {
+                "clocked_in_at": "2026-08-10T09:00:00-07:00",
+                "clocked_out_at": "2026-08-10T17:00:00-07:00",
+            },
+        ],
+    )
+    now = datetime.fromisoformat("2026-08-11T09:00:00-07:00")
+
+    runtime._refresh_session_time_summary(session, now)
+    review = runtime._build_time_tracking_review_snapshot(user, session, now=now)
+
+    assert session.time_summary["gross_clocked_in_total_seconds"] == 8 * 60 * 60
+    assert review["status"] == "likely_wrong"
+    assert any("overlapping work segment" in reason for reason in review["reasons"])
+
+
+def test_runtime_legacy_migration_does_not_treat_missing_task_time_as_live_failure() -> None:
+    runtime = _build_runtime()
+    user = UserProfile(
+        user_key="alex",
+        display_name="Alex",
+        discord_user_id=1,
+        timezone="America/Los_Angeles",
+    )
+    session = SessionState(
+        user_key="alex",
+        session_date="2026-08-05",
+        stage="clocked_out",
+        clocked_in_at="2026-08-05T09:00:00-07:00",
+        clocked_out_at="2026-08-05T17:00:00-07:00",
+        work_segments=[
+            {
+                "clocked_in_at": "2026-08-05T09:00:00-07:00",
+                "clocked_out_at": "2026-08-05T17:00:00-07:00",
+            }
+        ],
+        metadata={
+            "time_record_origin": "legacy_migration",
+            "manual_time_edits": [{"edited_by": "g"}, {"edited_by": "g"}],
+        },
+    )
+    now = datetime.fromisoformat("2026-08-11T09:00:00-07:00")
+
+    runtime._refresh_session_time_summary(session, now)
+    review = runtime._build_time_tracking_review_snapshot(user, session, now=now)
+
+    assert review["status"] == "likely_correct"
+    assert any("legacy migration" in reason.lower() for reason in review["reasons"])
+    assert not any("no task-tracked time" in reason.lower() for reason in review["reasons"])
+
+
 def test_runtime_reported_clock_out_request_bypasses_missing_task_onboarding_prompt() -> None:
     runtime = _build_runtime()
     sent: list[str] = []
@@ -2020,7 +2238,7 @@ def test_runtime_clock_out_photo_and_wrap_up_across_follow_up_messages_finishes_
     asyncio.run(runtime._handle_clock_out_artifacts(SimpleNamespace(), user, session, wrap_up, wrap_up.created_at))
 
     assert session.stage == "clocked_out"
-    assert session.clocked_out_at == "2026-06-10T17:04:00-07:00"
+    assert session.clocked_out_at == "2026-06-10T17:00:00-07:00"
     assert session.awaiting_clock_out_photo is False
     assert session.awaiting_clock_out_summary is False
     assert session.metadata["clock_out_summary_message_id"] == "msg-clock-out-wrap-up"
@@ -2131,7 +2349,7 @@ def test_runtime_handle_incoming_message_serializes_clock_out_artifact_follow_up
 
     stored = runtime.state_store.get_session(user.user_key, session.session_date)
     assert stored.stage == "clocked_out"
-    assert stored.clocked_out_at == "2026-06-22T17:16:21-07:00"
+    assert stored.clocked_out_at == "2026-06-22T17:14:30-07:00"
     assert stored.awaiting_clock_out_photo is False
     assert stored.awaiting_clock_out_summary is False
     assert stored.metadata["clock_out_summary_message_id"] == "msg-artifacts"
@@ -2391,7 +2609,7 @@ def test_runtime_clock_out_artifacts_finalize_before_later_scheduler_tick() -> N
 
     asyncio.run(runtime.process_inbound_event(SimpleNamespace(), user, session, artifacts, artifacts.created_at))
     assert session.stage == "clocked_out"
-    assert session.clocked_out_at == "2026-06-22T17:16:21-07:00"
+    assert session.clocked_out_at == "2026-06-22T17:14:30-07:00"
 
     runtime.state_store.save_session(session)
     asyncio.run(
@@ -2404,7 +2622,7 @@ def test_runtime_clock_out_artifacts_finalize_before_later_scheduler_tick() -> N
 
     stored = runtime.state_store.get_session(user.user_key, session.session_date)
     assert stored.stage == "clocked_out"
-    assert stored.clocked_out_at == "2026-06-22T17:16:21-07:00"
+    assert stored.clocked_out_at == "2026-06-22T17:14:30-07:00"
     assert "auto_clock_out_at" not in stored.metadata
     assert sent[0] == "clock out"
     assert "saved" in sent[1].lower()

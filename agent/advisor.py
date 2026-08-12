@@ -37,6 +37,14 @@ class Advisor:
     ) -> str:
         raise NotImplementedError
 
+    async def summarize_slack_progress(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        messages: list[MessageRecord],
+    ) -> str:
+        raise NotImplementedError
+
     async def assess_check_in_reply(
         self,
         user: UserProfile,
@@ -103,6 +111,20 @@ class HeuristicAdvisor(Advisor):
             lines.append("Recent updates:")
             lines.extend(f"- {item}" for item in latest_excerpt)
         return "\n".join(lines)
+
+    async def summarize_slack_progress(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        messages: list[MessageRecord],
+    ) -> str:
+        del user, session
+        updates = [
+            " ".join(message.content.strip().split())
+            for message in messages
+            if message.direction == "inbound" and message.content.strip()
+        ]
+        return " ".join(dict.fromkeys(updates))
 
     async def assess_check_in_reply(
         self,
@@ -238,6 +260,30 @@ class OpenAIAdvisor(Advisor):
         )
         return await self._response_text(prompt)
 
+    async def summarize_slack_progress(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        messages: list[MessageRecord],
+    ) -> str:
+        transcript = "\n".join(
+            f"- {message.content.strip()}"
+            for message in messages
+            if message.direction == "inbound" and message.content.strip()
+        )
+        prompt = (
+            "Extract only factual project progress from the worker messages for a public Slack update. "
+            "Keep concrete changes, results, measurements, decisions, blockers, and next actions. "
+            "Ignore complaints about the bot, time-clock questions, menu replies, greetings, and workflow chatter. "
+            "Do not invent or infer accomplishments. Return at most two concise sentences with no heading. "
+            "If there is no factual progress, return exactly NONE.\n\n"
+            f"Worker: {user.display_name}\n"
+            f"Task: {session.metadata.get('active_clickup_task_name') or 'unknown'}\n"
+            f"Messages:\n{transcript or '(none)'}"
+        )
+        result = (await self._response_text(prompt)).strip()
+        return "" if result.upper() == "NONE" else result
+
     async def assess_check_in_reply(
         self,
         user: UserProfile,
@@ -325,6 +371,19 @@ class ResilientAdvisor(Advisor):
             except Exception as exc:
                 self._disable_primary(exc, "session summary")
         return await self.fallback.summarize_updates(user, session, messages, clickup_context)
+
+    async def summarize_slack_progress(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        messages: list[MessageRecord],
+    ) -> str:
+        if self.primary_enabled:
+            try:
+                return await self.primary.summarize_slack_progress(user, session, messages)
+            except Exception as exc:
+                self._disable_primary(exc, "Slack progress summary")
+        return await self.fallback.summarize_slack_progress(user, session, messages)
 
     async def assess_check_in_reply(
         self,

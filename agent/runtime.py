@@ -299,6 +299,7 @@ _SESSION_STATE_TIMESTAMP_FIELDS = (
 _TIME_TRACKING_REPORT_RELATIVE_PATH = Path("dashboard") / "time_tracking" / "time_tracking.csv"
 _SLACK_UPDATE_STATE_RELATIVE_PATH = Path("dashboard") / "slack_updates" / "state.json"
 _RETRO_HOURS_BACKFILL_METADATA_KEY = "retro_hours_backfill"
+_TIME_RECORD_ORIGIN_METADATA_KEY = "time_record_origin"
 _TIME_TRACKING_REPORT_FIELDS = (
     "user_key",
     "display_name",
@@ -319,6 +320,7 @@ _TIME_TRACKING_REPORT_FIELDS = (
     "latest_manual_edit_json",
     "retro_backfill_confidence",
     "retro_backfill_warning_count",
+    "time_record_origin",
     "review_status",
     "review_summary",
     "review_reasons_json",
@@ -595,6 +597,7 @@ class _AdminProgressProbeView(discord.ui.View):
 
 _CLICKUP_PROMPT_KEY = "clickup_prompt"
 _CLOCK_OUT_RETURN_STATE_KEY = "clock_out_return_state"
+_CLOCK_OUT_PAUSE_NOTE_KEY = "clock_out_pause_note"
 _STATE_MACHINE_CHANGES_FILENAME = "state_machine_changes.jsonl"
 _MANUAL_TIME_EDITS_FILENAME = "manual_time_edits.jsonl"
 _LUNCH_CONFIRMATION_REQUESTED_AT_KEY = "lunch_confirmation_requested_at"
@@ -4144,6 +4147,12 @@ class InternManagementRuntime:
             blocker_changed=blocker_changed,
         ):
             return False
+        factual_progress = await self._summarize_slack_progress_for_post(
+            user,
+            session,
+            recent_messages,
+            include_session_context=first_update,
+        )
         message = self._build_slack_daily_update_message(
             user,
             session,
@@ -4153,6 +4162,7 @@ class InternManagementRuntime:
             route_uncertain=route_uncertain,
             include_session_context=first_update,
             blocker_changed=blocker_changed,
+            factual_progress=factual_progress,
         )
         text_fingerprints = set(posted_text_fingerprints)
         text_fingerprints.update(
@@ -4747,6 +4757,7 @@ class InternManagementRuntime:
         route_uncertain: bool,
         include_session_context: bool,
         blocker_changed: bool,
+        factual_progress: str | None = None,
     ) -> str:
         intern = f"<@{user.slack_user_id}>" if user.slack_user_id else user.display_name
         task_name = str(session.metadata.get("active_clickup_task_name") or "current task")
@@ -4759,10 +4770,10 @@ class InternManagementRuntime:
         lines = [f"*{intern} update* - {task_label}"]
         if route_label and route_label not in {"default", "mapping needed"}:
             lines.append(f"_Project: {route_label}_")
-        interesting_bits = self._slack_interesting_bits(
-            session,
-            messages,
-            include_session_context=include_session_context,
+        interesting_bits = (
+            self._compact_slack_text(factual_progress, 420)
+            if factual_progress
+            else ""
         )
         if interesting_bits:
             lines.append(f"*What changed:* {interesting_bits}")
@@ -4778,6 +4789,36 @@ class InternManagementRuntime:
             )
             lines.append(f"*Photo note:* {image_hint}")
         return "\n".join(lines)
+
+    async def _summarize_slack_progress_for_post(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        messages: list[MessageRecord],
+        *,
+        include_session_context: bool,
+    ) -> str:
+        candidates = list(messages)
+        if not candidates:
+            if (
+                include_session_context
+                and not session.latest_plan
+                and self._slack_text_is_interesting(session.latest_status or "")
+            ):
+                return self._compact_slack_text(session.latest_status or "", 420)
+            return ""
+        summarize = getattr(getattr(self, "advisor", None), "summarize_slack_progress", None)
+        if callable(summarize):
+            try:
+                result = str(await summarize(user, session, candidates) or "").strip()
+                return self._compact_slack_text(result, 420) if result else ""
+            except Exception:
+                logger.exception("Could not extract factual Slack progress for %s.", user.user_key)
+        return self._slack_interesting_bits(
+            session,
+            candidates,
+            include_session_context=include_session_context,
+        )
 
     def _slack_interesting_bits(
         self,
@@ -10983,25 +11024,31 @@ class InternManagementRuntime:
             "source": "local",
         }
         if self.clickup and self.config and self.config.clickup.create_time_entries:
-            assignee_id = await self.clickup.resolve_clickup_user_id(user)
-            if assignee_id:
-                entry = await self.clickup.get_running_time_entry(assignee_id) if self.clickup.can_query_assignee_timers() else None
-                entry_task_id = self._time_entry_task_id(entry) if entry else None
-                if entry and entry_task_id == task_id:
-                    new_tracking["source"] = "remote"
-                    new_tracking["remote_entry_id"] = str(entry.get("id") or entry.get("timer_id") or "")
-                    new_tracking["started_at"] = self._time_entry_start_iso(entry, now)
-                elif self.clickup._assignee_timer_start_supported is not False:
-                    started = await self.clickup.start_assignee_timer(
-                        assignee_id=assignee_id,
-                        task_id=task_id,
-                        start_ms=int(now.timestamp() * 1000),
-                        description=self._build_time_entry_description(session),
-                    )
-                    if started:
+            try:
+                assignee_id = await self.clickup.resolve_clickup_user_id(user)
+                if assignee_id:
+                    entry = await self.clickup.get_running_time_entry(assignee_id) if self.clickup.can_query_assignee_timers() else None
+                    entry_task_id = self._time_entry_task_id(entry) if entry else None
+                    if entry and entry_task_id == task_id:
                         new_tracking["source"] = "remote"
-                        new_tracking["remote_entry_id"] = str(started.get("id") or started.get("timer_id") or "")
-                        new_tracking["started_at"] = self._time_entry_start_iso(started, now)
+                        new_tracking["remote_entry_id"] = str(entry.get("id") or entry.get("timer_id") or "")
+                        new_tracking["started_at"] = self._time_entry_start_iso(entry, now)
+                    elif self.clickup._assignee_timer_start_supported is not False:
+                        started = await self.clickup.start_assignee_timer(
+                            assignee_id=assignee_id,
+                            task_id=task_id,
+                            start_ms=int(now.timestamp() * 1000),
+                            description=self._build_time_entry_description(session),
+                        )
+                        if started:
+                            new_tracking["source"] = "remote"
+                            new_tracking["remote_entry_id"] = str(started.get("id") or started.get("timer_id") or "")
+                            new_tracking["started_at"] = self._time_entry_start_iso(started, now)
+            except Exception:
+                logger.exception(
+                    "Could not start remote task time for %s; using the local timer.",
+                    user.user_key,
+                )
         session.metadata["clickup_time_tracking"] = new_tracking
 
     async def _pause_current_task_tracking(
@@ -11016,7 +11063,13 @@ class InternManagementRuntime:
         active_task_id = self._active_task_id(session)
         active_task_name = str(session.metadata.get("active_clickup_task_name") or "the active task")
         if active_task_id and set_hold:
-            await self._safe_set_task_state(session, active_task_id, "hold")
+            try:
+                await self._safe_set_task_state(session, active_task_id, "hold")
+            except Exception:
+                logger.exception(
+                    "Could not put ClickUp task %s on hold while pausing tracking.",
+                    active_task_id,
+                )
         tracking = session.metadata.get("clickup_time_tracking")
         if not isinstance(tracking, dict) or tracking.get("closed_at"):
             return None
@@ -11029,29 +11082,35 @@ class InternManagementRuntime:
         start_dt = datetime.fromisoformat(started_at)
         synced = False
         if self.clickup and self.config and self.config.clickup.create_time_entries:
-            remote_entry_id = str(tracking.get("remote_entry_id") or "")
-            if remote_entry_id:
-                synced = bool(
-                    await self.clickup.close_time_entry(
-                        timer_id=remote_entry_id,
-                        start_ms=int(start_dt.timestamp() * 1000),
-                        stop_ms=int(now.timestamp() * 1000),
-                        description=description,
-                        task_id=tracked_task_id or None,
-                    )
-                )
-            else:
-                assignee_id = await self.clickup.resolve_clickup_user_id(user)
-                if assignee_id:
+            try:
+                remote_entry_id = str(tracking.get("remote_entry_id") or "")
+                if remote_entry_id:
                     synced = bool(
-                        await self.clickup.create_time_entry(
-                            assignee_id=assignee_id,
-                            task_id=tracked_task_id or None,
+                        await self.clickup.close_time_entry(
+                            timer_id=remote_entry_id,
                             start_ms=int(start_dt.timestamp() * 1000),
                             stop_ms=int(now.timestamp() * 1000),
                             description=description,
+                            task_id=tracked_task_id or None,
                         )
                     )
+                else:
+                    assignee_id = await self.clickup.resolve_clickup_user_id(user)
+                    if assignee_id:
+                        synced = bool(
+                            await self.clickup.create_time_entry(
+                                assignee_id=assignee_id,
+                                task_id=tracked_task_id or None,
+                                start_ms=int(start_dt.timestamp() * 1000),
+                                stop_ms=int(now.timestamp() * 1000),
+                                description=description,
+                            )
+                        )
+            except Exception:
+                logger.exception(
+                    "Could not synchronize paused task time for %s; keeping the local window.",
+                    user.user_key,
+                )
         tracking["closed_at"] = now.isoformat()
         tracking["duration_seconds"] = max(0, int((now - start_dt).total_seconds()))
         tracking["sync_result"] = "synced" if synced else "local_only"
@@ -11962,6 +12021,7 @@ class InternManagementRuntime:
             "latest_manual_edit_json": latest_manual_edit_json,
             "retro_backfill_confidence": str(retro_backfill.get("confidence") or ""),
             "retro_backfill_warning_count": len(retro_warnings) if isinstance(retro_warnings, list) else 0,
+            "time_record_origin": str(session.metadata.get(_TIME_RECORD_ORIGIN_METADATA_KEY) or "live"),
             "review_status": str(review.get("status") or "likely_correct"),
             "review_summary": str(review.get("summary") or ""),
             "review_reasons_json": json.dumps(review.get("reasons") or [], sort_keys=True, separators=(",", ":")),
@@ -11985,6 +12045,7 @@ class InternManagementRuntime:
         work_segment_count = int(session.time_summary.get("work_segment_count") or 0)
         has_open_work_segment = bool(session.time_summary.get("has_open_work_segment"))
         active_task_timer_running = bool(session.time_summary.get("active_task_timer_running"))
+        overlapping_work_segment_count = self._overlapping_work_segment_count(session, now)
         gap_seconds = abs(clocked_in_total_seconds - task_tracked_total_seconds)
         current_workday = self.resolve_user_workday_date(user, now)
         is_current_workday = session.session_date == current_workday
@@ -11995,6 +12056,10 @@ class InternManagementRuntime:
         retro_confidence = str(retro_backfill.get("confidence") or "")
         retro_warnings = retro_backfill.get("warnings")
         retro_warning_count = len(retro_warnings) if isinstance(retro_warnings, list) else 0
+        time_record_origin = str(
+            session.metadata.get(_TIME_RECORD_ORIGIN_METADATA_KEY) or "live"
+        )
+        is_legacy_migration = time_record_origin == "legacy_migration"
 
         if is_current_workday and (
             has_open_work_segment
@@ -12029,6 +12094,14 @@ class InternManagementRuntime:
             add_issue(2, "Past workday still has an open work segment.")
         if not is_current_workday and active_task_timer_running:
             add_issue(2, "Past workday still shows an active task timer.")
+        if overlapping_work_segment_count:
+            add_issue(
+                2,
+                (
+                    f"{overlapping_work_segment_count} overlapping work segment(s) were found. "
+                    "Overlapping time is counted only once, but the raw segments should be corrected."
+                ),
+            )
         if clocked_in_total_seconds > 0 and work_segment_count <= 0:
             add_issue(2, "Clocked-in time exists, but no work segments were stored for the day.")
         if not is_current_workday and clocked_in_total_seconds > 0 and not session.clocked_out_at:
@@ -12054,11 +12127,12 @@ class InternManagementRuntime:
                 2,
                 f"Task-tracked time exceeds clocked-in time by {self._format_duration(task_overrun_seconds)}.",
             )
-        elif clocked_in_total_seconds >= 4 * 60 * 60 and task_tracked_total_seconds == 0:
-            add_issue(
-                1,
-                f"No task-tracked time was recorded for a {self._format_duration(clocked_in_total_seconds)} day.",
-            )
+        elif task_tracked_total_seconds == 0:
+            if clocked_in_total_seconds >= 4 * 60 * 60 and not is_legacy_migration:
+                add_issue(
+                    1,
+                    f"No task-tracked time was recorded for a {self._format_duration(clocked_in_total_seconds)} day.",
+                )
         else:
             uncovered_gap_seconds = clocked_in_total_seconds - task_tracked_total_seconds
             if uncovered_gap_seconds >= 4 * 60 * 60:
@@ -12084,9 +12158,14 @@ class InternManagementRuntime:
         if retro_warning_count > 0:
             add_issue(1, f"Retro backfill recorded {retro_warning_count} warning(s) for this day.")
 
-        if manual_edit_count > 1:
+        if is_legacy_migration:
+            add_note(
+                "Legacy migration record; task allocation was not imported and is not treated as a current Don Pollo failure."
+            )
+
+        if manual_edit_count > 1 and not is_legacy_migration:
             add_issue(1, f"This day has been manually corrected {manual_edit_count} times.")
-        elif manual_edit_count == 1:
+        elif manual_edit_count == 1 and not is_legacy_migration:
             add_note("This day has one manual correction on record.")
 
         latest_manual_edit = session.metadata.get("latest_manual_time_edit")
@@ -12445,7 +12524,38 @@ class InternManagementRuntime:
                 end_dt = end_dt.replace(tzinfo=start_dt.tzinfo)
             if end_dt > start_dt:
                 bounds.append((start_dt, end_dt))
-        return sorted(bounds, key=lambda item: item[0])
+        merged: list[tuple[datetime, datetime]] = []
+        for start_dt, end_dt in sorted(bounds, key=lambda item: item[0]):
+            if not merged or start_dt >= merged[-1][1]:
+                merged.append((start_dt, end_dt))
+                continue
+            previous_start, previous_end = merged[-1]
+            merged[-1] = (previous_start, max(previous_end, end_dt))
+        return merged
+
+    def _overlapping_work_segment_count(
+        self,
+        session: SessionState,
+        now: datetime,
+    ) -> int:
+        raw_bounds: list[tuple[datetime, datetime]] = []
+        for segment in session.work_segments:
+            if not isinstance(segment, dict):
+                continue
+            start_dt = self._coerce_datetime(str(segment.get("clocked_in_at") or ""))
+            end_dt = self._coerce_datetime(str(segment.get("clocked_out_at") or "")) or now
+            if start_dt is None:
+                continue
+            start_dt, end_dt = self._align_datetime_pair(start_dt, end_dt, reference=now)
+            if end_dt > start_dt:
+                raw_bounds.append((start_dt, end_dt))
+        overlap_count = 0
+        furthest_end: datetime | None = None
+        for start_dt, end_dt in sorted(raw_bounds, key=lambda item: item[0]):
+            if furthest_end is not None and start_dt < furthest_end:
+                overlap_count += 1
+            furthest_end = end_dt if furthest_end is None else max(furthest_end, end_dt)
+        return overlap_count
 
     def _unpaid_lunch_deduction_seconds(
         self,
@@ -14039,19 +14149,13 @@ class InternManagementRuntime:
             if not segment.get("clocked_out_at"):
                 segment["clocked_out_at"] = now.isoformat()
                 return
-        if session.clocked_in_at:
-            session.work_segments.append(
-                {
-                    "clocked_in_at": session.clocked_in_at,
-                    "clocked_out_at": now.isoformat(),
-                }
-            )
 
     def _clear_clock_out_state(self, session: SessionState) -> None:
         session.clocked_out_at = None
         session.awaiting_clock_out_photo = False
         session.awaiting_clock_out_summary = False
         session.metadata.pop(_CLOCK_OUT_RETURN_STATE_KEY, None)
+        session.metadata.pop(_CLOCK_OUT_PAUSE_NOTE_KEY, None)
 
     def _clear_auto_clock_out_metadata(self, session: SessionState) -> None:
         for key in (
@@ -14090,8 +14194,18 @@ class InternManagementRuntime:
         inbound: MessageRecord,
         now: datetime,
     ) -> None:
+        if session.clocked_out_at and _CLOCK_OUT_RETURN_STATE_KEY not in session.metadata:
+            await self._send_dm(
+                client,
+                user,
+                session,
+                "You are already clocked out. I did not add another time segment.",
+                now,
+            )
+            return
         if _CLOCK_OUT_RETURN_STATE_KEY not in session.metadata:
             prompt = session.metadata.get(_CLICKUP_PROMPT_KEY)
+            tracking = session.metadata.get("clickup_time_tracking")
             session.metadata[_CLOCK_OUT_RETURN_STATE_KEY] = {
                 "stage": session.stage,
                 "awaiting_clock_out_photo": session.awaiting_clock_out_photo,
@@ -14102,6 +14216,10 @@ class InternManagementRuntime:
                 "had_clock_out_summary_message_id": "clock_out_summary_message_id" in session.metadata,
                 "clock_out_summary_message_id": session.metadata.get("clock_out_summary_message_id"),
                 "pending_lunch_confirmation": session.metadata.get(_LUNCH_CONFIRMATION_REQUESTED_AT_KEY),
+                "task_tracking_was_running": bool(
+                    isinstance(tracking, dict) and not tracking.get("closed_at")
+                ),
+                "clock_out_requested_at": now.isoformat(),
             }
         self._clear_pending_lunch_confirmation(session)
         self._clear_task_onboarding_prompt(session)
@@ -14118,6 +14236,17 @@ class InternManagementRuntime:
         session.stage = "awaiting_clock_out_artifacts"
         session.awaiting_clock_out_photo = not bool(inbound.attachments)
         session.awaiting_clock_out_summary = True
+        session.clocked_out_at = now.isoformat()
+        self._close_current_work_segment(session, now)
+        pause_note = await self._pause_current_task_tracking(
+            user,
+            session,
+            now,
+            set_hold=True,
+            end_reason="clock_out_requested",
+        )
+        if pause_note:
+            session.metadata[_CLOCK_OUT_PAUSE_NOTE_KEY] = pause_note
         if inbound.attachments:
             self._record_attachment_paths(session, "clock_out_photo_paths", inbound)
         await self._send_dm(client, user, session, self.config.prompts.clock_out_prompt, now)
@@ -14155,6 +14284,20 @@ class InternManagementRuntime:
         pending_lunch_confirmation = return_state.get("pending_lunch_confirmation")
         if pending_lunch_confirmation:
             session.metadata[_LUNCH_CONFIRMATION_REQUESTED_AT_KEY] = pending_lunch_confirmation
+        self._start_new_work_segment(session, now)
+        if bool(return_state.get("task_tracking_was_running")):
+            task_id = str(self._active_task_id(session) or "")
+            task_name = str(session.metadata.get("active_clickup_task_name") or "")
+            if task_id:
+                try:
+                    await self._safe_set_task_state(session, task_id, "in_progress")
+                except Exception:
+                    logger.exception(
+                        "Could not restore ClickUp task %s after clock-out cancellation.",
+                        task_id,
+                    )
+                await self._start_task_timer(user, session, now, task_id, task_name)
+        session.metadata.pop(_CLOCK_OUT_PAUSE_NOTE_KEY, None)
 
         message = "Okay, I canceled the clock-out process. You are still clocked in."
         if isinstance(restored_prompt, dict) and str(restored_prompt.get("type") or "") == "task_onboarding":
@@ -14176,6 +14319,17 @@ class InternManagementRuntime:
     ) -> None:
         if is_clock_out_cancellation(inbound.content):
             await self._cancel_clock_out(client, user, session, now)
+            return
+        if detect_signals(inbound.content).clocking_out:
+            reminder = self._clock_out_artifacts_reminder_text(session)
+            await self._send_dm(
+                client,
+                user,
+                session,
+                "You are already clocked out; I did not add another time segment."
+                + (f"\n\n{reminder}" if reminder else ""),
+                now,
+            )
             return
         self._clear_task_onboarding_prompt(session)
         if inbound.attachments:
@@ -14205,11 +14359,19 @@ class InternManagementRuntime:
         ):
             session.metadata["lunch_ended_at"] = now.isoformat()
             self._record_lunch_window_end(session, now)
-        session.clocked_out_at = now.isoformat()
-        self._close_current_work_segment(session, now)
+        return_state = session.metadata.get(_CLOCK_OUT_RETURN_STATE_KEY)
+        return_state = return_state if isinstance(return_state, dict) else {}
+        session.clocked_out_at = str(
+            return_state.get("clock_out_requested_at")
+            or session.clocked_out_at
+            or now.isoformat()
+        )
         session.stage = "clocked_out"
         session.metadata.pop(_CLOCK_OUT_RETURN_STATE_KEY, None)
         note = await self._finalize_clickup_day(user, session, now)
+        pause_note = str(session.metadata.pop(_CLOCK_OUT_PAUSE_NOTE_KEY, "") or "").strip()
+        if pause_note:
+            note = f"{pause_note}\n\n{note}" if note else pause_note
         message = "Perfect. I saved everything and will update the project trail."
         if note:
             message = f"{message}\n\n{note}"

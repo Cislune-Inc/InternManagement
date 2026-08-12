@@ -67,6 +67,14 @@ class SlackUpdatePolicy:
                 normalized,
             )
             or re.search(r"\b(?:clock|break)\b.*\b(?:pollo|bot)\b", normalized)
+            or re.search(
+                r"\b(?:you|pollo|bot)\b.*\b(?:did not|didnt|didn t|never|havent|haven t|have not)\b.*\b(?:ask|prompt|tell)\b",
+                normalized,
+            )
+            or re.search(
+                r"\bwhy\b.*\b(?:are you|is (?:pollo|the bot))\b.*\b(?:asking|prompting|telling)\b",
+                normalized,
+            )
         )
 
     def is_interesting(self, text: str) -> bool:

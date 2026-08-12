@@ -16,8 +16,12 @@ fi
 repo_root="${DON_POLLO_DEPLOY_REPO_ROOT:?}"
 stable_script="${DON_POLLO_DEPLOY_STABLE_PATH:?}"
 reconciliation_index=""
+maintenance_started=0
 
 cleanup() {
+  if [[ "${maintenance_started}" == "1" ]]; then
+    .venv/bin/python ops/deploy_maintenance.py stop >/dev/null 2>&1 || true
+  fi
   [[ -z "${reconciliation_index}" ]] || rm -f "${reconciliation_index}"
   rm -f "${stable_script}"
 }
@@ -89,6 +93,10 @@ fi
 .venv/bin/python ops/apply_production_controls.py --apply
 PYTHONPATH=. .venv/bin/python ops/apply_production_roster_controls.py --apply
 .venv/bin/python ops/infer_compensation_plans.py --apply-confident
+.venv/bin/python ops/deploy_maintenance.py start --minutes 15
+maintenance_started=1
 ops/restart-services.sh
+.venv/bin/python ops/deploy_maintenance.py stop
+maintenance_started=0
 
 echo "Deployed ${branch} at ${candidate}."

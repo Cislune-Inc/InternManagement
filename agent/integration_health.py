@@ -17,6 +17,7 @@ from .persistence import atomic_write_json
 from .runtime import InternManagementRuntime
 
 _DEFAULT_DASHBOARD_URL = "http://127.0.0.1:8765/api/health"
+_DEPLOY_MAINTENANCE_FILENAME = "deploy_maintenance.json"
 
 
 async def run_integration_checks(
@@ -74,12 +75,25 @@ async def run_integration_checks(
             enabled=bool(os.environ.get("OPENAI_API_KEY")),
         ),
     ]
+    maintenance = _active_deploy_maintenance(runtime, reference)
+    if maintenance:
+        for check in checks:
+            if check.get("name") not in {"bot", "dashboard"} or check.get("status") != "error":
+                continue
+            suppressed_error = str(check.get("error") or "")
+            check["status"] = "maintenance"
+            check["error"] = None
+            check["details"] = {
+                **(check.get("details") if isinstance(check.get("details"), dict) else {}),
+                "suppressed_error": suppressed_error,
+                "maintenance_expires_at": maintenance["expires_at"],
+            }
     for check in checks:
         name = str(check["name"])
         if check["status"] == "ok":
             runtime.operations.resolve("integration_health", name)
             continue
-        if check["status"] == "disabled":
+        if check["status"] in {"disabled", "maintenance"}:
             continue
         await runtime.operations.report(
             category="integration_health",
@@ -101,10 +115,33 @@ async def run_integration_checks(
         "generated_at": reference.isoformat(),
         "overall_status": (
             "ok"
-            if all(check["status"] in {"ok", "disabled"} for check in checks)
+            if all(check["status"] in {"ok", "disabled", "maintenance"} for check in checks)
             else "error"
         ),
         "checks": checks,
+        "maintenance": maintenance or {},
+    }
+
+
+def _active_deploy_maintenance(
+    runtime: InternManagementRuntime,
+    now: datetime,
+) -> dict[str, Any] | None:
+    marker_path = runtime.bootstrap.state_db_path.parent / _DEPLOY_MAINTENANCE_FILENAME
+    try:
+        payload = json.loads(marker_path.read_text(encoding="utf-8"))
+        expires_at = datetime.fromisoformat(str(payload.get("expires_at") or ""))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    reference = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+    if expires_at <= reference.astimezone(expires_at.tzinfo):
+        return None
+    return {
+        "reason": str(payload.get("reason") or "controlled deployment"),
+        "started_at": str(payload.get("started_at") or ""),
+        "expires_at": expires_at.isoformat(),
     }
 
 
