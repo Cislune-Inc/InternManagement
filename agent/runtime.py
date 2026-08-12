@@ -229,6 +229,21 @@ _SELF_LOOKUP_STATUS_REQUEST_PATTERNS = {
     "show my current status",
     "show me my current status",
 }
+_SLACK_PORTAL_REQUEST_PHRASES = {
+    "portal",
+    "beta portal",
+    "worker portal",
+    "workday beta",
+    "login",
+    "log in",
+    "open portal",
+    "open workday",
+    "workday portal",
+    "portal link",
+    "connection link",
+    "connect",
+    "connect portal",
+}
 _AUTO_CLOCK_OUT_NOTIFICATION_MESSAGE = (
     "I paused your work timer after the inactivity window so it does not keep running unattended. "
     "If you are continuing work, reply `clock in` or `resume work`. If you were working during "
@@ -246,17 +261,15 @@ def _normalize_slack_admin_text(value: Any) -> str:
     )
     normalized_text = command_candidate.casefold()
     is_deterministic_command = (
-        normalized_text in {
+        normalized_text
+        in {
             "help",
             "menu",
             "flow",
             "back",
             "home",
             "cancel",
-            "portal",
-            "beta portal",
-            "worker portal",
-            "workday beta",
+            *_SLACK_PORTAL_REQUEST_PHRASES,
         }
         or normalized_text.startswith("help ")
         or normalized_text.startswith("run ")
@@ -1347,12 +1360,7 @@ class InternManagementRuntime:
             return
         slack_user_id = str(event.get("user") or "").strip()
         normalized_text = _normalize_slack_admin_text(event.get("text"))
-        if normalized_text.lower() in {
-            "portal",
-            "beta portal",
-            "worker portal",
-            "workday beta",
-        }:
+        if normalized_text.lower() in _SLACK_PORTAL_REQUEST_PHRASES:
             from .worker_portal import build_worker_portal_link, resolve_worker_portal_actor
 
             actor = resolve_worker_portal_actor(self, slack_user_id)
@@ -1368,12 +1376,13 @@ class InternManagementRuntime:
                     await self.slack.post_message(
                         slack_user_id,
                         (
-                            "Open your live Don Pollo Workday portal:\n"
-                            f"{portal_url}\n\n"
+                            f"<{portal_url}|Open your live Don Pollo Workday portal>\n"
+                            f"Direct link: {portal_url}\n\n"
                             "The private signed link expires in 72 hours. The portal and this Slack DM use the "
                             "same durable work session: starting work claims the ClickUp task without removing "
                             "co-owners, clocks you in, and starts its task timer. If the link does not open, use "
-                            "this Slack DM as the fallback and report the problem rather than skipping the log."
+                            "this Slack DM as the fallback and report the problem rather than skipping the log. "
+                            "It is reachable on the shop network or through the office VPN when you are away."
                         ),
                     )
                     return
@@ -1403,6 +1412,96 @@ class InternManagementRuntime:
             session, now = self.get_user_session_for_moment(user, moment)
             inbound = await self._build_slack_inbound_record(event, session, user, moment)
             await self.process_inbound_event(client, user, session, inbound, now)
+
+    def build_slack_app_home_view(self, slack_user_id: str) -> dict[str, Any]:
+        """Build a durable Slack App Home entry point for the worker portal."""
+        from .worker_portal import build_worker_portal_link, resolve_worker_portal_actor
+
+        actor = resolve_worker_portal_actor(self, slack_user_id)
+        portal_url = ""
+        if actor is not None:
+            try:
+                portal_url = build_worker_portal_link(self, actor)
+            except ValueError:
+                portal_url = ""
+        blocks: list[dict[str, Any]] = [
+            {
+                "type": "header",
+                "text": {"type": "plain_text", "text": "Don Pollo Workday", "emoji": True},
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        "Start or resume work, choose the right project, save useful checkpoints, "
+                        "take lunch or a short break, and see today's recorded time."
+                    ),
+                },
+            },
+        ]
+        if portal_url:
+            blocks.extend(
+                [
+                    {
+                        "type": "actions",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "text": {
+                                    "type": "plain_text",
+                                    "text": "Open Workday Portal",
+                                    "emoji": True,
+                                },
+                                "style": "primary",
+                                "url": portal_url,
+                                "action_id": "open_worker_portal",
+                            }
+                        ],
+                    },
+                    {
+                        "type": "context",
+                        "elements": [
+                            {
+                                "type": "mrkdwn",
+                                "text": (
+                                    "Private link: works on the shop network or office VPN and expires in "
+                                    "72 hours. Reopen this Home tab or DM `login` for a fresh link."
+                                ),
+                            }
+                        ],
+                    },
+                ]
+            )
+        else:
+            blocks.append(
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            "Your Slack account is not enabled for the web beta yet. Use this DM for "
+                            "ordinary Don Pollo updates or contact Erik or George if you need portal access."
+                        ),
+                    },
+                }
+            )
+        blocks.extend(
+            [
+                {"type": "divider"},
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            "*Slack fallback*\nDM `login` for the portal, `hours` for recorded time, "
+                            "or describe what you plan to accomplish and Don Pollo will guide the work log."
+                        ),
+                    },
+                },
+            ]
+        )
+        return {"type": "home", "blocks": blocks}
 
     async def process_inbound_event(
         self,

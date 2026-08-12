@@ -18,6 +18,16 @@ def build_slack_web_client(bot_token: str) -> Any:
     return AsyncWebClient(token=bot_token, ssl=build_ssl_context())
 
 
+async def publish_app_home(runtime: Any, web_client: Any, slack_user_id: str) -> None:
+    """Publish the durable portal/login entry point when a user opens the app."""
+    normalized_user_id = str(slack_user_id or "").strip()
+    if not normalized_user_id:
+        return
+    await runtime.refresh_configuration()
+    view = runtime.build_slack_app_home_view(normalized_user_id)
+    await web_client.views_publish(user_id=normalized_user_id, view=view)
+
+
 class SlackSocketReceiver:
     def __init__(
         self,
@@ -55,6 +65,20 @@ class SlackSocketReceiver:
                 logger.exception(
                     "Unhandled error while processing Slack DM %s",
                     event.get("event_ts") or event.get("ts") or "unknown",
+                )
+
+        @app.event("app_home_opened")
+        async def handle_app_home_opened(event: dict[str, Any]) -> None:
+            try:
+                await publish_app_home(
+                    self.runtime,
+                    web_client,
+                    str(event.get("user") or ""),
+                )
+            except Exception:
+                logger.exception(
+                    "Unhandled error while publishing Slack App Home for %s",
+                    event.get("user") or "unknown",
                 )
 
         self._handler = AsyncSocketModeHandler(

@@ -590,7 +590,7 @@ def test_slack_admin_portal_command_returns_live_link(tmp_path: Path) -> None:
             SimpleNamespace(),
             {
                 "user": "U01SWQKDTBM",
-                "text": "portal *Sent using* <@U0BATRYF16C|ChatGPT>",
+                "text": "login *Sent using* <@U0BATRYF16C|ChatGPT>",
                 "ts": "1785859200.0",
             },
         )
@@ -600,7 +600,8 @@ def test_slack_admin_portal_command_returns_live_link(tmp_path: Path) -> None:
     assert posted[0][0] == "U01SWQKDTBM"
     assert "http://192.168.4.87:8765/portal?token=" in posted[0][1]
     assert "same durable work session" in posted[0][1]
-    assert "VPN" not in posted[0][1]
+    assert "shop network" in posted[0][1]
+    assert "office VPN" in posted[0][1]
 
 
 def test_slack_worker_portal_command_returns_own_live_link(tmp_path: Path) -> None:
@@ -642,7 +643,37 @@ def test_slack_worker_portal_command_returns_own_live_link(tmp_path: Path) -> No
     assert "http://192.168.4.87:8765/portal?token=" in posted[0][1]
     assert "same durable work session" in posted[0][1]
     assert "Slack DM as the fallback" in posted[0][1]
-    assert "VPN" not in posted[0][1]
+    assert "shop network" in posted[0][1]
+    assert "office VPN" in posted[0][1]
+
+
+def test_slack_app_home_exposes_persistent_portal_button(tmp_path: Path) -> None:
+    runtime = _build_runtime(
+        admins=[
+            AdminProfile(
+                name="Erik",
+                discord_user_id=999,
+                slack_user_id="U01SWQKDTBM",
+            )
+        ]
+    )
+    runtime.config.slack.manager_queue_url = "http://192.168.4.87:8765/exceptions"
+    runtime.config.slack.worker_portal_beta_slack_user_ids = ["U01SWQKDTBM"]
+    runtime.state_store = StateStore(tmp_path / "state.sqlite3")
+    runtime.roster_by_slack_id = {}
+
+    view = runtime.build_slack_app_home_view("U01SWQKDTBM")
+    button = next(
+        element
+        for block in view["blocks"]
+        for element in block.get("elements", [])
+        if isinstance(element, dict) and element.get("type") == "button"
+    )
+
+    assert view["type"] == "home"
+    assert button["text"]["text"] == "Open Workday Portal"
+    assert button["url"].startswith("http://192.168.4.87:8765/portal?token=")
+    assert "DM `login`" in str(view)
 
 
 def test_short_rest_stays_paid_and_requires_return_check_in() -> None:

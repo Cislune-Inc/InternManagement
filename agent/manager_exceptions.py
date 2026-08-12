@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import html
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from .work_dashboard import build_work_dashboard_payload
+
+
+_MISSING_TASK_MANAGER_GRACE = timedelta(minutes=60)
 
 
 async def build_manager_exceptions_payload(
@@ -25,7 +28,7 @@ async def build_manager_exceptions_payload(
     for person in work.get("people", []):
         if not isinstance(person, dict):
             continue
-        exceptions.extend(_person_exceptions(person))
+        exceptions.extend(_person_exceptions(person, reference_now=now))
     for issue in runtime.state_store.list_operational_issues(status="open", limit=250):
         details = issue.get("details")
         details = details if isinstance(details, dict) else {}
@@ -119,7 +122,7 @@ category.innerHTML += [...new Set(rows.map(row => row.category).filter(Boolean))
 function render() {{
   const query = search.value.trim().toLowerCase();
   const visible = rows.filter(row => (!severity.value || row.severity === severity.value) && (!category.value || row.category === category.value) && (!query || JSON.stringify(row).toLowerCase().includes(query)));
-  queue.innerHTML = visible.length ? visible.map(row => `<article class="card ${{escapeHtml(row.severity)}}"><strong>${{escapeHtml(row.summary)}}</strong><div class="meta">${{escapeHtml(row.severity)}} · ${{escapeHtml(row.category)}}${{row.person ? ` · ${{escapeHtml(row.person)}}` : ''}}${{row.session_date ? ` · ${{escapeHtml(row.session_date)}}` : ''}}</div><details><summary>Evidence</summary><pre>${{escapeHtml(JSON.stringify(row.details || {{}}, null, 2))}}</pre></details>${{row.user_key ? '<p><a class="action" href="/work">Review worker and correct ClickUp task</a></p>' : ''}}</article>`).join('') : '<p class="empty">No manager exceptions are currently open.</p>';
+  queue.innerHTML = visible.length ? visible.map(row => `<article class="card ${{escapeHtml(row.severity)}}"><strong>${{escapeHtml(row.summary)}}</strong><div class="meta">${{escapeHtml(row.severity)}} · ${{escapeHtml(row.category)}}${{row.person ? ` · ${{escapeHtml(row.person)}}` : ''}}${{row.session_date ? ` · ${{escapeHtml(row.session_date)}}` : ''}}</div>${{row.details?.recommended_action ? `<p>${{escapeHtml(row.details.recommended_action)}}</p>` : ''}}<details><summary>Evidence and history</summary><pre>${{escapeHtml(JSON.stringify(row.details || {{}}, null, 2))}}</pre></details>${{row.user_key ? `<p><a class="action" href="/work?worker=${{encodeURIComponent(row.user_key)}}">Assign or correct ClickUp task</a></p>` : ''}}</article>`).join('') : '<p class="empty">No manager exceptions are currently open.</p>';
 }}
 function escapeHtml(value) {{ return String(value ?? '').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'","&#39;"); }}
 [severity, category, search].forEach(control => control.addEventListener('input', render));
@@ -129,7 +132,11 @@ setTimeout(() => window.location.reload(), 10 * 60 * 1000);
 </body></html>"""
 
 
-def _person_exceptions(person: dict[str, Any]) -> list[dict[str, Any]]:
+def _person_exceptions(
+    person: dict[str, Any],
+    *,
+    reference_now: datetime | None = None,
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     base = {
         "person": str(person.get("display_name") or ""),
@@ -223,15 +230,32 @@ def _person_exceptions(person: dict[str, Any]) -> list[dict[str, Any]]:
             )
         )
     if person.get("clock_state") == "clocked in" and not active_task_id:
-        rows.append(
-            _exception(
-                base,
-                "warning",
-                "missing_active_task",
-                "Clocked-in worker has no confirmed ClickUp task.",
-                {"stage": stage},
-            )
+        wait_minutes = _minutes_since_last_worker_message(
+            person,
+            reference_now or datetime.now(timezone.utc),
         )
+        if wait_minutes is None or wait_minutes >= int(
+            _MISSING_TASK_MANAGER_GRACE.total_seconds() // 60
+        ):
+            rows.append(
+                _exception(
+                    base,
+                    "warning",
+                    "missing_active_task",
+                    "Clocked-in worker still has no confirmed ClickUp task after the worker-only grace period.",
+                    {
+                        "stage": stage,
+                        "waiting_minutes": wait_minutes,
+                        "manager_grace_minutes": int(
+                            _MISSING_TASK_MANAGER_GRACE.total_seconds() // 60
+                        ),
+                        "recommended_action": (
+                            "Assign an existing task, classify the work as overhead, or ask the worker "
+                            "which concrete result should be recorded."
+                        ),
+                    },
+                )
+            )
     current_days = person.get("days")
     current_day = current_days[0] if isinstance(current_days, list) and current_days else {}
     current_seconds = int(
@@ -253,22 +277,27 @@ def _person_exceptions(person: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _deduplicate_exceptions(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    missing_task_rows = {
-        (str(row.get("user_key") or ""), str(row.get("session_date") or "")): row
-        for row in rows
-        if row.get("category") == "missing_active_task"
-    }
     deduplicated: list[dict[str, Any]] = []
+    missing_task_rows: dict[str, dict[str, Any]] = {}
     for row in rows:
-        if row.get("category") != "slack_update_missing_task":
+        category = str(row.get("category") or "")
+        user_key = str(row.get("user_key") or "")
+        if category not in {"missing_active_task", "slack_update_missing_task"} or not user_key:
             deduplicated.append(row)
             continue
-        key = (str(row.get("user_key") or ""), str(row.get("session_date") or ""))
-        target = missing_task_rows.get(key)
+        target = missing_task_rows.get(user_key)
         if target is None:
+            missing_task_rows[user_key] = row
             deduplicated.append(row)
             continue
-        target["source"] = "session+operational_issue"
+        target_history_item = _missing_task_history_item(target)
+        row_history_item = _missing_task_history_item(row)
+        sources: list[str] = []
+        for value in (target.get("source"), row.get("source")):
+            for part in str(value or "").split("+"):
+                if part and part not in sources:
+                    sources.append(part)
+        target["source"] = "+".join(sources)
         target["last_seen_at"] = max(
             str(target.get("last_seen_at") or ""),
             str(row.get("last_seen_at") or ""),
@@ -278,16 +307,72 @@ def _deduplicate_exceptions(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         )
         details = target.get("details")
         details = dict(details) if isinstance(details, dict) else {}
-        details["slack_update_hold"] = {
-            "summary": str(row.get("summary") or ""),
-            "worker_prompted": bool(
-                (row.get("details") if isinstance(row.get("details"), dict) else {}).get(
-                    "worker_prompted"
-                )
+        history = details.get("history")
+        history = list(history) if isinstance(history, list) else []
+        if not history:
+            history.append(target_history_item)
+        history.append(row_history_item)
+        unique_history: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for item in history:
+            if not isinstance(item, dict):
+                continue
+            key = (
+                str(item.get("session_date") or ""),
+                str(item.get("source") or ""),
+                str(item.get("summary") or ""),
+            )
+            unique_history[key] = item
+        details["history"] = sorted(
+            unique_history.values(),
+            key=lambda item: (
+                str(item.get("session_date") or ""),
+                str(item.get("last_seen_at") or ""),
             ),
-        }
+            reverse=True,
+        )
+        row_details = row.get("details")
+        if category == "slack_update_missing_task" and isinstance(row_details, dict):
+            details["worker_prompted"] = bool(
+                details.get("worker_prompted") or row_details.get("worker_prompted")
+            )
+        target["session_date"] = max(
+            str(target.get("session_date") or ""),
+            str(row.get("session_date") or ""),
+        )
         target["details"] = details
     return deduplicated
+
+
+def _minutes_since_last_worker_message(
+    person: dict[str, Any],
+    reference_now: datetime,
+) -> int | None:
+    raw = str(person.get("last_user_message_at") or "").strip()
+    if not raw:
+        return None
+    try:
+        last_message = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if last_message.tzinfo is None:
+        last_message = last_message.replace(tzinfo=timezone.utc)
+    if reference_now.tzinfo is None:
+        reference_now = reference_now.replace(tzinfo=timezone.utc)
+    return max(0, int((reference_now - last_message).total_seconds() // 60))
+
+
+def _missing_task_history_item(row: dict[str, Any]) -> dict[str, Any]:
+    details = row.get("details")
+    details = details if isinstance(details, dict) else {}
+    return {
+        "session_date": str(row.get("session_date") or ""),
+        "source": str(row.get("source") or ""),
+        "summary": str(row.get("summary") or ""),
+        "stage": str(details.get("stage") or ""),
+        "worker_prompted": bool(details.get("worker_prompted")),
+        "last_seen_at": str(row.get("last_seen_at") or ""),
+        "occurrence_count": int(row.get("occurrence_count") or 1),
+    }
 
 
 def _exception(

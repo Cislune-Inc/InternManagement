@@ -177,7 +177,7 @@ Slack posting is optional and disabled unless the live local config enables it. 
 Don Pollo can run the same clock-in, task selection, ClickUp timer, lunch, status, and clock-out workflow through Slack DMs. Slack inbound messaging uses Socket Mode so the local Mac does not need a public webhook:
 
 1. Enable Socket Mode and Event Subscriptions for the Don Pollo Slack app.
-2. Subscribe the bot to the `message.im` event.
+2. Enable the App Home tab and subscribe the bot to the `message.im` and `app_home_opened` events. The Home tab gives each enabled user a fresh signed portal button; the DM remains the fallback.
 3. Add an app-level token with `connections:write` to `.env` as `SLACK_APP_TOKEN`.
 4. Keep `SLACK_BOT_TOKEN` configured with DM/message and file permissions.
 5. Add the worker to `config/roster.csv` with `slack_user_id` and `preferred_transport=slack`. `discord_user_id` may be blank for Slack-only workers.
@@ -201,7 +201,7 @@ Resolved enforcement does not produce an interrupting admin DM. Automatic meal p
 
 A configured admin can use the deterministic admin console by DMing the Don Pollo Slack app. Add the admin's Slack member ID as `slack_user_id` in the `admins` list in `config/agent.config.json`; do not add the admin to the worker roster. The same `help`, `flow`, and `run <command-id> ...` grammar works in Slack. Read-only commands return immediately. Commands that send messages or change state return a preview and require the exact `confirm <token>` reply; `cancel` abandons the pending action.
 
-Slack admin DMs use the same Socket Mode connection as Slack-only workers, so `SLACK_APP_TOKEN` with `connections:write` and the `message.im` event subscription are required. The production controls map Erik's configured admin profile to Slack member `U01SWQKDTBM` for the beta.
+Slack admin DMs and App Home use the same Socket Mode connection as Slack-only workers, so `SLACK_APP_TOKEN` with `connections:write` and the `message.im` plus `app_home_opened` event subscriptions are required. The production controls map Erik's configured admin profile to Slack member `U01SWQKDTBM` for the beta.
 
 ## Monday Payroll And Project Labor
 
