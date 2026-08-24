@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from collections import Counter
 from datetime import datetime, timedelta
 from typing import Any, Callable
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from .models import AdminProfile, AgentConfig
 from .slack_client import SlackClient
@@ -12,6 +12,10 @@ from .state_store import StateStore
 from .time_utils import resolve_timezone
 
 logger = logging.getLogger(__name__)
+
+
+_UNCHANGED_DIGEST_REMINDER = timedelta(days=7)
+_DIGEST_PREVIEW_LIMIT = 5
 
 
 class OperationalIssueReporter:
@@ -120,6 +124,11 @@ class OperationalIssueReporter:
         digest_state = self.state_store.get_operational_state(
             "operational_issue_digest"
         ) or {}
+        last_checked_local_date = str(
+            digest_state.get("last_checked_local_date") or ""
+        )
+        if last_checked_local_date == digest_now.date().isoformat():
+            return False
         last_sent_local_date = str(
             digest_state.get("last_sent_local_date") or ""
         )
@@ -141,29 +150,38 @@ class OperationalIssueReporter:
         targets = [admin for admin in self.admins_provider() if admin.slack_user_id]
         if not targets:
             return False
-        category_counts = Counter(str(issue.get("category") or "unknown") for issue in issues)
-        occurrence_counts: Counter[str] = Counter()
-        severity_counts = Counter(str(issue.get("severity") or "unknown").lower() for issue in issues)
-        for issue in issues:
-            occurrence_counts[str(issue.get("category") or "unknown")] += int(
-                issue.get("occurrence_count") or 1
-            )
-        lines = [
-            "*Don Pollo operational digest*",
-            f"Open issues: {len(issues)}",
-            "Severity: " + ", ".join(
-                f"{severity} {count}"
-                for severity, count in sorted(severity_counts.items())
+        signature = _digest_signature(issues)
+        last_signature = str(digest_state.get("last_signature") or "")
+        last_signature_sent_at = _parse_digest_datetime(
+            str(
+                digest_state.get("last_signature_sent_at")
+                or digest_state.get("last_sent_at")
+                or ""
             ),
-            "",
-            "Top categories:",
-        ]
-        for category, count in category_counts.most_common(8):
-            lines.append(
-                f"• `{category}`: {count} open, {occurrence_counts[category]} occurrence(s)"
+            reference=observed_at,
+        )
+        weekly_reminder = bool(
+            signature == last_signature
+            and last_signature_sent_at is not None
+            and observed_at - last_signature_sent_at >= _UNCHANGED_DIGEST_REMINDER
+        )
+        if signature == last_signature and not weekly_reminder:
+            self.state_store.set_operational_state(
+                "operational_issue_digest",
+                {
+                    **digest_state,
+                    "last_checked_at": observed_at.isoformat(),
+                    "last_checked_local_date": digest_now.date().isoformat(),
+                    "timezone": config.slack.operational_digest_timezone,
+                    "open_issue_count": len(issues),
+                },
             )
-        lines.extend(("", f"Review and resolve: {config.slack.manager_queue_url}"))
-        message = "\n".join(lines)
+            return False
+        message = _digest_message(
+            issues,
+            manager_queue_url=config.slack.manager_queue_url,
+            weekly_reminder=weekly_reminder,
+        )
         notified = False
         for admin in targets:
             try:
@@ -181,6 +199,10 @@ class OperationalIssueReporter:
             {
                 "last_sent_at": observed_at.isoformat(),
                 "last_sent_local_date": digest_now.date().isoformat(),
+                "last_checked_at": observed_at.isoformat(),
+                "last_checked_local_date": digest_now.date().isoformat(),
+                "last_signature": signature,
+                "last_signature_sent_at": observed_at.isoformat(),
                 "timezone": config.slack.operational_digest_timezone,
                 "open_issue_count": len(issues),
             },
@@ -291,6 +313,116 @@ class OperationalIssueReporter:
 def issue_fingerprint(category: str, *parts: str) -> str:
     source = "|".join((category, *parts))
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def _digest_signature(issues: list[dict[str, Any]]) -> str:
+    """Identify manager decisions, ignoring noisy recurrence counters and timestamps."""
+    rows = sorted(
+        "|".join(
+            (
+                str(issue.get("fingerprint") or ""),
+                str(issue.get("category") or ""),
+                str(issue.get("severity") or ""),
+            )
+        )
+        for issue in issues
+    )
+    return hashlib.sha256("\n".join(rows).encode("utf-8")).hexdigest()
+
+
+def _parse_digest_datetime(value: str, *, reference: datetime) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value) if value else None
+    except ValueError:
+        return None
+    if parsed is not None and parsed.tzinfo is None and reference.tzinfo is not None:
+        parsed = parsed.replace(tzinfo=reference.tzinfo)
+    return parsed
+
+
+def _digest_message(
+    issues: list[dict[str, Any]],
+    *,
+    manager_queue_url: str,
+    weekly_reminder: bool,
+) -> str:
+    severity_order = {"critical": 0, "error": 1, "warning": 2, "info": 3}
+    ordered = sorted(
+        issues,
+        key=lambda issue: (
+            severity_order.get(str(issue.get("severity") or "").lower(), 9),
+            str((issue.get("details") or {}).get("display_name") or "").lower(),
+            str(issue.get("category") or ""),
+        ),
+    )
+    title = (
+        f"*Don Pollo — {len(ordered)} unresolved manager action"
+        f"{'s' if len(ordered) != 1 else ''}*"
+    )
+    if weekly_reminder:
+        title += " _(weekly reminder)_"
+    lines = [title, ""]
+    for issue in ordered[:_DIGEST_PREVIEW_LIMIT]:
+        lines.append(_digest_issue_line(issue, manager_queue_url=manager_queue_url))
+    hidden_count = len(ordered) - _DIGEST_PREVIEW_LIMIT
+    if hidden_count > 0:
+        lines.append(f"• *+{hidden_count} more* in the manager queue")
+    lines.extend(
+        (
+            "",
+            "*Process them*",
+            "1. Open the item and assign the hours to an existing contract task or an overhead category.",
+            "2. If the result is unclear, ask the worker for one concrete outcome before assigning it.",
+            "3. Save the correction; dismiss only a true duplicate or obsolete system error.",
+            "",
+            f"<{manager_queue_url}|Open manager queue>",
+            "_Only new or changed items are sent. Unchanged items return as one weekly reminder._",
+        )
+    )
+    return "\n".join(lines)
+
+
+def _digest_issue_line(issue: dict[str, Any], *, manager_queue_url: str) -> str:
+    category = str(issue.get("category") or "")
+    details = issue.get("details")
+    details = details if isinstance(details, dict) else {}
+    display_name = str(
+        details.get("display_name")
+        or details.get("user_key")
+        or "Don Pollo"
+    ).strip()
+    user_key = str(details.get("user_key") or "").strip()
+    session_date = str(details.get("session_date") or "").strip()
+    date_label = f" ({session_date})" if session_date else ""
+    action_url = _worker_action_url(manager_queue_url, user_key) if user_key else manager_queue_url
+    if category == "slack_update_missing_task":
+        return (
+            f"• *{display_name}*{date_label} — work was recorded without a confirmed task. "
+            f"<{action_url}|Assign or classify>"
+        )
+    if category == "slack_route_uncertain":
+        task_name = str(details.get("active_task_name") or "this work").strip()
+        return (
+            f"• *{display_name}* — choose the project channel for {task_name}. "
+            f"<{action_url}|Review routing>"
+        )
+    summary = str(issue.get("summary") or "Review this Don Pollo issue.").strip()
+    return f"• *{display_name}* — {summary} <{action_url}|Review>"
+
+
+def _worker_action_url(manager_queue_url: str, user_key: str) -> str:
+    parsed = urlsplit(manager_queue_url)
+    if parsed.scheme and parsed.netloc:
+        return urlunsplit(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                "/work",
+                f"worker={quote(user_key)}",
+                "",
+            )
+        )
+    return f"/work?worker={quote(user_key)}"
 
 
 def _issue_message(

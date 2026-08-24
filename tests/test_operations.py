@@ -102,8 +102,8 @@ def test_operational_warning_is_held_for_digest(tmp_path):
     assert slack.messages == []
     assert asyncio.run(reporter.maybe_send_digest(now)) is True
     assert len(slack.messages) == 1
-    assert "operational digest" in slack.messages[0][1]
-    assert "`slack_route_uncertain`: 1 open" in slack.messages[0][1]
+    assert "unresolved manager action" in slack.messages[0][1]
+    assert "choose the project channel" in slack.messages[0][1]
     assert "http://192.168.4.87:8765/exceptions" in slack.messages[0][1]
     assert asyncio.run(reporter.maybe_send_digest(now + timedelta(minutes=30))) is False
 
@@ -143,6 +143,93 @@ def test_operational_digest_waits_until_eight_pacific_and_sends_once_per_day(tmp
     assert asyncio.run(reporter.maybe_send_digest(after)) is True
     assert asyncio.run(reporter.maybe_send_digest(late)) is False
     assert len(slack.messages) == 1
+
+
+def test_operational_digest_names_worker_and_suppresses_unchanged_daily_noise(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    slack = _Slack()
+    config = SimpleNamespace(
+        slack=SlackConfig(
+            enabled=True,
+            operational_digest_hour=8,
+            operational_digest_timezone="America/Los_Angeles",
+            manager_queue_url="http://192.168.4.87:8765/exceptions",
+        )
+    )
+    reporter = OperationalIssueReporter(
+        state_store=store,
+        config_provider=lambda: config,
+        slack_provider=lambda: slack,
+        admins_provider=lambda: [
+            AdminProfile(name="Erik", discord_user_id=1, slack_user_id="UERIK")
+        ],
+        timezone_provider=lambda: "America/Los_Angeles",
+    )
+    first = datetime(2026, 8, 20, 8, 1, tzinfo=timezone(timedelta(hours=-7)))
+    store.record_operational_issue(
+        fingerprint="pia-missing-task",
+        category="slack_update_missing_task",
+        severity="warning",
+        summary="Pia reported meaningful work without a task.",
+        details={
+            "display_name": "Pia",
+            "user_key": "Pia",
+            "session_date": "2026-08-20",
+            "escalated_after_minutes": 30,
+        },
+        observed_at=first,
+    )
+
+    assert asyncio.run(reporter.maybe_send_digest(first)) is True
+    message = slack.messages[0][1]
+    assert "*Pia* (2026-08-20)" in message
+    assert "Assign or classify" in message
+    assert "http://192.168.4.87:8765/work?worker=Pia" in message
+
+    assert asyncio.run(reporter.maybe_send_digest(first + timedelta(days=1))) is False
+    assert len(slack.messages) == 1
+    assert asyncio.run(reporter.maybe_send_digest(first + timedelta(days=7))) is True
+    assert "weekly reminder" in slack.messages[-1][1]
+
+
+def test_operational_digest_sends_when_the_open_action_set_changes(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    slack = _Slack()
+    config = SimpleNamespace(
+        slack=SlackConfig(
+            enabled=True,
+            operational_digest_hour=8,
+            operational_digest_timezone="America/Los_Angeles",
+        )
+    )
+    reporter = OperationalIssueReporter(
+        state_store=store,
+        config_provider=lambda: config,
+        slack_provider=lambda: slack,
+        admins_provider=lambda: [
+            AdminProfile(name="Erik", discord_user_id=1, slack_user_id="UERIK")
+        ],
+        timezone_provider=lambda: "America/Los_Angeles",
+    )
+    first = datetime(2026, 8, 20, 8, 1, tzinfo=timezone(timedelta(hours=-7)))
+    store.record_operational_issue(
+        fingerprint="first",
+        category="review",
+        severity="warning",
+        summary="First review.",
+        observed_at=first,
+    )
+    assert asyncio.run(reporter.maybe_send_digest(first)) is True
+
+    store.record_operational_issue(
+        fingerprint="second",
+        category="review",
+        severity="warning",
+        summary="Second review.",
+        observed_at=first + timedelta(days=1),
+    )
+    assert asyncio.run(reporter.maybe_send_digest(first + timedelta(days=1))) is True
+    assert len(slack.messages) == 2
 
 
 def test_route_issue_maintenance_merges_worker_task_duplicates_and_retires_stale(tmp_path):
