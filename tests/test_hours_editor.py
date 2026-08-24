@@ -111,6 +111,13 @@ def test_runtime_preview_manual_time_edit_rejects_current_effective_workday(tmp_
         work_segments=[{"clocked_in_at": "2026-06-15T09:00:00-07:00", "clocked_out_at": "2026-06-15T11:00:00-07:00"}],
     )
     runtime.state_store.save_session(session)
+    runtime.state_store.record_operational_issue(
+        fingerprint="missing-task:alex:2026-06-12",
+        category="slack_update_missing_task",
+        severity="warning",
+        summary="Alex reported work without a task.",
+        details={"user_key": "alex", "session_date": "2026-06-12"},
+    )
 
     with pytest.raises(ValueError, match="Only past workdays can be edited"):
         asyncio.run(
@@ -609,6 +616,7 @@ def test_hours_editor_corrects_active_clickup_task_with_audit(tmp_path: Path) ->
     assert result["task_name"] == "Correct project task"
     assert saved.metadata["active_clickup_task_id"] == "right-task"
     assert saved.metadata["operator_task_corrections"][-1]["corrected_by"] == "Erik"
+    assert runtime.state_store.list_operational_issues(status="open") == []
     changes = _read_json_lines(
         tmp_path
         / "storage"

@@ -184,7 +184,7 @@ def test_operational_digest_names_worker_and_suppresses_unchanged_daily_noise(tm
     message = slack.messages[0][1]
     assert "*Pia* (2026-08-20)" in message
     assert "Assign or classify" in message
-    assert "http://192.168.4.87:8765/work?worker=Pia" in message
+    assert "http://192.168.4.87:8765/work?worker=Pia&session=2026-08-20" in message
 
     assert asyncio.run(reporter.maybe_send_digest(first + timedelta(days=1))) is False
     assert len(slack.messages) == 1

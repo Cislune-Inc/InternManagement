@@ -394,7 +394,11 @@ def _digest_issue_line(issue: dict[str, Any], *, manager_queue_url: str) -> str:
     user_key = str(details.get("user_key") or "").strip()
     session_date = str(details.get("session_date") or "").strip()
     date_label = f" ({session_date})" if session_date else ""
-    action_url = _worker_action_url(manager_queue_url, user_key) if user_key else manager_queue_url
+    action_url = (
+        _worker_action_url(manager_queue_url, user_key, session_date=session_date)
+        if user_key
+        else manager_queue_url
+    )
     if category == "slack_update_missing_task":
         return (
             f"• *{display_name}*{date_label} — work was recorded without a confirmed task. "
@@ -410,7 +414,15 @@ def _digest_issue_line(issue: dict[str, Any], *, manager_queue_url: str) -> str:
     return f"• *{display_name}* — {summary} <{action_url}|Review>"
 
 
-def _worker_action_url(manager_queue_url: str, user_key: str) -> str:
+def _worker_action_url(
+    manager_queue_url: str,
+    user_key: str,
+    *,
+    session_date: str = "",
+) -> str:
+    query = f"worker={quote(user_key)}"
+    if session_date:
+        query += f"&session={quote(session_date)}"
     parsed = urlsplit(manager_queue_url)
     if parsed.scheme and parsed.netloc:
         return urlunsplit(
@@ -418,11 +430,11 @@ def _worker_action_url(manager_queue_url: str, user_key: str) -> str:
                 parsed.scheme,
                 parsed.netloc,
                 "/work",
-                f"worker={quote(user_key)}",
+                query,
                 "",
             )
         )
-    return f"/work?worker={quote(user_key)}"
+    return f"/work?{query}"
 
 
 def _issue_message(

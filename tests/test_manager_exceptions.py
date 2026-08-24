@@ -64,6 +64,7 @@ def test_manager_queue_html_has_filters_and_work_correction_link():
     assert "All categories" in html
     assert "Assign or correct ClickUp task" in html
     assert "/work?worker=" in html
+    assert "&session=" in html
 
 
 def test_manager_queue_keeps_normal_task_intake_worker_only_for_an_hour() -> None:

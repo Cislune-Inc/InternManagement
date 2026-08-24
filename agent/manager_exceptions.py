@@ -122,10 +122,29 @@ category.innerHTML += [...new Set(rows.map(row => row.category).filter(Boolean))
 function render() {{
   const query = search.value.trim().toLowerCase();
   const visible = rows.filter(row => (!severity.value || row.severity === severity.value) && (!category.value || row.category === category.value) && (!query || JSON.stringify(row).toLowerCase().includes(query)));
-  queue.innerHTML = visible.length ? visible.map(row => `<article class="card ${{escapeHtml(row.severity)}}"><strong>${{escapeHtml(row.summary)}}</strong><div class="meta">${{escapeHtml(row.severity)}} · ${{escapeHtml(row.category)}}${{row.person ? ` · ${{escapeHtml(row.person)}}` : ''}}${{row.session_date ? ` · ${{escapeHtml(row.session_date)}}` : ''}}</div>${{row.details?.recommended_action ? `<p>${{escapeHtml(row.details.recommended_action)}}</p>` : ''}}<details><summary>Evidence and history</summary><pre>${{escapeHtml(JSON.stringify(row.details || {{}}, null, 2))}}</pre></details>${{row.user_key ? `<p><a class="action" href="/work?worker=${{encodeURIComponent(row.user_key)}}">Assign or correct ClickUp task</a></p>` : ''}}</article>`).join('') : '<p class="empty">No manager exceptions are currently open.</p>';
+  queue.innerHTML = visible.length ? visible.map(row => `<article class="card ${{escapeHtml(row.severity)}}"><strong>${{escapeHtml(row.summary)}}</strong><div class="meta">${{escapeHtml(row.severity)}} · ${{escapeHtml(row.category)}}${{row.person ? ` · ${{escapeHtml(row.person)}}` : ''}}${{row.session_date ? ` · ${{escapeHtml(row.session_date)}}` : ''}}</div>${{row.details?.recommended_action ? `<p>${{escapeHtml(row.details.recommended_action)}}</p>` : ''}}<details><summary>Evidence and history</summary><pre>${{escapeHtml(JSON.stringify(row.details || {{}}, null, 2))}}</pre></details><p>${{row.user_key ? `<a class="action" href="/work?worker=${{encodeURIComponent(row.user_key)}}${{row.session_date ? `&session=${{encodeURIComponent(row.session_date)}}` : ''}}">Assign or correct ClickUp task</a>` : ''}}${{row.source === 'operational_issue' ? ` <button class="action" type="button" data-dismiss-fingerprint="${{escapeHtml(row.id)}}">Dismiss duplicate / obsolete</button>` : ''}}</p></article>`).join('') : '<p class="empty">No manager exceptions are currently open.</p>';
 }}
 function escapeHtml(value) {{ return String(value ?? '').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'","&#39;"); }}
 [severity, category, search].forEach(control => control.addEventListener('input', render));
+queue.addEventListener('click', async event => {{
+  const button = event.target.closest('[data-dismiss-fingerprint]');
+  if (!button) return;
+  if (!window.confirm('Dismiss this only if it is a duplicate or the underlying issue is already obsolete.')) return;
+  button.disabled = true;
+  try {{
+    const response = await fetch('/api/issues/resolve', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{fingerprint: button.dataset.dismissFingerprint}}),
+    }});
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Dismissal failed.');
+    window.location.reload();
+  }} catch (error) {{
+    button.disabled = false;
+    window.alert(error.message);
+  }}
+}});
 render();
 setTimeout(() => window.location.reload(), 10 * 60 * 1000);
 </script>

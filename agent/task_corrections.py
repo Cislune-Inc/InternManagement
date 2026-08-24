@@ -113,6 +113,12 @@ async def apply_operator_task_correction(
             trigger="operator_task_correction",
             details=record,
         )
+        runtime._resolve_matching_operational_issue(
+            "slack_update_missing_task",
+            user_key=user.user_key,
+            session_date=session_date,
+            now=reference,
+        )
     return {
         "corrected": True,
         "user_key": user.user_key,
