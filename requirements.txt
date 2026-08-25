@@ -2,5 +2,6 @@ discord.py>=2.5,<3
 openai>=1.84,<2
 python-dotenv>=1.1,<2
 requests>=2.32,<3
+slack-bolt>=1.23,<2
+truststore>=0.10.4,<1
 tzdata>=2025.2
-pytest>=8.4,<9

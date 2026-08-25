@@ -2,8 +2,30 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
+
+
+class SessionStage(StrEnum):
+    AWAITING_CLOCK_IN = "awaiting_clock_in"
+    AWAITING_TASK_SELECTION = "awaiting_task_selection"
+    AWAITING_PLAN = "awaiting_plan"
+    AWAITING_START_PHOTO = "awaiting_start_photo"
+    AWAITING_RISK = "awaiting_risk"
+    ACTIVE = "active"
+    ON_LUNCH_BREAK = "on_lunch_break"
+    AWAITING_ADMIN_REVIEW = "awaiting_admin_review"
+    AWAITING_CLOCK_OUT_ARTIFACTS = "awaiting_clock_out_artifacts"
+    CLOCKED_OUT = "clocked_out"
+    DEMO_LIVE = "demo_live"
+
+
+class IssueSeverity(StrEnum):
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+    CRITICAL = "critical"
 
 
 @dataclass(slots=True)
@@ -25,6 +47,7 @@ class ScheduleConfig:
     stuck_alert_after_hours: int = 4
     task_onboarding_interval_minutes: int = 5
     auto_clock_out_after_hours: int = 6
+    auto_clock_out_warning_minutes: int = 15
 
 
 @dataclass(slots=True)
@@ -48,7 +71,101 @@ class ClickUpConfig:
     attach_images_to_tasks: bool = False
     auto_status_updates: bool = True
     create_time_entries: bool = True
+    new_task_approval_required: bool = True
+    new_task_approver_names: list[str] = field(
+        default_factory=lambda: ["Erik", "George"]
+    )
     custom_fields: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class LaborConfig:
+    enabled: bool = True
+    short_rest_break_minutes: int = 10
+    meal_minimum_minutes: int = 30
+    meal_warning_after_hours: float = 4.5
+    meal_auto_pause_after_hours: float = 5.0
+    overtime_limit_hours: float = 8.0
+    overtime_warning_minutes: int = 30
+    auto_clock_out_at_overtime_limit: bool = True
+    monday_export_hour: int = 7
+    overhead_task_ids: list[str] = field(default_factory=list)
+    overhead_name_patterns: list[str] = field(
+        default_factory=lambda: [
+            r"\boverhead\b",
+            r"\badministration\b",
+            r"\btraining\b",
+            r"\bshop cleanup\b",
+            r"\bshop\b.*\b(?:cleaning|cleanup|improvement|maintenance|organization)\b",
+            r"\b(?:cleaning|cleanup|improving|maintaining|organizing)\b.*\bshop\b",
+            r"\bfacilit(?:y|ies)\b",
+        ]
+    )
+
+
+@dataclass(slots=True)
+class SlackProjectRoute:
+    channel_id: str
+    label: str = ""
+    clickup_task_ids: list[str] = field(default_factory=list)
+    clickup_list_ids: list[str] = field(default_factory=list)
+    clickup_folder_ids: list[str] = field(default_factory=list)
+    content_patterns: list[str] = field(default_factory=list)
+    task_name_patterns: list[str] = field(default_factory=list)
+    list_name_patterns: list[str] = field(default_factory=list)
+    folder_name_patterns: list[str] = field(default_factory=list)
+    labor_code: str = ""
+    budget_hours: float | None = None
+
+
+@dataclass(slots=True)
+class SlackConfig:
+    enabled: bool = False
+    daily_updates_enabled: bool = True
+    weekly_recaps_enabled: bool = True
+    practice_channel_id: str | None = None
+    default_channel_id: str | None = None
+    unmapped_channel_id: str | None = None
+    post_start_hour: int = 10
+    post_end_hour: int = 17
+    min_post_interval_minutes: int = 25
+    max_images_per_update: int = 3
+    weekly_recap_day: int = 4
+    weekly_recap_hour: int = 16
+    operational_alerts_enabled: bool = True
+    operational_alert_cooldown_minutes: int = 360
+    operational_digest_interval_minutes: int = 1440
+    operational_digest_hour: int = 8
+    operational_digest_timezone: str = "America/Los_Angeles"
+    manager_queue_url: str = "http://127.0.0.1:8765/exceptions"
+    worker_portal_beta_slack_user_ids: list[str] = field(default_factory=list)
+    quarantine_uncertain_routes: bool = True
+    thread_daily_updates: bool = True
+    feedback_poll_interval_minutes: int = 360
+    feedback_reactions: dict[str, str] = field(
+        default_factory=lambda: {
+            "white_check_mark": "useful",
+            "x": "wrong_task_or_channel",
+            "twisted_rightwards_arrows": "wrong_task_or_channel",
+            "repeat": "duplicate",
+            "memo": "too_detailed",
+        }
+    )
+    positive_reactions: list[str] = field(
+        default_factory=lambda: [
+            "heart",
+            "heart_eyes",
+            "fire",
+            "raised_hands",
+            "clap",
+            "tada",
+            "star-struck",
+            "rocket",
+            "white_check_mark",
+            "thumbsup",
+        ]
+    )
+    project_routes: list[SlackProjectRoute] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -63,6 +180,7 @@ class AdminProfile:
     discord_user_id: int
     clickup_user_id: str | None = None
     clickup_user_email: str | None = None
+    slack_user_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -74,6 +192,8 @@ class AgentConfig:
     schedule: ScheduleConfig
     clickup: ClickUpConfig
     prompts: PromptConfig
+    slack: SlackConfig = field(default_factory=SlackConfig)
+    labor: LaborConfig = field(default_factory=LaborConfig)
     admin_console: AdminConsoleConfig = field(default_factory=AdminConsoleConfig)
     admins: list[AdminProfile] = field(default_factory=list)
 
@@ -82,13 +202,35 @@ class AgentConfig:
 class UserProfile:
     user_key: str
     display_name: str
-    discord_user_id: int
-    discord_username: str
-    storage_folder_name: str
+    discord_user_id: int | None = None
+    discord_username: str = ""
+    storage_folder_name: str = ""
     timezone: str | None = None
     clickup_user_id: str | None = None
     clickup_user_email: str | None = None
+    slack_user_id: str | None = None
     active: bool = True
+    preferred_transport: str = "auto"
+    worker_type: str = "intern"
+    work_location: str = ""
+    labor_jurisdiction: str = ""
+    compensation_plan: str = "needs_review"
+    time_tracking_required: bool = True
+    meal_tracking_required: bool = True
+    overtime_approval_required: bool = False
+    expected_daily_hours: float = 8.0
+    weekly_target_hours: float = 40.0
+    regular_workdays: list[str] = field(
+        default_factory=lambda: ["monday", "tuesday", "wednesday", "thursday", "friday"]
+    )
+    typical_start_time: str = "09:00"
+    typical_end_time: str = "17:00"
+    planned_time_off: list[str] = field(default_factory=list)
+    interests: list[str] = field(default_factory=list)
+    skills: list[str] = field(default_factory=list)
+    check_in_interval_minutes: int | None = None
+    gusto_entity_uuid: str | None = None
+    labor_cost_rate: float | None = None
 
 
 @dataclass(slots=True)
@@ -127,7 +269,7 @@ class SessionState:
     user_key: str
     session_date: str
     work_segments: list[dict[str, str | None]] = field(default_factory=list)
-    stage: str = "awaiting_clock_in"
+    stage: str | SessionStage = SessionStage.AWAITING_CLOCK_IN
     first_sign_of_life_at: str | None = None
     clocked_in_at: str | None = None
     intake_completed_at: str | None = None

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 
 import discord
 from discord.ext import tasks
 
 from .runtime import InternManagementRuntime
+from .ssl_compat import build_aiohttp_connector
+from .slack_receiver import SlackSocketReceiver
 
 
 logger = logging.getLogger(__name__)
@@ -18,9 +22,32 @@ class InternManagementDiscordBot(discord.Client):
         intents.messages = True
         super().__init__(intents=intents)
         self.runtime = runtime
+        self.slack_receiver: SlackSocketReceiver | None = None
+        self.slack_receiver_task = None
+
+    async def login(self, token: str) -> None:
+        self.http.connector = build_aiohttp_connector()
+        await super().login(token)
 
     async def setup_hook(self) -> None:
         self.scheduler.start()
+        slack_bot_token = os.environ.get("SLACK_BOT_TOKEN")
+        slack_app_token = os.environ.get("SLACK_APP_TOKEN")
+        if slack_bot_token and slack_app_token:
+            self.slack_receiver = SlackSocketReceiver(
+                self.runtime,
+                self,
+                bot_token=slack_bot_token,
+                app_token=slack_app_token,
+            )
+            self.slack_receiver_task = asyncio.create_task(self.slack_receiver.start())
+
+    async def close(self) -> None:
+        if self.slack_receiver is not None:
+            await self.slack_receiver.close()
+        if self.slack_receiver_task is not None:
+            self.slack_receiver_task.cancel()
+        await super().close()
 
     async def on_ready(self) -> None:
         await self.runtime.refresh_configuration(force=True)

@@ -91,8 +91,8 @@ After each run, inspect:
 
 Current automated coverage for the current-state model lives mainly in:
 
-- [tests/test_runtime.py](</C:/Users/George Ore/Documents/InternManagment/tests/test_runtime.py>)
-- [tests/test_admin_commands.py](</C:/Users/George Ore/Documents/InternManagment/tests/test_admin_commands.py>)
+- [tests/test_runtime.py](../tests/test_runtime.py)
+- [tests/test_admin_commands.py](../tests/test_admin_commands.py)
 
 Those tests currently validate:
 

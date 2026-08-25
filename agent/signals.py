@@ -7,6 +7,10 @@ from dataclasses import dataclass
 YES_PATTERNS = [
     r"\bclocked in\b",
     r"\bi clocked in\b",
+    r"\bclock me in\b",
+    r"\bclock back in\b",
+    r"\bclock me back in\b",
+    r"\bresume (?:my )?work\b",
     r"\byes\b",
     r"\byeah\b",
     r"\byep\b",
@@ -14,11 +18,27 @@ YES_PATTERNS = [
 ]
 
 CLOCK_OUT_PATTERNS = [
-    r"\bclocking out\b",
-    r"\bclocked out\b",
-    r"\blogging off\b",
-    r"\bdone for the day\b",
-    r"\bend of day\b",
+    r"^\s*(?:please\s+)?clock(?:\s+me)?\s+out(?:[\s,]+(?:now|please|(?:don\s*)?pollo))*[.!?]*\s*$",
+    r"\b(?:can|could|may)\s+i\s+(?:please\s+)?clock\s+out\b",
+    r"\b(?:can|could|would|will)\s+you\s+(?:please\s+)?clock\s+me\s+out\b",
+    r"\bcan i clock out\b",
+    r"\bi need to clock out\b",
+    r"\bi have to clock out\b",
+    r"\bi(?:\s+am|'m|m)\s+(?:going\s+to\s+)?clock(?:ing)?\s+out\b",
+    r"^\s*(?:i(?:\s+am|'m|m)\s+)?clocking\s+out(?:\s+now)?[.!?]*\s*$",
+    r"^\s*(?:i(?:\s+have|'ve)?\s+)?clocked\s+out[.!?]*\s*$",
+    r"^\s*(?:i(?:\s+am|'m|m)\s+)?logging\s+off(?:\s+now)?[.!?]*\s*$",
+    r"^\s*(?:i(?:\s+am|'m|m)\s+)?done\s+for\s+the\s+day[.!?]*\s*$",
+    r"^\s*end\s+of\s+day[.!?]*\s*$",
+]
+
+CLOCK_OUT_CANCELLATION_PATTERNS = [
+    r"\b(?:did\s+not|didn'?t)\s+mean\s+(?:to|too|that|it)\b",
+    r"\b(?:do\s+not|don'?t)\s+clock(?:\s+me)?\s+out\b",
+    r"\bnot\s+(?:trying\s+to\s+)?clock(?:ing)?\s+out\b",
+    r"\bkeep\s+me\s+clocked\s+in\b",
+    r"^\s*(?:no[\s,]+(?:please[\s,]+)?)?(?:cancel|stop|never\s*mind|nevermind)[.!?]*\s*$",
+    r"^\s*(?:no|nope|nah)[.!?]*\s*$",
 ]
 
 BLOCKED_PATTERNS = [
@@ -84,6 +104,22 @@ LUNCH_END_PATTERNS = [
     r"\bi'?m back\b",
 ]
 
+SHORT_REST_START_PATTERNS = [
+    r"^\s*(?:i(?:\s+am|'m)\s+)?taking a break(?: now)?[.!?]*\s*$",
+    r"\btaking (?:a )?(?:short |rest |10[- ]?minute |ten[- ]?minute )break\b",
+    r"\bstarting (?:a )?(?:short |rest |10[- ]?minute |ten[- ]?minute )break\b",
+    r"\b(?:short|rest|10[- ]?minute|ten[- ]?minute) break (?:now|please)\b",
+    r"^\s*(?:i(?:\s+am|'m)\s+)?(?:going|stepping) (?:on|out for) (?:a )?(?:short |rest |10[- ]?minute |ten[- ]?minute )break[.!?]*\s*$",
+]
+
+SHORT_REST_END_PATTERNS = [
+    r"\bback from (?:my |the )?(?:short |rest |10[- ]?minute |ten[- ]?minute )break\b",
+    r"\bdone with (?:my |the )?(?:short |rest |10[- ]?minute |ten[- ]?minute )break\b",
+    r"\b(?:short|rest|10[- ]?minute|ten[- ]?minute) break is over\b",
+    r"^\s*(?:i(?:\s+am|'m)\s+)?back (?:to work|from break)[.!?]*\s*$",
+    r"^\s*(?:check|clock)(?:\s+me)?\s+back\s+in[.!?]*\s*$",
+]
+
 RECOVERED_PATTERNS = [
     r"\bunblocked\b",
     r"\bfixed\b",
@@ -109,6 +145,8 @@ class MessageSignals:
     recovered: bool = False
     starting_lunch: bool = False
     ending_lunch: bool = False
+    starting_short_rest: bool = False
+    ending_short_rest: bool = False
 
 
 def detect_signals(text: str) -> MessageSignals:
@@ -117,9 +155,10 @@ def detect_signals(text: str) -> MessageSignals:
     not_blocked = _matches_any(normalized, NOT_BLOCKED_PATTERNS)
     blocked_status = _matches_any(normalized, BLOCKED_PATTERNS) and not not_blocked
     help_requested = _matches_any(normalized, HELP_REQUEST_PATTERNS) and not help_declined
+    clock_out_cancelled = is_clock_out_cancellation(normalized)
     return MessageSignals(
         clocked_in=_matches_any(normalized, YES_PATTERNS),
-        clocking_out=_matches_any(normalized, CLOCK_OUT_PATTERNS),
+        clocking_out=_matches_any(normalized, CLOCK_OUT_PATTERNS) and not clock_out_cancelled,
         blocked_status=blocked_status,
         help_requested=help_requested,
         help_declined=help_declined,
@@ -127,7 +166,13 @@ def detect_signals(text: str) -> MessageSignals:
         recovered=_matches_any(normalized, RECOVERED_PATTERNS),
         starting_lunch=_matches_any(normalized, LUNCH_START_PATTERNS),
         ending_lunch=_matches_any(normalized, LUNCH_END_PATTERNS),
+        starting_short_rest=_matches_any(normalized, SHORT_REST_START_PATTERNS),
+        ending_short_rest=_matches_any(normalized, SHORT_REST_END_PATTERNS),
     )
+
+
+def is_clock_out_cancellation(text: str) -> bool:
+    return _matches_any(text.lower(), CLOCK_OUT_CANCELLATION_PATTERNS)
 
 
 def _matches_any(text: str, patterns: list[str]) -> bool:

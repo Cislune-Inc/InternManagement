@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-import os
+import csv
+import difflib
+import hashlib
 import json
+import logging
+import os
 import re
 from dataclasses import dataclass
 from copy import deepcopy
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -22,9 +26,18 @@ from .image_intelligence import ImageIntelligence, build_image_manifest
 from .interface_intelligence import InterfaceIntelligence
 from .local_store import LocalStore
 from .models import AdminProfile, AgentConfig, AttachmentRecord, ClickUpContextBundle, MessageRecord, SessionState, UserProfile
-from .signals import detect_signals
+from .operations import OperationalIssueReporter
+from .persistence import atomic_write_json
+from .scheduler import run_scheduler_tick
+from .session_metadata import SessionMetadata
+from .signals import detect_signals, is_clock_out_cancellation
+from .slack_client import SlackClient
+from .slack_feedback import collect_slack_update_feedback
+from .slack_update_policy import SlackUpdatePolicy
 from .state_store import StateStore
-from .time_utils import ADMIN_DISPLAY_TIMEZONE, effective_workday_date, format_admin_datetime, localize_datetime, resolve_timezone
+from .time_tracking_dashboard import write_time_tracking_dashboard
+from .time_utils import ADMIN_DISPLAY_TIMEZONE, effective_workday_date, format_admin_datetime, format_user_datetime, localize_datetime, resolve_timezone
+from .task_corrections import apply_operator_task_correction
 
 
 _COMPLETE_HINTS = (
@@ -66,14 +79,41 @@ _TASK_REVIEW_CANCEL_HINTS = (
 _BLOCKER_STATE_KEY = "blocker_state"
 _BLOCKER_HELP_DECISION_AT_KEY = "blocker_help_decision_at"
 _PENDING_FOLLOW_UP_KEY = "pending_follow_up"
+# Slack events keep mentions as ``<@USER_ID>`` while history readers may enrich
+# the same mention as ``<@USER_ID|ChatGPT>``.  Match either representation of
+# the connector-added footer, but only when it is the final line of an admin DM.
+_SLACK_CHATGPT_ATTRIBUTION_RE = re.compile(
+    r"\s*\n+\*Sent using\*\s+<@[^>\r\n]+>\s*$",
+    flags=re.IGNORECASE,
+)
+_SLACK_SENT_USING_MARKER_RE = re.compile(
+    r"\s+(?:[*_~]{1,2})?sent\s+using(?:[*_~]{1,2})?(?=\s|<)",
+    flags=re.IGNORECASE,
+)
 _FOLLOW_UP_RESPONSE_AGGREGATION_KEY = "follow_up_response_aggregation"
 _PROGRESS_PROBE_HISTORY_KEY = "progress_probe_history"
+_WORKER_CHECKPOINT_KEY = "worker_checkpoint"
+_CHECKPOINT_QUALITY_HISTORY_KEY = "checkpoint_quality_history"
+_STILL_WORKING_ACK_KEY = "still_working_ack"
 _FOLLOW_UP_PROBE_GRACE_WINDOW = timedelta(minutes=1)
 _PROGRESS_PROBE_TIMEOUT = timedelta(minutes=30)
+_AUTO_CLOCK_OUT_WARNING_KEY = "auto_clock_out_warning"
+_PORTAL_QUALITY_WARNING_KEY = "portal_quality_warning"
+_PORTAL_QUALITY_RESTART_BLOCK_KEY = "portal_quality_restart_blocked"
+_SHORT_REST_ACTIVE_KEY = "short_rest_break_active"
+_SHORT_REST_HISTORY_KEY = "short_rest_breaks"
+_SLACK_USER_MIN_POST_INTERVAL = timedelta(minutes=90)
+_SLACK_MISSING_TASK_ESCALATION_DELAY = timedelta(minutes=30)
 _TRANSCRIPT_PACIFIC_BACKFILL_MARKER = "transcript_pacific_backfill_v1.done"
 _SESSION_DATE_DIRECTORY_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _PENDING_ADMIN_REVIEWS_KEY = "pending_admin_reviews"
 _PENDING_INTERN_TASK_SWITCH_KEY = "pending_intern_task_switch"
+_SELF_LOOKUP_PROMPT_KEY = "self_lookup_prompt"
+_DAY_SUPPRESSION_PROMPT_KEY = "day_suppression_prompt"
+_DAY_SUPPRESSION_STATE_KEY = "day_suppression"
+_LUNCH_WINDOWS_KEY = "lunch_windows"
+_ACTIVE_TASK_AUTHORITY_KEY = "active_clickup_task_authority"
+_TASK_PLACEMENT_CONTEXT_VERSION = 2
 _TASK_CORRECTION_WITH_HINT_PATTERNS = (
     re.compile(r"^(?:actually\s+)?switch\s+task\s+to\s+(.+)$", re.IGNORECASE),
     re.compile(r"^(?:actually\s+)?use\s+(.+?)\s+instead\.?$", re.IGNORECASE),
@@ -107,7 +147,207 @@ _TASK_CREATION_BACK_PATTERNS = (
     re.compile(r"^back\.?$", re.IGNORECASE),
     re.compile(r"^go\s+back\.?$", re.IGNORECASE),
 )
+_SELF_LOOKUP_HOURS_REQUEST_PATTERNS = {
+    "my hours",
+    "show my hours",
+    "show me my hours",
+    "can i see my hours",
+    "let me see my hours",
+    "check my hours",
+    "hours today",
+    "hours this week",
+    "hours last week",
+    "hours whole summer",
+    "hours for today",
+    "hours for this week",
+    "hours for last week",
+    "hours for the whole summer",
+    "what are my hours",
+    "what are my hours today",
+    "what are my hours this week",
+    "what are my hours last week",
+    "what are my hours for today",
+    "what are my hours for this week",
+    "what are my hours for last week",
+    "how many hours do i have",
+    "how many hours do i have clocked in",
+    "how many hours do i have today",
+    "how many hours do i have this week",
+    "how many hours do i have last week",
+    "how many hours have i worked",
+    "how many hours have i clocked in",
+    "how many hours did i log today",
+    "how many hours did i log this week",
+    "how many hours did i log last week",
+    "how many hours have i clocked in today",
+    "how many hours have i clocked in this week",
+    "how many hours have i clocked in last week",
+}
+_SELF_LOOKUP_HOURS_REQUEST_PREFIXES = (
+    "show ",
+    "show me ",
+    "tell me ",
+    "check ",
+    "let me see ",
+    "can you show ",
+    "could you show ",
+    "can you tell ",
+    "could you tell ",
+    "can i see ",
+    "could i see ",
+    "what ",
+    "whats ",
+    "how many ",
+    "how much ",
+    "how long ",
+)
+_SELF_LOOKUP_TIME_TRACKING_PHRASES = (
+    "time tracking",
+    "tracked time",
+    "time tracked",
+    "logged time",
+    "time logged",
+)
+_SELF_LOOKUP_HOURS_REPORT_TOKENS = {
+    "my",
+    "have",
+    "did",
+    "logged",
+    "clocked",
+    "tracked",
+    "tracking",
+    "worked",
+}
+_SELF_LOOKUP_STATUS_REQUEST_PATTERNS = {
+    "my status",
+    "show my status",
+    "show me my status",
+    "what is my status",
+    "whats my status",
+    "what is my current status",
+    "whats my current status",
+    "show my current status",
+    "show me my current status",
+}
+_SLACK_PORTAL_REQUEST_PHRASES = {
+    "portal",
+    "beta portal",
+    "worker portal",
+    "workday beta",
+    "login",
+    "log in",
+    "open portal",
+    "open workday",
+    "workday portal",
+    "portal link",
+    "connection link",
+    "connect",
+    "connect portal",
+}
+_AUTO_CLOCK_OUT_NOTIFICATION_MESSAGE = (
+    "I paused your work timer after the inactivity window so it does not keep running unattended. "
+    "If you are continuing work, reply `clock in` or `resume work`. If you were working during "
+    "the gap, tell me what you completed so the time can be reviewed."
+)
+
+
+def _normalize_slack_admin_text(value: Any) -> str:
+    text = _SLACK_CHATGPT_ATTRIBUTION_RE.sub("", str(value or "")).strip()
+    attribution_marker = _SLACK_SENT_USING_MARKER_RE.search(text)
+    command_candidate = (
+        text[: attribution_marker.start()].strip()
+        if attribution_marker
+        else text
+    )
+    normalized_text = command_candidate.casefold()
+    is_deterministic_command = (
+        normalized_text
+        in {
+            "help",
+            "menu",
+            "flow",
+            "back",
+            "home",
+            "cancel",
+            *_SLACK_PORTAL_REQUEST_PHRASES,
+        }
+        or normalized_text.startswith("help ")
+        or normalized_text.startswith("run ")
+    )
+    if is_deterministic_command:
+        if attribution_marker:
+            text = text[: attribution_marker.start()].strip()
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) > 1 and is_deterministic_command:
+        first_line = lines[0]
+        return first_line
+    return text
+
+
+_LUNCH_RETURN_TIME_PATTERN = re.compile(
+    r"\b(?:at|since)\s+(\d{1,2})(?:\s*[:.]\s*|\s+)(\d{2})\s*([ap]\.?m\.?)?\b",
+    re.IGNORECASE,
+)
+_SELF_LOOKUP_RANGE_LABELS = {
+    "today": "Today",
+    "this_week": "This Week",
+    "last_week": "Last Week",
+    "whole_summer": "Whole Summer",
+}
 _URL_PATTERN = re.compile(r"https?://\S+", re.IGNORECASE)
+_SESSION_STATE_TIMESTAMP_FIELDS = (
+    "first_sign_of_life_at",
+    "clocked_in_at",
+    "intake_completed_at",
+    "last_contact_at",
+    "last_user_message_at",
+    "last_outbound_at",
+    "last_clock_in_prompt_at",
+    "last_follow_up_at",
+    "last_clickup_sync_at",
+    "stuck_since",
+    "stuck_alerted_at",
+    "clocked_out_at",
+)
+_TIME_TRACKING_REPORT_RELATIVE_PATH = Path("dashboard") / "time_tracking" / "time_tracking.csv"
+_SLACK_UPDATE_STATE_RELATIVE_PATH = Path("dashboard") / "slack_updates" / "state.json"
+_RETRO_HOURS_BACKFILL_METADATA_KEY = "retro_hours_backfill"
+_TIME_RECORD_ORIGIN_METADATA_KEY = "time_record_origin"
+_TIME_TRACKING_REPORT_FIELDS = (
+    "user_key",
+    "display_name",
+    "timezone",
+    "session_date",
+    "gross_clocked_in_total_seconds",
+    "gross_clocked_in_total_human",
+    "unpaid_lunch_deducted_seconds",
+    "unpaid_lunch_deducted_human",
+    "clocked_in_total_seconds",
+    "clocked_in_total_human",
+    "task_tracked_total_seconds",
+    "task_tracked_total_human",
+    "work_segment_count",
+    "has_open_work_segment",
+    "active_task_timer_running",
+    "manual_edit_count",
+    "latest_manual_edit_json",
+    "retro_backfill_confidence",
+    "retro_backfill_warning_count",
+    "time_record_origin",
+    "review_status",
+    "review_summary",
+    "review_reasons_json",
+    "review_gap_seconds",
+    "review_gap_human",
+    "time_by_task_json",
+    "session_path",
+)
+logger = logging.getLogger(__name__)
+
+
+def _safe_storage_name(value: str) -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value).strip().rstrip(".")
+    return cleaned or "user"
 
 
 @dataclass(slots=True)
@@ -221,6 +461,106 @@ class _InternQueuedReviewChoiceView(discord.ui.View):
         return False
 
 
+class _InternSelfLookupButton(discord.ui.Button["_InternSelfLookupView"]):
+    def __init__(self, label: str, action: str, style: discord.ButtonStyle) -> None:
+        super().__init__(label=label, style=style, custom_id=f"intern-self-lookup:{action}")
+        self.action = action
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        if view is None:
+            return
+        await view.runtime.handle_self_lookup_interaction(
+            interaction,
+            view.user_key,
+            view.session_date,
+            self.action,
+        )
+
+
+class _InternSelfLookupView(discord.ui.View):
+    def __init__(
+        self,
+        runtime: "InternManagementRuntime",
+        user: UserProfile,
+        *,
+        session_date: str,
+        step: str,
+    ) -> None:
+        super().__init__(timeout=600)
+        self.runtime = runtime
+        self.user_key = user.user_key
+        self.user_id = user.discord_user_id
+        self.session_date = session_date
+        if step == "chooser":
+            self.add_item(_InternSelfLookupButton("No", "dismiss", discord.ButtonStyle.secondary))
+            self.add_item(_InternSelfLookupButton("Hours", "hours", discord.ButtonStyle.primary))
+            self.add_item(_InternSelfLookupButton("Status", "status", discord.ButtonStyle.primary))
+        elif step == "range":
+            self.add_item(_InternSelfLookupButton("Today", "today", discord.ButtonStyle.primary))
+            self.add_item(_InternSelfLookupButton("This Week", "this_week", discord.ButtonStyle.primary))
+            self.add_item(_InternSelfLookupButton("Last Week", "last_week", discord.ButtonStyle.secondary))
+            self.add_item(_InternSelfLookupButton("Whole Summer", "whole_summer", discord.ButtonStyle.secondary))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.user_id:
+            return True
+        if interaction.response.is_done():
+            await interaction.followup.send("This info prompt is not for you.")
+        else:
+            await interaction.response.send_message("This info prompt is not for you.")
+        return False
+
+
+class _InternDaySuppressionButton(discord.ui.Button["_InternDaySuppressionView"]):
+    def __init__(self, label: str, action: str, style: discord.ButtonStyle) -> None:
+        super().__init__(label=label, style=style, custom_id=f"intern-day-suppression:{action}")
+        self.action = action
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        if view is None:
+            return
+        await view.runtime.handle_day_suppression_interaction(
+            interaction,
+            view.user_key,
+            view.session_date,
+            self.action,
+        )
+
+
+class _InternDaySuppressionView(discord.ui.View):
+    def __init__(self, runtime: "InternManagementRuntime", user: UserProfile, *, session_date: str) -> None:
+        super().__init__(timeout=600)
+        self.runtime = runtime
+        self.user_key = user.user_key
+        self.user_id = user.discord_user_id
+        self.session_date = session_date
+        self.add_item(
+            _InternDaySuppressionButton(
+                "Yes, pause today",
+                "confirm",
+                discord.ButtonStyle.primary,
+            )
+        )
+        self.add_item(
+            _InternDaySuppressionButton(
+                "No, keep messages on",
+                "cancel",
+                discord.ButtonStyle.secondary,
+            )
+        )
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.user_id:
+            return True
+        if interaction.response.is_done():
+            await interaction.followup.send("This schedule pause prompt is not for you.")
+        else:
+            await interaction.response.send_message("This schedule pause prompt is not for you.")
+        return False
+
+
 class _AdminProgressProbeButton(discord.ui.Button["_AdminProgressProbeView"]):
     def __init__(self) -> None:
         super().__init__(
@@ -269,7 +609,10 @@ class _AdminProgressProbeView(discord.ui.View):
         return False
 
 _CLICKUP_PROMPT_KEY = "clickup_prompt"
+_CLOCK_OUT_RETURN_STATE_KEY = "clock_out_return_state"
+_CLOCK_OUT_PAUSE_NOTE_KEY = "clock_out_pause_note"
 _STATE_MACHINE_CHANGES_FILENAME = "state_machine_changes.jsonl"
+_MANUAL_TIME_EDITS_FILENAME = "manual_time_edits.jsonl"
 _LUNCH_CONFIRMATION_REQUESTED_AT_KEY = "lunch_confirmation_requested_at"
 _TASK_ONBOARDING_METADATA_FIELDS = {
     "plan": "task_onboarding_plan",
@@ -289,8 +632,10 @@ class InternManagementRuntime:
         self.store = LocalStore(self.bootstrap)
         self.config: AgentConfig | None = None
         self.roster_by_discord_id: dict[int, UserProfile] = {}
+        self.roster_by_slack_id: dict[str, UserProfile] = {}
         self.roster_by_key: dict[str, UserProfile] = {}
         self.clickup: ClickUpClient | None = None
+        self.slack: SlackClient | None = None
         self.advisor: Advisor = build_advisor(
             os.environ.get("OPENAI_API_KEY"),
             os.environ.get("OPENAI_MODEL"),
@@ -300,6 +645,17 @@ class InternManagementRuntime:
         self.interface_intelligence = InterfaceIntelligence()
         self.admin_router = AdminCommandRouter(self)
         self._config_loaded_at: datetime | None = None
+        self._user_session_locks: dict[str, asyncio.Lock] = {}
+        self._slack_policy_instance = SlackUpdatePolicy(
+            self._self_lookup_request_kind
+        )
+        self.operations = OperationalIssueReporter(
+            state_store=self.state_store,
+            config_provider=lambda: self.config,
+            slack_provider=lambda: self.slack,
+            admins_provider=self.admin_profiles,
+            timezone_provider=self.runtime_timezone_name,
+        )
 
     async def handle_direct_message(self, client: discord.Client, message: discord.Message) -> None:
         await self.refresh_configuration()
@@ -315,10 +671,21 @@ class InternManagementRuntime:
             return
         self.config = await self.store.load_agent_config()
         roster = await self.store.load_roster(self.config)
-        self.roster_by_discord_id = {user.discord_user_id: user for user in roster if user.active}
+        self.roster_by_discord_id = {
+            user.discord_user_id: user
+            for user in roster
+            if user.active and user.discord_user_id is not None
+        }
+        self.roster_by_slack_id = {
+            user.slack_user_id: user
+            for user in roster
+            if user.active and user.slack_user_id
+        }
         self.roster_by_key = {user.user_key: user for user in roster if user.active}
         clickup_token = os.environ.get("CLICKUP_API_TOKEN")
         self.clickup = ClickUpClient(clickup_token, self.config) if clickup_token else None
+        slack_token = os.environ.get("SLACK_BOT_TOKEN")
+        self.slack = SlackClient(slack_token) if slack_token and self.config.slack.enabled else None
         self._config_loaded_at = now
 
     async def backfill_transcripts_to_pacific_once(self) -> int:
@@ -383,6 +750,19 @@ class InternManagementRuntime:
             return []
         return list(self.config.admins)
 
+    def admin_profile_by_slack_user_id(self, slack_user_id: str) -> AdminProfile | None:
+        normalized = str(slack_user_id or "").strip()
+        if not normalized:
+            return None
+        return next(
+            (
+                admin
+                for admin in self.admin_profiles()
+                if str(admin.slack_user_id or "").strip() == normalized
+            ),
+            None,
+        )
+
     def primary_admin_profile(self) -> AdminProfile | None:
         admins = self.admin_profiles()
         return admins[0] if admins else None
@@ -404,6 +784,27 @@ class InternManagementRuntime:
     def resolve_user_timezone_name(self, user: UserProfile) -> str:
         return user.timezone or self.runtime_timezone_name()
 
+    def resolve_user_profile(self, user_key: str) -> UserProfile | None:
+        direct = self.roster_by_key.get(user_key)
+        if direct is not None:
+            return direct
+        storage_root = self._storage_root_path()
+        people_dir = storage_root / "people" if storage_root is not None else None
+        if people_dir is None or not people_dir.exists():
+            return None
+        for profile_path in sorted(people_dir.glob("*/profile.json"), key=lambda path: str(path).lower()):
+            try:
+                loaded = json.loads(profile_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if str(loaded.get("user_key") or "").strip() != user_key:
+                continue
+            try:
+                return UserProfile(**loaded)
+            except TypeError:
+                return None
+        return None
+
     def resolve_user_local_now(
         self,
         user: UserProfile,
@@ -411,6 +812,42 @@ class InternManagementRuntime:
     ) -> datetime:
         base_moment = moment or datetime.now(tz=resolve_timezone(self.runtime_timezone_name()))
         return localize_datetime(base_moment, self.resolve_user_timezone_name(user))
+
+    def is_user_scheduled_to_work(self, user: UserProfile, now: datetime) -> bool:
+        local_now = localize_datetime(now, self.resolve_user_timezone_name(user))
+        local_date = local_now.date()
+        for item in user.planned_time_off:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            if ".." in text:
+                start_text, end_text = text.split("..", 1)
+                try:
+                    if date.fromisoformat(start_text.strip()) <= local_date <= date.fromisoformat(end_text.strip()):
+                        return False
+                except ValueError:
+                    continue
+            try:
+                if date.fromisoformat(text) == local_date:
+                    return False
+            except ValueError:
+                continue
+        weekday_names = {
+            "monday": 0,
+            "tuesday": 1,
+            "wednesday": 2,
+            "thursday": 3,
+            "friday": 4,
+            "saturday": 5,
+            "sunday": 6,
+        }
+        configured_days = {
+            weekday_names[str(item).strip().lower()]
+            for item in user.regular_workdays
+            if str(item).strip().lower() in weekday_names
+        }
+        fallback_days = set(self.config.schedule.workdays) if self.config else {0, 1, 2, 3, 4}
+        return local_now.weekday() in (configured_days or fallback_days)
 
     def resolve_user_workday_date(
         self,
@@ -428,7 +865,20 @@ class InternManagementRuntime:
     ) -> tuple[SessionState, datetime]:
         local_now = self.resolve_user_local_now(user, moment)
         session_date = self.resolve_user_workday_date(user, moment)
-        return self.state_store.get_session(user.user_key, session_date), local_now
+        session = self.state_store.get_session(user.user_key, session_date)
+        self._normalize_session_state(session, user=user)
+        return session, local_now
+
+    def _user_session_lock(self, user_key: str) -> asyncio.Lock:
+        locks = getattr(self, "_user_session_locks", None)
+        if not isinstance(locks, dict):
+            locks = {}
+            self._user_session_locks = locks
+        lock = locks.get(user_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[user_key] = lock
+        return lock
 
     def find_admin_profiles(self, text: str) -> list[AdminProfile]:
         normalized = self._normalize_identifier_value(text)
@@ -610,6 +1060,26 @@ class InternManagementRuntime:
         )
         await self.write_dashboard()
         return f"Started a task-switch onboarding flow for {user.display_name} on `{target_task_name}`."
+
+    async def apply_operator_task_correction(
+        self,
+        *,
+        user_key: str,
+        session_date: str,
+        task_id: str,
+        corrected_by: str,
+        reason: str,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        return await apply_operator_task_correction(
+            self,
+            user_key=user_key,
+            session_date=session_date,
+            task_id=task_id,
+            corrected_by=corrected_by,
+            reason=reason,
+            now=now,
+        )
 
     async def debug_reset_workday(
         self,
@@ -875,9 +1345,163 @@ class InternManagementRuntime:
         user = self.roster_by_discord_id.get(message.author.id)
         if not user:
             return
-        session, now = self.get_user_session_for_moment(user, message.created_at)
-        inbound = await self._build_inbound_record(message, session, user)
-        await self.process_inbound_event(client, user, session, inbound, now)
+        async with self._user_session_lock(user.user_key):
+            session, now = self.get_user_session_for_moment(user, message.created_at)
+            inbound = await self._build_inbound_record(message, session, user)
+            await self.process_inbound_event(client, user, session, inbound, now)
+
+    async def handle_slack_direct_message(
+        self,
+        client: discord.Client,
+        event: dict[str, Any],
+    ) -> None:
+        await self.refresh_configuration()
+        if not self.config:
+            return
+        slack_user_id = str(event.get("user") or "").strip()
+        normalized_text = _normalize_slack_admin_text(event.get("text"))
+        if normalized_text.lower() in _SLACK_PORTAL_REQUEST_PHRASES:
+            from .worker_portal import build_worker_portal_link, resolve_worker_portal_actor
+
+            actor = resolve_worker_portal_actor(self, slack_user_id)
+            if actor is not None:
+                if not self.slack:
+                    logger.error("Cannot answer Slack portal DM because Slack is not configured.")
+                    return
+                try:
+                    portal_url = build_worker_portal_link(self, actor)
+                except ValueError:
+                    pass
+                else:
+                    await self.slack.post_message(
+                        slack_user_id,
+                        (
+                            f"<{portal_url}|Open your live Don Pollo Workday portal>\n"
+                            f"Direct link: {portal_url}\n\n"
+                            "The private signed link expires in 72 hours. The portal and this Slack DM use the "
+                            "same durable work session: starting work claims the ClickUp task without removing "
+                            "co-owners, clocks you in, and starts its task timer. If the link does not open, use "
+                            "this Slack DM as the fallback and report the problem rather than skipping the log. "
+                            "It is reachable on the shop network or through the office VPN when you are away."
+                        ),
+                    )
+                    return
+        admin = self.admin_profile_by_slack_user_id(slack_user_id)
+        if admin:
+            if not self.slack:
+                logger.error("Cannot answer Slack admin DM because Slack is not configured.")
+                return
+            admin_text = normalized_text
+            response = await self.admin_router.handle_plain_text(
+                client,
+                admin.discord_user_id,
+                admin_text,
+            )
+            await self.slack.post_message(slack_user_id, response)
+            return
+        user = self.roster_by_slack_id.get(slack_user_id)
+        if not user:
+            logger.warning("Ignoring Slack DM from unmapped user %s.", slack_user_id or "unknown")
+            return
+        event_ts = str(event.get("event_ts") or event.get("ts") or "").strip()
+        try:
+            moment = datetime.fromtimestamp(float(event_ts), tz=timezone.utc)
+        except (TypeError, ValueError):
+            moment = datetime.now(tz=timezone.utc)
+        async with self._user_session_lock(user.user_key):
+            session, now = self.get_user_session_for_moment(user, moment)
+            inbound = await self._build_slack_inbound_record(event, session, user, moment)
+            await self.process_inbound_event(client, user, session, inbound, now)
+
+    def build_slack_app_home_view(self, slack_user_id: str) -> dict[str, Any]:
+        """Build a durable Slack App Home entry point for the worker portal."""
+        from .worker_portal import build_worker_portal_link, resolve_worker_portal_actor
+
+        actor = resolve_worker_portal_actor(self, slack_user_id)
+        portal_url = ""
+        if actor is not None:
+            try:
+                portal_url = build_worker_portal_link(self, actor)
+            except ValueError:
+                portal_url = ""
+        blocks: list[dict[str, Any]] = [
+            {
+                "type": "header",
+                "text": {"type": "plain_text", "text": "Don Pollo Workday", "emoji": True},
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        "Start or resume work, choose the right project, save useful checkpoints, "
+                        "take lunch or a short break, and see today's recorded time."
+                    ),
+                },
+            },
+        ]
+        if portal_url:
+            blocks.extend(
+                [
+                    {
+                        "type": "actions",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "text": {
+                                    "type": "plain_text",
+                                    "text": "Open Workday Portal",
+                                    "emoji": True,
+                                },
+                                "style": "primary",
+                                "url": portal_url,
+                                "action_id": "open_worker_portal",
+                            }
+                        ],
+                    },
+                    {
+                        "type": "context",
+                        "elements": [
+                            {
+                                "type": "mrkdwn",
+                                "text": (
+                                    "Private link: works on the shop network or office VPN and expires in "
+                                    "72 hours. Reopen this Home tab or DM `login` for a fresh link."
+                                ),
+                            }
+                        ],
+                    },
+                ]
+            )
+        else:
+            blocks.append(
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            "Your Slack account is not enabled for the web beta yet. Use this DM for "
+                            "ordinary Don Pollo updates or contact Erik or George if you need portal access."
+                        ),
+                    },
+                }
+            )
+        blocks.extend(
+            [
+                {"type": "divider"},
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            "*Slack fallback*\nDM `login` for the portal, `hours` for recorded time, "
+                            "or describe what you plan to accomplish and Don Pollo will guide the work log."
+                        ),
+                    },
+                },
+            ]
+        )
+        return {"type": "home", "blocks": blocks}
 
     async def process_inbound_event(
         self,
@@ -888,7 +1512,7 @@ class InternManagementRuntime:
         now: datetime,
     ) -> None:
         previous_session = self._clone_session_state(session)
-        normalized_changed = self._normalize_session_state(session)
+        normalized_changed = self._normalize_session_state(session, user=user)
         inserted = self.state_store.append_message(user.user_key, session.session_date, inbound)
         if not inserted:
             if normalized_changed:
@@ -907,6 +1531,75 @@ class InternManagementRuntime:
                 await self.write_dashboard()
             return
         self._touch_inbound_session(session, now)
+        if not session.first_sign_of_life_at:
+            session.first_sign_of_life_at = now.isoformat()
+        self_lookup_request = self._self_lookup_request_kind(inbound.content)
+        if not self_lookup_request and self._could_be_self_lookup_request(inbound.content):
+            self_lookup_request = await self._resolve_self_lookup_request_kind(
+                inbound.content,
+                stage=session.stage,
+            )
+        if self_lookup_request:
+            if self._progress_probe_prompt(session):
+                await self._close_progress_probe(
+                    client,
+                    user,
+                    session,
+                    now,
+                    reason="interrupted_by_self_lookup",
+                )
+            else:
+                self._clear_follow_up_probe_tracking(session)
+            session.pending_clickup_sync = previous_session.pending_clickup_sync
+            await self._start_self_lookup_prompt(client, user, session, now)
+            await self._persist_session_state(
+                user,
+                session,
+                now=now,
+                previous_session=previous_session,
+                trigger="inbound_message",
+                details={
+                    "message_id": inbound.message_id,
+                    "content_excerpt": self._excerpt_text(inbound.content),
+                    "handled_by_self_lookup_query": True,
+                    "self_lookup_request_kind": self_lookup_request,
+                },
+            )
+            await self.write_dashboard()
+            return
+        if session.stage == "awaiting_clock_out_artifacts":
+            await self._handle_clock_out_artifacts(client, user, session, inbound, now)
+            session.pending_clickup_sync = True
+            await self._persist_session_state(
+                user,
+                session,
+                now=now,
+                previous_session=previous_session,
+                trigger="inbound_message",
+                details={
+                    "message_id": inbound.message_id,
+                    "content_excerpt": self._excerpt_text(inbound.content),
+                    "handled_by_clock_out_artifacts": True,
+                },
+            )
+            await self.write_dashboard()
+            return
+        if await self._maybe_start_day_suppression_prompt(client, user, session, inbound, now):
+            session.pending_clickup_sync = previous_session.pending_clickup_sync
+            await self._persist_session_state(
+                user,
+                session,
+                now=now,
+                previous_session=previous_session,
+                trigger="inbound_message",
+                details={
+                    "message_id": inbound.message_id,
+                    "content_excerpt": self._excerpt_text(inbound.content),
+                    "handled_by_day_suppression_prompt": True,
+                },
+            )
+            await self.write_dashboard()
+            return
         signals = detect_signals(inbound.content)
         active_prompt = session.metadata.get(_CLICKUP_PROMPT_KEY)
         active_prompt = active_prompt if isinstance(active_prompt, dict) else None
@@ -916,8 +1609,33 @@ class InternManagementRuntime:
                 session.stage,
                 signals,
             )
-        if not session.first_sign_of_life_at:
-            session.first_sign_of_life_at = now.isoformat()
+        if self._active_short_rest_break(session):
+            await self._handle_short_rest_break_message(
+                client,
+                user,
+                session,
+                inbound,
+                signals,
+                now,
+            )
+            session.pending_clickup_sync = True
+            await self._persist_session_state(
+                user,
+                session,
+                now=now,
+                previous_session=previous_session,
+                trigger="inbound_message",
+                details={
+                    "message_id": inbound.message_id,
+                    "content_excerpt": self._excerpt_text(inbound.content),
+                    "signals": self._signal_details(signals),
+                    "handled_by_short_rest_break": True,
+                },
+            )
+            await self.write_dashboard()
+            return
+        if self._day_suppression_active_for_session(session) and signals.clocked_in:
+            self._clear_day_suppression_state(session)
         if await self._maybe_recover_missing_clock_in(client, user, session, inbound, signals, now):
             session.pending_clickup_sync = True
             await self._persist_session_state(
@@ -988,6 +1706,24 @@ class InternManagementRuntime:
             )
             await self.write_dashboard()
             return
+        if getattr(signals, "starting_short_rest", False):
+            if await self._maybe_start_short_rest_break(client, user, session, now):
+                session.pending_clickup_sync = True
+                await self._persist_session_state(
+                    user,
+                    session,
+                    now=now,
+                    previous_session=previous_session,
+                    trigger="inbound_message",
+                    details={
+                        "message_id": inbound.message_id,
+                        "content_excerpt": self._excerpt_text(inbound.content),
+                        "signals": self._signal_details(signals),
+                        "handled_by_short_rest_intent": True,
+                    },
+                )
+                await self.write_dashboard()
+                return
         if (
             session.stage != "awaiting_clock_out_artifacts"
             and not signals.clocking_out
@@ -1046,6 +1782,19 @@ class InternManagementRuntime:
     ) -> bool:
         if session.clocked_in_at or not getattr(signals, "clocked_in", False):
             return False
+        if self._quality_restart_blocked(session):
+            await self._send_dm(
+                client,
+                user,
+                session,
+                (
+                    "A work-detail quality warning expired earlier today. I cannot restart tracked time "
+                    "until Erik or George reviews the corrected plan and approves the restart. "
+                    "Do not work off the clock; report any work already performed so the record can be corrected."
+                ),
+                now,
+            )
+            return True
         session.clocked_in_at = now.isoformat()
         session.clocked_out_at = None
         self._start_new_work_segment(session, now)
@@ -1077,6 +1826,32 @@ class InternManagementRuntime:
     ) -> bool:
         if not session.clocked_out_at:
             return False
+        if self._overtime_restart_blocked(session):
+            await self._send_dm(
+                client,
+                user,
+                session,
+                (
+                    "You were clocked out at the unapproved overtime limit. "
+                    "I cannot restart work time today until Erik or George approves it. "
+                    "Any work you actually perform must still be reported so the record can be corrected."
+                ),
+                now,
+            )
+            return True
+        if self._quality_restart_blocked(session):
+            await self._send_dm(
+                client,
+                user,
+                session,
+                (
+                    "A work-detail quality warning expired earlier today. I cannot restart tracked time "
+                    "until Erik or George reviews the corrected plan and approves the restart. "
+                    "Do not work off the clock; report any work already performed so the record can be corrected."
+                ),
+                now,
+            )
+            return True
         self._clear_pending_lunch_confirmation(session)
         self._clear_clock_out_state(session)
         if not session.clocked_in_at:
@@ -1086,7 +1861,7 @@ class InternManagementRuntime:
         if not session.intake_completed_at:
             await self._begin_daily_clock_in_intake(client, user, session, now, source="same_day_reclockin")
             return True
-        active_task_id = self._active_task_id(session)
+        active_task_id = self._authoritative_active_task_id(session)
         active_task_name = str(session.metadata.get("active_clickup_task_name") or "")
         if active_task_id:
             session.stage = "active"
@@ -1106,7 +1881,7 @@ class InternManagementRuntime:
         await self._start_task_selection_resume(client, user, session, now, reason="I marked you clocked back in, but I still need to confirm which task you are resuming.")
         return True
 
-    async def _maybe_resume_after_auto_clock_out_activity(
+    async def _maybe_handle_post_auto_clock_out_activity(
         self,
         client: discord.Client,
         user: UserProfile,
@@ -1121,7 +1896,35 @@ class InternManagementRuntime:
             return False
         if not inbound.content.strip() and not inbound.attachments:
             return False
-        return await self._maybe_resume_same_day_work(client, user, session, now)
+        if inbound.content.strip():
+            session.latest_status = inbound.content.strip()
+            if self._signals_blocked_status(signals):
+                session.latest_blocker = inbound.content.strip()
+        elif inbound.attachments:
+            session.latest_status = "Sent an update while the work timer was paused."
+        await self._send_dm(
+            client,
+            user,
+            session,
+            (
+                "Thanks for checking in. Your work timer is still paused, and I did not restart it "
+                "from this message. If you are continuing work, reply `clock in` or `resume work`; "
+                "otherwise no action is needed."
+            ),
+            now,
+        )
+        return True
+
+    def _overtime_restart_blocked(self, session: SessionState) -> bool:
+        if session.metadata.get("overtime_approved_at"):
+            return False
+        return str(session.metadata.get("auto_clock_out_reason") or "") == (
+            "Configured overtime limit reached."
+        )
+
+    @staticmethod
+    def _quality_restart_blocked(session: SessionState) -> bool:
+        return bool(session.metadata.get(_PORTAL_QUALITY_RESTART_BLOCK_KEY))
 
     async def _begin_daily_clock_in_intake(
         self,
@@ -1132,6 +1935,7 @@ class InternManagementRuntime:
         *,
         source: str,
     ) -> None:
+        self._clear_non_authoritative_active_task_context(session)
         session.stage = "awaiting_task_selection"
         session.awaiting_start_photo = False
         session.clocked_out_at = None
@@ -1141,6 +1945,18 @@ class InternManagementRuntime:
         session.last_follow_up_at = None
         tasks = await self.clickup.list_assigned_tasks(user, limit=8) if self.clickup else []
         recommended_task = self.clickup.pick_highest_priority_task(tasks) if self.clickup else None
+        if (
+            not recommended_task
+            and self.clickup
+            and hasattr(self.clickup, "suggest_next_tasks")
+        ):
+            workspace_options = await self.clickup.suggest_next_tasks(
+                user,
+                session,
+                self.list_session_messages(user.user_key, session),
+                limit=3,
+            )
+            recommended_task = workspace_options[0] if workspace_options else None
         prompt: dict[str, Any] = {
             "type": "task_onboarding",
             "source": source,
@@ -1151,6 +1967,8 @@ class InternManagementRuntime:
         if recommended_task:
             prompt["recommended_task_id"] = str(recommended_task.get("id") or "")
             prompt["recommended_task_name"] = str(recommended_task.get("name") or "")
+            if recommended_task.get("_don_pollo_workspace_option"):
+                prompt["recommended_workspace_option"] = True
         session.metadata[_CLICKUP_PROMPT_KEY] = prompt
         session.metadata["last_task_onboarding_prompt_at"] = now.isoformat()
         await self._send_dm(
@@ -1183,21 +2001,27 @@ class InternManagementRuntime:
             recommendation_id = str(recommendation.get("id") or "unknown")
             recommendation_name = str(recommendation.get("name") or "Unnamed task")
             recommendation_priority = (recommendation.get("priority") or {}).get("priority") or "none"
+            is_workspace_option = bool(recommendation.get("_don_pollo_workspace_option"))
+            recommendation_basis = (
+                "It is my best open option across the configured ClickUp workspace, ranked by project-context overlap, status, and priority."
+                if is_workspace_option
+                else "It is the highest-priority assigned task I can see right now, using earliest-created as the tie-breaker."
+            )
+            lines.extend(["", f"My recommendation is `{recommendation_name}` ({recommendation_id}).", recommendation_basis])
+            if is_workspace_option:
+                lines.append(f"Location: {self._task_option_location_label(recommendation)}")
             lines.extend(
                 [
-                    "",
-                    f"My recommendation is `{recommendation_name}` ({recommendation_id}).",
-                    "It is the highest-priority assigned task I can see right now, using earliest-created as the tie-breaker.",
                     f"Priority: {recommendation_priority}",
-                    "If that is what you are starting with, reply `yes` or `recommended`. Otherwise reply with a different assigned task name or task ID.",
+                    "If that is what you are starting with, reply `yes` or `recommended`. Otherwise choose another option by task name or ID.",
                 ]
             )
         else:
             lines.extend(
                 [
                     "",
-                    "I could not find an assigned ClickUp task to recommend yet.",
-                    "Reply with the exact assigned task name or task ID you are starting with, or ask admin to assign one.",
+                    "I could not find a strong existing ClickUp task to recommend yet.",
+                    "Reply with an exact task name or ID, or reply `create task` to propose a new one for approval.",
                 ]
             )
         lines.extend(["", await self._task_selection_prompt(user, session, tasks=visible_tasks, recommended_task=recommendation)])
@@ -1212,6 +2036,7 @@ class InternManagementRuntime:
         *,
         reason: str,
     ) -> None:
+        self._clear_non_authoritative_active_task_context(session)
         session.stage = "awaiting_task_selection"
         session.awaiting_start_photo = False
         session.awaiting_clock_out_photo = False
@@ -1233,39 +2058,115 @@ class InternManagementRuntime:
         )
 
     async def scheduler_tick(self, client: discord.Client) -> None:
-        await self.refresh_configuration()
-        if not self.config:
-            return
-        base_now = datetime.now(tz=resolve_timezone(self.runtime_timezone_name()))
-        for user in self.roster_by_key.values():
+        await run_scheduler_tick(self, client)
+
+    async def _run_scheduler_for_user(
+        self,
+        client: discord.Client,
+        user: UserProfile,
+        base_now: datetime,
+    ) -> None:
+        async with self._user_session_lock(user.user_key):
             session, now = self.get_user_session_for_moment(user, base_now)
-            is_workday = now.weekday() in self.config.schedule.workdays
+            is_workday = self.is_user_scheduled_to_work(user, now)
             previous_session = self._clone_session_state(session)
-            normalized_changed = self._normalize_session_state(session)
+            normalized_changed = self._normalize_session_state(session, user=user)
             changed = False
             reasons: list[str] = []
             if normalized_changed:
                 changed = True
                 reasons.append("normalized_session_state")
+            if await self._maybe_enforce_portal_quality_warning(client, user, session, now):
+                changed = True
+                reasons.append("portal_quality_auto_clock_out")
+                await self._persist_session_state(
+                    user,
+                    session,
+                    now=now,
+                    previous_session=previous_session,
+                    trigger="scheduler_tick",
+                    details={"workday": is_workday, "reasons": reasons},
+                )
+                return
+            if self._active_short_rest_break(session):
+                if await self._maybe_check_short_rest_break(client, user, session, now):
+                    changed = True
+                    reasons.append("short_rest_break_auto_clock_out")
+                if changed:
+                    await self._persist_session_state(
+                        user,
+                        session,
+                        now=now,
+                        previous_session=previous_session,
+                        trigger="scheduler_tick",
+                        details={
+                            "workday": is_workday,
+                            "reasons": reasons + ["short_rest_break_active"],
+                        },
+                    )
+                return
+            if self._day_suppression_active_for_session(session):
+                if await self._maybe_send_auto_clock_out_warning(client, user, session, now):
+                    changed = True
+                    reasons.append("sent_auto_clock_out_warning")
+                if await self._maybe_auto_clock_out_inactive(client, user, session, now):
+                    changed = True
+                    reasons.append("auto_clock_out_inactive")
+                if changed:
+                    await self._persist_session_state(
+                        user,
+                        session,
+                        now=now,
+                        previous_session=previous_session,
+                        trigger="scheduler_tick",
+                        details={
+                            "workday": is_workday,
+                            "reasons": reasons + ["day_suppression_active"],
+                        },
+                    )
+                return
+            if await self._maybe_send_auto_clock_out_warning(client, user, session, now):
+                changed = True
+                reasons.append("sent_auto_clock_out_warning")
             if is_workday and await self._maybe_send_clock_in(client, user, session, now):
                 changed = True
                 reasons.append("sent_clock_in_prompt")
-            if await self._maybe_auto_clock_out_inactive(user, session, now):
+            if session.stage == "awaiting_clock_out_artifacts":
+                if changed:
+                    await self._persist_session_state(
+                        user,
+                        session,
+                        now=now,
+                        previous_session=previous_session,
+                        trigger="scheduler_tick",
+                        details={
+                            "workday": is_workday,
+                            "reasons": reasons,
+                        },
+                    )
+                return
+            if await self._maybe_auto_clock_out_inactive(client, user, session, now):
                 changed = True
                 reasons.append("auto_clock_out_inactive")
-            if is_workday and await self._maybe_prompt_task_onboarding(client, user, session, now):
+            if session.clocked_in_at and await self._maybe_prompt_task_onboarding(client, user, session, now):
                 changed = True
                 reasons.append("prompted_task_onboarding")
-            if is_workday and await self._maybe_send_lunch_break_check_in(client, user, session, now):
+            if session.clocked_in_at and await self._maybe_send_lunch_break_check_in(client, user, session, now):
                 changed = True
                 reasons.append("sent_lunch_check_in")
+            if session.clocked_in_at and await self._maybe_check_meal_compliance(client, user, session, now):
+                changed = True
+                reasons.append("meal_compliance_event")
+            if session.clocked_in_at and await self._maybe_check_overtime_compliance(client, user, session, now):
+                changed = True
+                reasons.append("overtime_compliance_event")
             if await self._maybe_assess_pending_follow_up_probe(client, user, session, now):
                 changed = True
                 reasons.append("handled_follow_up_probe")
             if await self._maybe_timeout_progress_probe(client, user, session, now):
                 changed = True
                 reasons.append("timed_out_progress_probe")
-            if is_workday and await self._maybe_send_follow_up(client, user, session, now):
+            if session.clocked_in_at and await self._maybe_send_follow_up(client, user, session, now):
                 changed = True
                 reasons.append("sent_follow_up")
             if await self._maybe_alert_admin(client, user, session, now):
@@ -1274,6 +2175,9 @@ class InternManagementRuntime:
             if await self._maybe_flush_clickup(user, session, now):
                 changed = True
                 reasons.append("flushed_clickup")
+            if await self._maybe_post_slack_daily_update(user, session, now):
+                changed = True
+                reasons.append("posted_slack_daily_update")
             if changed:
                 await self._persist_session_state(
                     user,
@@ -1286,7 +2190,6 @@ class InternManagementRuntime:
                         "reasons": reasons,
                     },
                 )
-        await self.write_dashboard()
 
     async def write_dashboard(self) -> None:
         if not self.config:
@@ -1345,7 +2248,7 @@ class InternManagementRuntime:
         if getattr(signals, "clocked_in", False):
             if await self._maybe_resume_same_day_work(client, user, session, now):
                 return
-        if await self._maybe_resume_after_auto_clock_out_activity(client, user, session, inbound, signals, now):
+        if await self._maybe_handle_post_auto_clock_out_activity(client, user, session, inbound, signals, now):
             if session.stage != "active":
                 return
         if getattr(signals, "starting_lunch", False):
@@ -1354,6 +2257,17 @@ class InternManagementRuntime:
         if await self._maybe_handle_lunch_confirmation(client, user, session, inbound, signals, now):
             return
         if await self._maybe_handle_intern_task_switch_request(client, user, session, inbound, now):
+            return
+        if session.stage == "awaiting_admin_review" and self._is_task_creation_request(inbound.content):
+            await self._start_intern_task_switch(
+                client,
+                user,
+                session,
+                now,
+                source="intern_switch",
+                reason="Okay, that earlier task is already waiting on admin review. Let's create what you are switching to next.",
+                open_task_creation=True,
+            )
             return
         if session.stage == "awaiting_admin_review":
             await self._send_dm(
@@ -1447,15 +2361,29 @@ class InternManagementRuntime:
     ) -> bool:
         if session.clocked_in_at:
             return False
-        if now.hour < self.config.schedule.clock_in_hour or now.hour > self.config.schedule.clock_in_cutoff_hour:
+        try:
+            start_hour, start_minute = [int(part) for part in user.typical_start_time.split(":", 1)]
+            end_hour, end_minute = [int(part) for part in user.typical_end_time.split(":", 1)]
+            start_at = now.replace(hour=start_hour, minute=start_minute, second=0, microsecond=0)
+            end_at = now.replace(hour=end_hour, minute=end_minute, second=0, microsecond=0)
+            cutoff_at = min(start_at + timedelta(hours=4), end_at)
+        except (TypeError, ValueError):
+            start_at = now.replace(hour=self.config.schedule.clock_in_hour, minute=0, second=0, microsecond=0)
+            cutoff_at = now.replace(hour=self.config.schedule.clock_in_cutoff_hour, minute=59, second=59, microsecond=0)
+        if now < start_at or now > cutoff_at:
             return False
+        timezone_name = self.resolve_user_timezone_name(user)
         should_send = False
         if not session.last_clock_in_prompt_at:
             should_send = True
             prompt = self.config.prompts.clock_in
         else:
-            last_prompt = datetime.fromisoformat(session.last_clock_in_prompt_at)
-            if now - last_prompt >= timedelta(hours=1):
+            last_prompt = self._coerce_datetime_for_reference(
+                session.last_clock_in_prompt_at,
+                reference=now,
+                timezone_name=timezone_name,
+            )
+            if not last_prompt or now - last_prompt >= timedelta(hours=1):
                 should_send = True
                 prompt = self.config.prompts.clock_in_reminder
             else:
@@ -1475,32 +2403,929 @@ class InternManagementRuntime:
     ) -> bool:
         if session.stage != "active" or session.clocked_out_at:
             return False
+        if self._self_lookup_prompt(session):
+            return False
         prompt = session.metadata.get(_CLICKUP_PROMPT_KEY)
         if isinstance(prompt, dict) and str(prompt.get("type") or "") in {"task_onboarding", "progress_probe"}:
+            return False
+        pending_follow_up = self._pending_follow_up(session)
+        if pending_follow_up and bool(pending_follow_up.get("awaiting_reply", True)):
+            # A checkpoint gets one friendly reminder. The four-hour inactivity
+            # backstop is responsible for an unattended session; repeating the
+            # same question only creates notification fatigue.
             return False
         if self._pending_follow_up_aggregation(session):
             return False
         if not session.intake_completed_at:
             return False
-        intake_completed = datetime.fromisoformat(session.intake_completed_at)
-        if now - intake_completed < timedelta(minutes=self.config.schedule.follow_up_interval_minutes):
+        timezone_name = self.resolve_user_timezone_name(user)
+        intake_completed = self._coerce_datetime_for_reference(
+            session.intake_completed_at,
+            reference=now,
+            timezone_name=timezone_name,
+        )
+        if not intake_completed:
             return False
-        if session.last_follow_up_at:
-            last_follow_up = datetime.fromisoformat(session.last_follow_up_at)
-            if now - last_follow_up < timedelta(minutes=self.config.schedule.follow_up_interval_minutes):
+        worker_checkpoint = self._worker_checkpoint(session)
+        if worker_checkpoint:
+            if bool(worker_checkpoint.get("reminder_sent")):
                 return False
+            due_at = self._coerce_datetime_for_reference(
+                str(worker_checkpoint.get("due_at") or ""),
+                reference=now,
+                timezone_name=timezone_name,
+            )
+            if not due_at or now < due_at:
+                return False
+        else:
+            follow_up_interval = self._adaptive_follow_up_interval_minutes(user, session)
+            if now - intake_completed < timedelta(minutes=follow_up_interval):
+                return False
+            if session.last_follow_up_at:
+                last_follow_up = self._coerce_datetime_for_reference(
+                    session.last_follow_up_at,
+                    reference=now,
+                    timezone_name=timezone_name,
+                )
+                if last_follow_up and now - last_follow_up < timedelta(minutes=follow_up_interval):
+                    return False
         questions = self.config.prompts.follow_up_questions
+        if not questions:
+            logger.warning("Skipping follow-up for user %s because prompts.follow_up_questions is empty.", user.user_key)
+            return False
         index = int(session.metadata.get("follow_up_index", 0)) % len(questions)
-        sent = await self._send_dm(client, user, session, questions[index], now)
+        selected_choice = str((worker_checkpoint or {}).get("choice") or "").strip()
+        question_text = (
+            "Quick checkpoint—what changed, what is next, or is anything blocked? "
+            "One concise line is enough. You are still clocked in; this is not a clock-out warning."
+        )
+        if selected_choice:
+            question_text = (
+                f"Quick checkpoint—you chose {selected_choice}. What changed, what is next, "
+                "or is anything blocked? One concise line is enough. You are still clocked in."
+            )
+        sent = await self._send_dm(client, user, session, question_text, now)
         session.metadata["follow_up_index"] = index + 1
         session.last_follow_up_at = now.isoformat()
         session.metadata[_PENDING_FOLLOW_UP_KEY] = {
             "message_id": sent.message_id if isinstance(sent, MessageRecord) else f"follow-up:{int(now.timestamp())}",
-            "question_text": questions[index],
+            "question_text": question_text,
             "sent_at": now.isoformat(),
             "awaiting_reply": True,
         }
+        if worker_checkpoint is not None:
+            worker_checkpoint["reminder_sent"] = True
+            worker_checkpoint["reminder_sent_at"] = now.isoformat()
         return True
+
+    def _adaptive_follow_up_interval_minutes(
+        self,
+        user: UserProfile,
+        session: SessionState,
+    ) -> int:
+        if user.check_in_interval_minutes:
+            return user.check_in_interval_minutes
+        base_interval = max(45, int(self.config.schedule.follow_up_interval_minutes))
+        estimated_minutes = self._estimated_task_duration_minutes(
+            str(session.metadata.get("task_onboarding_estimated_duration") or "")
+        )
+        if estimated_minutes is None:
+            interval = base_interval
+        elif estimated_minutes <= 60:
+            interval = 45
+        elif estimated_minutes <= 3 * 60:
+            interval = 75
+        elif estimated_minutes <= 8 * 60:
+            interval = 90
+        else:
+            interval = min(120, max(90, base_interval))
+        if self._useful_checkpoint_streak(session) >= 3:
+            # Clear communicators earn a little more uninterrupted focus time
+            # when they have not explicitly chosen a portal checkpoint.
+            interval = min(180, interval + 30)
+        return interval
+
+    def _worker_checkpoint(self, session: SessionState) -> dict[str, Any] | None:
+        value = session.metadata.get(_WORKER_CHECKPOINT_KEY)
+        return value if isinstance(value, dict) else None
+
+    def _set_worker_checkpoint(
+        self,
+        session: SessionState,
+        now: datetime,
+        choice: str,
+        *,
+        source: str,
+    ) -> dict[str, Any]:
+        normalized = " ".join(str(choice or "").strip().lower().split())
+        if normalized == "when result is ready":
+            interval_minutes = 120
+        else:
+            interval_minutes = self._estimated_task_duration_minutes(normalized) or 60
+        interval_minutes = max(30, min(120, interval_minutes))
+        checkpoint = {
+            "choice": normalized or "60 minutes",
+            "set_at": now.isoformat(),
+            "due_at": (now + timedelta(minutes=interval_minutes)).isoformat(),
+            "interval_minutes": interval_minutes,
+            "source": source,
+            "reminder_sent": False,
+        }
+        session.metadata[_WORKER_CHECKPOINT_KEY] = checkpoint
+        session.metadata["task_onboarding_checkpoint"] = checkpoint["choice"]
+        self._clear_follow_up_probe_tracking(session)
+        return checkpoint
+
+    def _record_checkpoint_quality(
+        self,
+        session: SessionState,
+        now: datetime,
+        *,
+        meaningful: bool,
+        source: str,
+    ) -> None:
+        history = session.metadata.get(_CHECKPOINT_QUALITY_HISTORY_KEY)
+        if not isinstance(history, list):
+            history = []
+        history.append(
+            {
+                "recorded_at": now.isoformat(),
+                "meaningful": bool(meaningful),
+                "source": source,
+            }
+        )
+        session.metadata[_CHECKPOINT_QUALITY_HISTORY_KEY] = history[-10:]
+        if meaningful:
+            session.metadata.pop(_STILL_WORKING_ACK_KEY, None)
+
+    def _renew_checkpoint_after_response(
+        self,
+        session: SessionState,
+        now: datetime,
+        *,
+        source: str,
+    ) -> None:
+        worker_checkpoint = self._worker_checkpoint(session)
+        choice = str((worker_checkpoint or {}).get("choice") or "").strip()
+        if choice:
+            self._set_worker_checkpoint(session, now, choice, source=source)
+            return
+        self._clear_follow_up_probe_tracking(session)
+        session.last_follow_up_at = now.isoformat()
+
+    def _useful_checkpoint_streak(self, session: SessionState) -> int:
+        history = session.metadata.get(_CHECKPOINT_QUALITY_HISTORY_KEY)
+        if not isinstance(history, list):
+            return 0
+        streak = 0
+        for item in reversed(history):
+            if not isinstance(item, dict) or not bool(item.get("meaningful")):
+                break
+            streak += 1
+        return streak
+
+    def _estimated_task_duration_minutes(self, value: str) -> int | None:
+        normalized = value.strip().lower()
+        if not normalized:
+            return None
+        match = re.search(
+            r"(\d+(?:\.\d+)?)\s*(minutes?|mins?|hours?|hrs?|days?)\b",
+            normalized,
+        )
+        if not match:
+            return None
+        amount = float(match.group(1))
+        unit = match.group(2)
+        if unit.startswith(("minute", "min")):
+            return max(1, round(amount))
+        if unit.startswith(("hour", "hr")):
+            return max(1, round(amount * 60))
+        return max(1, round(amount * 8 * 60))
+
+    def _active_short_rest_break(
+        self,
+        session: SessionState,
+    ) -> dict[str, Any] | None:
+        raw = session.metadata.get(_SHORT_REST_ACTIVE_KEY)
+        if not isinstance(raw, dict):
+            return None
+        if not str(raw.get("started_at") or "").strip():
+            return None
+        if not str(raw.get("deadline_at") or "").strip():
+            return None
+        return raw
+
+    async def _maybe_start_short_rest_break(
+        self,
+        client: discord.Client,
+        user: UserProfile,
+        session: SessionState,
+        now: datetime,
+    ) -> bool:
+        if self._active_short_rest_break(session):
+            await self._send_dm(
+                client,
+                user,
+                session,
+                "Your short rest break is already active. Reply `back from break` when you return.",
+                now,
+            )
+            return True
+        if (
+            not self.config.labor.enabled
+            or not user.time_tracking_required
+            or not session.clocked_in_at
+            or session.clocked_out_at
+            or session.stage != "active"
+            or not self._active_task_id(session)
+        ):
+            await self._send_dm(
+                client,
+                user,
+                session,
+                "I can start a paid short rest only while you are clocked in on an active ClickUp task.",
+                now,
+            )
+            return True
+        if self._progress_probe_prompt(session):
+            await self._close_progress_probe(
+                client,
+                user,
+                session,
+                now,
+                reason="converted_to_short_rest",
+            )
+        else:
+            self._clear_follow_up_probe_tracking(session)
+        limit_minutes = self.config.labor.short_rest_break_minutes
+        deadline = now + timedelta(minutes=limit_minutes)
+        record = {
+            "started_at": now.isoformat(),
+            "deadline_at": deadline.isoformat(),
+            "limit_minutes": limit_minutes,
+            "task_id": self._active_task_id(session),
+            "task_name": str(session.metadata.get("active_clickup_task_name") or ""),
+            "source": "inbound_short_rest_signal",
+        }
+        session.metadata[_SHORT_REST_ACTIVE_KEY] = dict(record)
+        history = session.metadata.get(_SHORT_REST_HISTORY_KEY)
+        if not isinstance(history, list):
+            history = []
+            session.metadata[_SHORT_REST_HISTORY_KEY] = history
+        history.append(dict(record))
+        deadline_label = deadline.strftime("%I:%M %p").lstrip("0")
+        await self._send_dm(
+            client,
+            user,
+            session,
+            (
+                f"Paid short rest started. Your work and active-project time remain on the clock "
+                f"for up to {limit_minutes} minutes. Reply `back from break` by {deadline_label}. "
+                f"If you do not check back in by then, I will clock you out effective {deadline_label}."
+            ),
+            now,
+        )
+        return True
+
+    async def _handle_short_rest_break_message(
+        self,
+        client: discord.Client,
+        user: UserProfile,
+        session: SessionState,
+        inbound: MessageRecord,
+        signals: Any,
+        now: datetime,
+    ) -> None:
+        active = self._active_short_rest_break(session)
+        if not active:
+            return
+        deadline = self._coerce_datetime_for_reference(
+            str(active.get("deadline_at") or ""),
+            reference=now,
+            timezone_name=self.resolve_user_timezone_name(user),
+        )
+        if deadline and now > deadline:
+            await self._maybe_check_short_rest_break(client, user, session, now)
+            return
+        if getattr(signals, "clocking_out", False):
+            self._finish_short_rest_break(session, now, outcome="manual_clock_out")
+            await self._start_clock_out(client, user, session, inbound, now)
+            return
+        if (
+            getattr(signals, "ending_short_rest", False)
+            or getattr(signals, "recovered", False)
+        ):
+            started_at = self._coerce_datetime_for_reference(
+                str(active.get("started_at") or ""),
+                reference=now,
+                timezone_name=self.resolve_user_timezone_name(user),
+            )
+            self._finish_short_rest_break(session, now, outcome="returned")
+            elapsed_seconds = max(
+                0,
+                int((now - started_at).total_seconds()) if started_at else 0,
+            )
+            await self._send_dm(
+                client,
+                user,
+                session,
+                (
+                    f"Welcome back. I recorded a paid short rest of "
+                    f"{self._format_duration(elapsed_seconds)}. Continue on your active ClickUp task."
+                ),
+                now,
+            )
+            return
+        deadline_label = deadline.strftime("%I:%M %p").lstrip("0") if deadline else "the deadline"
+        await self._send_dm(
+            client,
+            user,
+            session,
+            (
+                "Your paid short rest is still active. Reply `back from break` when you return. "
+                f"If you do not check back in by {deadline_label}, I will clock you out."
+            ),
+            now,
+        )
+
+    def _finish_short_rest_break(
+        self,
+        session: SessionState,
+        ended_at: datetime,
+        *,
+        outcome: str,
+        detected_at: datetime | None = None,
+    ) -> None:
+        active = self._active_short_rest_break(session)
+        if not active:
+            return
+        started_at = str(active.get("started_at") or "")
+        active["ended_at"] = ended_at.isoformat()
+        active["outcome"] = outcome
+        if detected_at is not None:
+            active["detected_at"] = detected_at.isoformat()
+        history = session.metadata.get(_SHORT_REST_HISTORY_KEY)
+        if isinstance(history, list):
+            for record in reversed(history):
+                if not isinstance(record, dict):
+                    continue
+                if str(record.get("started_at") or "") != started_at:
+                    continue
+                record.update(active)
+                break
+        session.metadata.pop(_SHORT_REST_ACTIVE_KEY, None)
+
+    async def _maybe_check_short_rest_break(
+        self,
+        client: discord.Client,
+        user: UserProfile,
+        session: SessionState,
+        now: datetime,
+    ) -> bool:
+        active = self._active_short_rest_break(session)
+        if not active:
+            return False
+        deadline = self._coerce_datetime_for_reference(
+            str(active.get("deadline_at") or ""),
+            reference=now,
+            timezone_name=self.resolve_user_timezone_name(user),
+        )
+        if deadline is None or now <= deadline:
+            return False
+        if session.clocked_out_at or session.stage == "clocked_out":
+            self._finish_short_rest_break(
+                session,
+                deadline,
+                outcome="already_clocked_out",
+                detected_at=now,
+            )
+            return True
+        note = await self._finalize_clickup_day(
+            user,
+            session,
+            deadline,
+            allow_status_completion=False,
+            include_next_task_suggestion=False,
+            pause_reason="auto_clock_out_short_rest_limit",
+        )
+        session.clocked_out_at = deadline.isoformat()
+        self._close_current_work_segment(session, deadline)
+        session.stage = "clocked_out"
+        session.pending_clickup_sync = True
+        session.metadata["auto_clock_out_at"] = deadline.isoformat()
+        session.metadata["auto_clock_out_reference_at"] = str(active.get("started_at") or "")
+        session.metadata["auto_clock_out_reason"] = (
+            f"No return check-in within the {self.config.labor.short_rest_break_minutes}-minute short-rest limit."
+        )
+        if note:
+            session.metadata["auto_clock_out_note"] = note
+        self._finish_short_rest_break(
+            session,
+            deadline,
+            outcome="auto_clocked_out",
+            detected_at=now,
+        )
+        self._refresh_session_time_summary(session, deadline)
+        worked_seconds = int(session.time_summary.get("clocked_in_total_seconds") or 0)
+        self._append_compliance_event(
+            session,
+            event_type="short_rest_auto_clocked_out",
+            now=now,
+            worked_seconds=worked_seconds,
+        )
+        deadline_label = deadline.strftime("%I:%M %p").lstrip("0")
+        await self._send_dm(
+            client,
+            user,
+            session,
+            (
+                f"Your paid short rest reached {self.config.labor.short_rest_break_minutes} minutes "
+                f"without a return check-in, so I clocked you out effective {deadline_label}. "
+                "Reply `clock me back in` before doing more work."
+            ),
+            now,
+        )
+        return True
+
+    async def _maybe_enforce_portal_quality_warning(
+        self,
+        client: discord.Client | None,
+        user: UserProfile,
+        session: SessionState,
+        now: datetime,
+    ) -> bool:
+        warning = session.metadata.get(_PORTAL_QUALITY_WARNING_KEY)
+        if not isinstance(warning, dict):
+            return False
+        deadline = self._coerce_datetime_for_reference(
+            str(warning.get("deadline_at") or ""),
+            reference=now,
+            timezone_name=self.resolve_user_timezone_name(user),
+        )
+        if deadline is None:
+            session.metadata.pop(_PORTAL_QUALITY_WARNING_KEY, None)
+            return True
+        if now < deadline:
+            return False
+        if session.clocked_out_at or session.stage == "clocked_out":
+            session.metadata.pop(_PORTAL_QUALITY_WARNING_KEY, None)
+            return True
+        note = await self._finalize_clickup_day(
+            user,
+            session,
+            deadline,
+            allow_status_completion=False,
+            include_next_task_suggestion=False,
+            pause_reason="portal_quality_timeout",
+        )
+        session.clocked_out_at = deadline.isoformat()
+        self._close_current_work_segment(session, deadline)
+        session.stage = "clocked_out"
+        session.awaiting_clock_out_photo = False
+        session.awaiting_clock_out_summary = False
+        session.pending_clickup_sync = True
+        reasons = [str(item) for item in warning.get("reasons") or [] if str(item).strip()]
+        block = {
+            "clocked_out_at": deadline.isoformat(),
+            "detected_at": now.isoformat(),
+            "context": str(warning.get("context") or "work detail"),
+            "reasons": reasons[:4],
+            "status": "manager_approval_required",
+        }
+        session.metadata[_PORTAL_QUALITY_RESTART_BLOCK_KEY] = block
+        session.metadata.pop(_PORTAL_QUALITY_WARNING_KEY, None)
+        session.metadata["auto_clock_out_at"] = deadline.isoformat()
+        session.metadata["auto_clock_out_reference_at"] = str(warning.get("started_at") or "")
+        session.metadata["auto_clock_out_reason"] = "Worker portal quality correction deadline expired."
+        if note:
+            session.metadata["auto_clock_out_note"] = note
+        self._refresh_session_time_summary(session, deadline)
+        worked_seconds = int(session.time_summary.get("clocked_in_total_seconds") or 0)
+        self._append_compliance_event(
+            session,
+            event_type="portal_quality_auto_clocked_out",
+            now=now,
+            worked_seconds=worked_seconds,
+        )
+        try:
+            await self._send_dm(
+                client,
+                user,
+                session,
+                (
+                    "The 10-minute work-detail correction deadline passed, so I stopped future time "
+                    f"effective {deadline.strftime('%I:%M %p').lstrip('0')}. Time already recorded remains intact. "
+                    "Stop work now and contact Erik or George with a concrete corrected plan. "
+                    "A manager must approve the restart. Report any work already performed after the stop so the time record can be corrected."
+                ),
+                now,
+            )
+        except Exception:
+            logger.exception("Failed to send portal quality clock-out notice to %s.", user.user_key)
+        return True
+
+    async def _maybe_check_meal_compliance(
+        self,
+        client: discord.Client,
+        user: UserProfile,
+        session: SessionState,
+        now: datetime,
+    ) -> bool:
+        if (
+            not self.config.labor.enabled
+            or not user.time_tracking_required
+            or not user.meal_tracking_required
+            or not session.clocked_in_at
+            or session.clocked_out_at
+            or session.metadata.get("lunch_started_at")
+        ):
+            return False
+        gross_seconds = self._work_segment_total_seconds(session, now)
+        warning_seconds = round(self.config.labor.meal_warning_after_hours * 60 * 60)
+        auto_pause_seconds = round(self.config.labor.meal_auto_pause_after_hours * 60 * 60)
+        changed = False
+        if (
+            gross_seconds >= warning_seconds
+            and gross_seconds < auto_pause_seconds
+            and not session.metadata.get("meal_guidance_delivered_at")
+            and not session.metadata.get("meal_compliance_warning_at")
+        ):
+            remaining_seconds = max(0, auto_pause_seconds - gross_seconds)
+            remaining_minutes = max(1, round(remaining_seconds / 60))
+            await self._send_dm(
+                client,
+                user,
+                session,
+                (
+                    f"Lunch warning: you have {remaining_minutes} minute"
+                    f"{'s' if remaining_minutes != 1 else ''} to begin your meal break. "
+                    "If you do not start lunch, I will pause your work time automatically "
+                    "at the meal deadline."
+                ),
+                now,
+            )
+            session.metadata["meal_compliance_warning_at"] = now.isoformat()
+            self._append_compliance_event(
+                session,
+                event_type="meal_warning_sent",
+                now=now,
+                worked_seconds=gross_seconds,
+            )
+            changed = True
+        if gross_seconds >= auto_pause_seconds and not session.metadata.get("meal_auto_pause_at"):
+            started = await self._maybe_start_lunch_break(
+                client,
+                user,
+                session,
+                now,
+                automatic=True,
+            )
+            if not started or session.stage != "on_lunch_break":
+                return changed
+            session.metadata["meal_auto_pause_at"] = now.isoformat()
+            self._append_compliance_event(
+                session,
+                event_type="meal_auto_paused",
+                now=now,
+                worked_seconds=gross_seconds,
+            )
+            changed = True
+        return changed
+
+    async def _maybe_check_overtime_compliance(
+        self,
+        client: discord.Client,
+        user: UserProfile,
+        session: SessionState,
+        now: datetime,
+    ) -> bool:
+        if (
+            not self.config.labor.enabled
+            or not user.time_tracking_required
+            or not user.overtime_approval_required
+            or not session.clocked_in_at
+            or session.clocked_out_at
+            or session.metadata.get("overtime_approved_at")
+            or not self._overtime_coaching_applies(user)
+        ):
+            return False
+        self._refresh_session_time_summary(session, now)
+        worked_seconds = int(session.time_summary.get("clocked_in_total_seconds") or 0)
+        limit_seconds = round(self.config.labor.overtime_limit_hours * 60 * 60)
+        warning_seconds = max(
+            0,
+            limit_seconds - self.config.labor.overtime_warning_minutes * 60,
+        )
+        changed = False
+        if worked_seconds >= warning_seconds and worked_seconds < limit_seconds and not session.metadata.get(
+            "overtime_warning_at"
+        ):
+            await self._send_dm(
+                client,
+                user,
+                session,
+                (
+                    f"Overtime warning: you have {self.config.labor.overtime_warning_minutes} minutes "
+                    "left before the configured daily limit. Please wrap up and clock out, or get "
+                    "admin approval before continuing."
+                ),
+                now,
+            )
+            session.metadata["overtime_warning_at"] = now.isoformat()
+            self._append_compliance_event(
+                session,
+                event_type="overtime_warning_sent",
+                now=now,
+                worked_seconds=worked_seconds,
+            )
+            changed = True
+        if worked_seconds >= limit_seconds and not session.metadata.get("overtime_admin_alert_at"):
+            worked_label = self._format_duration(worked_seconds)
+            automatically_clocked_out = self.config.labor.auto_clock_out_at_overtime_limit
+            if automatically_clocked_out:
+                note = await self._finalize_clickup_day(
+                    user,
+                    session,
+                    now,
+                    allow_status_completion=False,
+                    include_next_task_suggestion=False,
+                    pause_reason="auto_clock_out_overtime_limit",
+                )
+                session.clocked_out_at = now.isoformat()
+                self._close_current_work_segment(session, now)
+                session.stage = "clocked_out"
+                session.pending_clickup_sync = True
+                session.metadata["auto_clock_out_at"] = now.isoformat()
+                session.metadata["auto_clock_out_reason"] = "Configured overtime limit reached."
+                if note:
+                    session.metadata["auto_clock_out_note"] = note
+                message = (
+                    f"You reached {worked_label} of recorded work today, so I automatically "
+                    "clocked you out to prevent unapproved overtime. "
+                    "Do not resume work until Erik or George approves more time."
+                )
+            else:
+                message = (
+                    f"You reached {worked_label} of recorded work today. Stop work and clock out "
+                    "unless Erik or George has approved more time."
+                )
+            await self._send_dm(
+                client,
+                user,
+                session,
+                message,
+                now,
+            )
+            if not automatically_clocked_out:
+                await self._safe_send_compliance_admin_notice(
+                    client,
+                    (
+                        f"Unresolved overtime risk: {user.display_name} reached "
+                        f"{self._format_duration(worked_seconds)} of recorded work for "
+                        f"{session.session_date} without a stored approval, and automatic "
+                        "clock-out is disabled."
+                    ),
+                    user=user,
+                    session=session,
+                )
+            session.metadata["overtime_admin_alert_at"] = now.isoformat()
+            self._append_compliance_event(
+                session,
+                event_type=(
+                    "overtime_auto_clocked_out"
+                    if automatically_clocked_out
+                    else "overtime_threshold_crossed"
+                ),
+                now=now,
+                worked_seconds=worked_seconds,
+            )
+            changed = True
+        return changed
+
+    def _meal_period_deadline(
+        self,
+        session: SessionState,
+        user: UserProfile,
+        now: datetime,
+    ) -> datetime | None:
+        bounds = self._work_segment_bounds(session, now)
+        if not bounds:
+            return None
+        started_at = min(start for start, _end in bounds)
+        timezone_name = self.resolve_user_timezone_name(user)
+        if started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=resolve_timezone(timezone_name))
+        return started_at.astimezone(resolve_timezone(timezone_name)) + timedelta(hours=5)
+
+    def _overtime_coaching_applies(self, user: UserProfile) -> bool:
+        return user.overtime_approval_required
+
+    def _post_lunch_clock_out_guidance(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        now: datetime,
+    ) -> str:
+        if (
+            not self.config
+            or user.worker_type == "intern"
+            or not self._overtime_coaching_applies(user)
+        ):
+            return ""
+        self._refresh_session_time_summary(session, now)
+        paid_seconds = int(session.time_summary.get("clocked_in_total_seconds") or 0)
+        limit_seconds = round(self.config.labor.overtime_limit_hours * 60 * 60)
+        remaining_seconds = max(0, limit_seconds - paid_seconds)
+        projected_clock_out = now + timedelta(seconds=remaining_seconds)
+        projected_label = projected_clock_out.strftime("%I:%M %p").lstrip("0")
+        if remaining_seconds <= 0:
+            return (
+                "You are already at the configured daily approval threshold. "
+                "Please clock out now unless additional time has been approved."
+            )
+        return (
+            f"To stay below {self.config.labor.overtime_limit_hours:g} recorded hours, "
+            f"plan to clock out by about {projected_label} unless additional time is approved."
+        )
+
+    def _append_compliance_event(
+        self,
+        session: SessionState,
+        *,
+        event_type: str,
+        now: datetime,
+        worked_seconds: int,
+    ) -> None:
+        events = session.metadata.setdefault("compliance_events", [])
+        if not isinstance(events, list):
+            events = []
+            session.metadata["compliance_events"] = events
+        events.append(
+            {
+                "event_type": event_type,
+                "recorded_at": now.isoformat(),
+                "worked_seconds": worked_seconds,
+            }
+        )
+
+    async def _safe_send_compliance_admin_notice(
+        self,
+        client: discord.Client,
+        content: str,
+        *,
+        user: UserProfile,
+        session: SessionState,
+    ) -> None:
+        try:
+            await self._send_admin_notice(
+                client,
+                content,
+                user=user,
+                session=session,
+            )
+        except Exception:
+            logger.exception("Could not send compliance admin notice for %s.", user.user_key)
+
+    async def approve_same_day_overtime(
+        self,
+        client: discord.Client,
+        user: UserProfile,
+        session: SessionState,
+        *,
+        approved_by: str,
+        comments: str,
+        now: datetime | None = None,
+    ) -> str:
+        if not user.overtime_approval_required:
+            return f"{user.display_name} is not configured for overtime approval."
+        if session.metadata.get("overtime_approved_at"):
+            prior = str(session.metadata.get("overtime_approved_by") or "an admin")
+            return f"Overtime for {user.display_name} was already approved by {prior}."
+        approval_reason = comments.strip()
+        if not approval_reason:
+            return "An overtime approval reason is required."
+        reference_now = now or self.resolve_user_local_now(user)
+        previous_session = self._clone_session_state(session)
+        self._refresh_session_time_summary(session, reference_now)
+        worked_seconds = int(
+            session.time_summary.get("clocked_in_total_seconds") or 0
+        )
+        session.metadata["overtime_approved_at"] = reference_now.isoformat()
+        session.metadata["overtime_approved_by"] = approved_by
+        session.metadata["overtime_approval_note"] = approval_reason
+        self._append_compliance_event(
+            session,
+            event_type="overtime_approved",
+            now=reference_now,
+            worked_seconds=worked_seconds,
+        )
+        await self._send_dm(
+            client,
+            user,
+            session,
+            (
+                f"{approved_by} approved additional work time for today: {approval_reason} "
+                "You may clock back in, confirm the ClickUp task, and continue."
+            ),
+            reference_now,
+        )
+        normalized_approver = self._normalize_identifier_value(approved_by)
+        other_approvers = [
+            admin
+            for admin in self._task_approval_admins()
+            if self._normalize_identifier_value(admin.name) != normalized_approver
+        ]
+        if other_approvers:
+            await self._send_admin_notice(
+                client,
+                (
+                    f"{approved_by} approved same-day overtime for {user.display_name} "
+                    f"({session.session_date}). Reason: {approval_reason}"
+                ),
+                target_admins=other_approvers,
+                user=user,
+                session=session,
+            )
+        await self._persist_session_state(
+            user,
+            session,
+            now=reference_now,
+            previous_session=previous_session,
+            trigger="overtime_approval",
+            details={
+                "approved_by": approved_by,
+                "approval_reason_excerpt": self._excerpt_text(approval_reason),
+                "worked_seconds_at_approval": worked_seconds,
+            },
+        )
+        await self.write_dashboard()
+        return (
+            f"Approved same-day overtime for {user.display_name}. "
+            "The worker and the other configured approver were notified."
+        )
+
+    async def approve_portal_quality_restart(
+        self,
+        client: discord.Client | None,
+        user: UserProfile,
+        session: SessionState,
+        *,
+        approved_by: str,
+        comments: str,
+        now: datetime | None = None,
+    ) -> str:
+        block = session.metadata.get(_PORTAL_QUALITY_RESTART_BLOCK_KEY)
+        if not isinstance(block, dict):
+            return f"{user.display_name} does not have a quality-based restart block."
+        approval_reason = comments.strip()
+        if not approval_reason:
+            return "A reviewed correction or restart reason is required."
+        reference_now = now or self.resolve_user_local_now(user)
+        previous_session = self._clone_session_state(session)
+        session.metadata.pop(_PORTAL_QUALITY_RESTART_BLOCK_KEY, None)
+        session.metadata.pop(_PORTAL_QUALITY_WARNING_KEY, None)
+        self._clear_auto_clock_out_metadata(session)
+        approvals = session.metadata.setdefault("portal_quality_restart_approvals", [])
+        if isinstance(approvals, list):
+            approvals.append(
+                {
+                    "approved_at": reference_now.isoformat(),
+                    "approved_by": approved_by,
+                    "comments": approval_reason,
+                    "prior_block": block,
+                }
+            )
+            del approvals[:-20]
+        self._refresh_session_time_summary(session, reference_now)
+        self._append_compliance_event(
+            session,
+            event_type="portal_quality_restart_approved",
+            now=reference_now,
+            worked_seconds=int(session.time_summary.get("clocked_in_total_seconds") or 0),
+        )
+        await self._send_dm(
+            client,
+            user,
+            session,
+            (
+                f"{approved_by} reviewed your correction and approved a tracked-work restart: "
+                f"{approval_reason} You may clock back in, confirm the task, and continue."
+            ),
+            reference_now,
+        )
+        await self._persist_session_state(
+            user,
+            session,
+            now=reference_now,
+            previous_session=previous_session,
+            trigger="portal_quality_restart_approval",
+            details={
+                "approved_by": approved_by,
+                "approval_reason_excerpt": self._excerpt_text(approval_reason),
+            },
+        )
+        await self.write_dashboard()
+        return f"Approved tracked-work restart for {user.display_name}; the worker was notified."
 
     def _pending_follow_up(self, session: SessionState) -> dict[str, Any] | None:
         raw = session.metadata.get(_PENDING_FOLLOW_UP_KEY)
@@ -1549,6 +3374,12 @@ class InternManagementRuntime:
         if getattr(signals, "clocked_in", False) or getattr(signals, "clocking_out", False):
             return False
         if getattr(signals, "starting_lunch", False) or getattr(signals, "ending_lunch", False):
+            return False
+        if getattr(signals, "starting_short_rest", False) or getattr(
+            signals,
+            "ending_short_rest",
+            False,
+        ):
             return False
         if getattr(signals, "recovered", False):
             return False
@@ -1633,7 +3464,12 @@ class InternManagementRuntime:
     ) -> bool:
         if session.stage != "on_lunch_break" or session.clocked_out_at:
             return False
-        last_prompt_at = self._metadata_datetime(session, "lunch_last_prompt_at")
+        last_prompt_at = self._metadata_datetime(
+            session,
+            "lunch_last_prompt_at",
+            reference=now,
+            timezone_name=self.resolve_user_timezone_name(user),
+        )
         if last_prompt_at and now - last_prompt_at < timedelta(minutes=self.config.schedule.follow_up_interval_minutes):
             return False
         await self._send_dm(client, user, session, self.config.prompts.lunch_break_check_in, now)
@@ -1658,14 +3494,16 @@ class InternManagementRuntime:
                     "What is the next step or blocker?",
                 ]
             return (
-                "I still cannot tell what actually changed from that update. Be concrete.\n\n"
+                "Thanks for checking in. I just need one concrete detail for the project record.\n\n"
                 + "\n".join(f"{index}. {question}" for index, question in enumerate(cleaned, start=1))
+                + "\n\nOne concise reply is enough; you are still clocked in."
             )
         if not cleaned:
             cleaned = self._default_progress_probe_questions()
         return (
-            "I still cannot tell what progress was made from that update, so I need a more specific check-in before I count it as project progress.\n\n"
+            "Thanks for checking in. I need one concrete detail before I can count this as project progress.\n\n"
             + "\n".join(f"{index}. {question}" for index, question in enumerate(cleaned, start=1))
+            + "\n\nOne concise reply is enough; you are still clocked in."
         )
 
     def _progress_probe_closure_message(self, reason: str) -> str:
@@ -1675,6 +3513,7 @@ class InternManagementRuntime:
             "converted_to_finish_confirmation": "Probe closed: moved into task-finish confirmation.",
             "converted_to_lunch": "Probe closed: moved into lunch-break handling.",
             "converted_to_clock_out": "Probe closed: moved into clock-out handling.",
+            "interrupted_by_self_lookup": "Probe closed: interrupted by a self-hours or self-status lookup.",
             "probe_exhausted": "Probe closed: still no concrete progress detail after follow-up.",
             "timed_out": "Probe closed: no reply to the progress probe for 30 minutes.",
             "session_reset": "Probe closed: session state was reset or superseded.",
@@ -1824,25 +3663,9 @@ class InternManagementRuntime:
             message_id=sent.message_id if isinstance(sent, MessageRecord) else None,
         )
         prompt["last_activity_at"] = now.isoformat()
-        await self._send_admin_notice(
-            client,
-            (
-                f"{user.display_name} sent a weak scheduled check-in reply.\n\n"
-                f"Scheduled follow-up:\n{str(aggregate.get('question_text') or 'Unknown question')}\n\n"
-                f"Aggregated reply after the 1-minute wait:\n{original_reply_text or 'No text captured.'}\n\n"
-                f"Reason: {reason}\n\n"
-                "Would you like to see their response to the progress probe?"
-            ),
-            user=user,
-            session=session,
-            view_factory=lambda admin: _AdminProgressProbeView(
-                self,
-                admin,
-                user_key=user.user_key,
-                session_date=session.session_date,
-                probe_id=probe_id,
-            ),
-        )
+        # A vague check-in is coaching context, not an admin exception. Managers
+        # are only pulled in by a blocker, a real labor/compliance exception, or
+        # an explicit worker request.
 
     async def _maybe_assess_pending_follow_up_probe(
         self,
@@ -1851,15 +3674,33 @@ class InternManagementRuntime:
         session: SessionState,
         now: datetime,
     ) -> bool:
+        if session.stage == "awaiting_clock_out_artifacts":
+            return False
+        if self._self_lookup_prompt(session):
+            return False
         aggregate = self._pending_follow_up_aggregation(session)
         if not aggregate or self._progress_probe_prompt(session):
             return False
-        last_reply_at = self._coerce_datetime(str(aggregate.get("last_reply_at") or ""))
+        last_reply_at = self._coerce_datetime_for_reference(
+            str(aggregate.get("last_reply_at") or ""),
+            reference=now,
+            timezone_name=self.resolve_user_timezone_name(user),
+        )
         if not last_reply_at or now - last_reply_at < _FOLLOW_UP_PROBE_GRACE_WINDOW:
             return False
         combined_text = self._combined_follow_up_reply_text(aggregate)
         if not combined_text and int(aggregate.get("attachment_count") or 0) > 0:
-            self._clear_follow_up_probe_tracking(session)
+            self._record_checkpoint_quality(
+                session,
+                now,
+                meaningful=True,
+                source="scheduled_check_in_attachment",
+            )
+            self._renew_checkpoint_after_response(
+                session,
+                now,
+                source="scheduled_check_in_attachment",
+            )
             return True
         if not combined_text:
             self._clear_follow_up_probe_tracking(session)
@@ -1876,7 +3717,17 @@ class InternManagementRuntime:
         )
         session.latest_status = combined_text
         if assessment.meaningful_progress or not assessment.needs_probe:
-            self._clear_follow_up_probe_tracking(session)
+            self._record_checkpoint_quality(
+                session,
+                now,
+                meaningful=True,
+                source="scheduled_check_in",
+            )
+            self._renew_checkpoint_after_response(
+                session,
+                now,
+                source="scheduled_check_in_reply",
+            )
             return True
         await self._start_progress_probe(
             client,
@@ -1896,10 +3747,16 @@ class InternManagementRuntime:
         session: SessionState,
         now: datetime,
     ) -> bool:
+        if session.stage == "awaiting_clock_out_artifacts":
+            return False
         prompt = self._progress_probe_prompt(session)
         if not prompt:
             return False
-        last_activity_at = self._coerce_datetime(str(prompt.get("last_activity_at") or ""))
+        last_activity_at = self._coerce_datetime_for_reference(
+            str(prompt.get("last_activity_at") or ""),
+            reference=now,
+            timezone_name=self.resolve_user_timezone_name(user),
+        )
         if not last_activity_at or now - last_activity_at < _PROGRESS_PROBE_TIMEOUT:
             return False
         await self._close_progress_probe(
@@ -1913,18 +3770,37 @@ class InternManagementRuntime:
 
     async def _maybe_auto_clock_out_inactive(
         self,
+        client: discord.Client | None,
         user: UserProfile,
         session: SessionState,
         now: datetime,
     ) -> bool:
-        if not self.config or not session.clocked_in_at or session.clocked_out_at:
-            return False
-        if session.stage == "on_lunch_break":
-            return False
-        reference_at = self._last_inbound_check_in_at(session)
+        reference_at = self._inactivity_auto_clock_out_reference_at(
+            user,
+            session,
+            reference=now,
+        )
         if not reference_at:
             return False
         if now - reference_at < timedelta(hours=self.config.schedule.auto_clock_out_after_hours):
+            return False
+        reference_at = await self._inactivity_reference_with_clickup_activity(
+            user,
+            session,
+            reference_at=reference_at,
+            now=now,
+        )
+        if now - reference_at < timedelta(hours=self.config.schedule.auto_clock_out_after_hours):
+            return False
+        warning_state = self._auto_clock_out_warning_state(session)
+        if not warning_state or str(warning_state.get("reference_at") or "") != reference_at.isoformat():
+            return False
+        warning_deadline = self._coerce_datetime_for_reference(
+            str(warning_state.get("auto_clock_out_at") or ""),
+            reference=now,
+            timezone_name=self.resolve_user_timezone_name(user),
+        )
+        if warning_deadline is None or now < warning_deadline:
             return False
         note = await self._finalize_clickup_day(
             user,
@@ -1945,6 +3821,92 @@ class InternManagementRuntime:
         )
         if note:
             session.metadata["auto_clock_out_note"] = note
+        if client is not None:
+            try:
+                await self._send_dm(
+                    client,
+                    user,
+                    session,
+                    _AUTO_CLOCK_OUT_NOTIFICATION_MESSAGE,
+                    now,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to send auto clock-out notification to user %s (%s)",
+                    user.user_key,
+                    user.display_name,
+                )
+        return True
+
+    async def _maybe_send_auto_clock_out_warning(
+        self,
+        client: discord.Client,
+        user: UserProfile,
+        session: SessionState,
+        now: datetime,
+    ) -> bool:
+        if not self.config or self.config.schedule.auto_clock_out_after_hours <= 0:
+            return False
+        reference_at = self._inactivity_auto_clock_out_reference_at(
+            user,
+            session,
+            reference=now,
+        )
+        if not reference_at:
+            return False
+        auto_clock_out_at = reference_at + timedelta(hours=self.config.schedule.auto_clock_out_after_hours)
+        warning_minutes = self.config.schedule.auto_clock_out_warning_minutes
+        warning_at = auto_clock_out_at - timedelta(minutes=warning_minutes)
+        if now < warning_at:
+            return False
+        reference_at = await self._inactivity_reference_with_clickup_activity(
+            user,
+            session,
+            reference_at=reference_at,
+            now=now,
+        )
+        auto_clock_out_at = reference_at + timedelta(
+            hours=self.config.schedule.auto_clock_out_after_hours
+        )
+        warning_at = auto_clock_out_at - timedelta(minutes=warning_minutes)
+        if now < warning_at:
+            return False
+        warning_state = self._auto_clock_out_warning_state(session)
+        reference_key = reference_at.isoformat()
+        if warning_state and str(warning_state.get("reference_at") or "") == reference_key:
+            return False
+        warning_deadline = (
+            auto_clock_out_at
+            if now < auto_clock_out_at
+            else now + timedelta(minutes=warning_minutes)
+        )
+        remaining_seconds = max(0, int((warning_deadline - now).total_seconds()))
+        remaining_minutes = max(1, (remaining_seconds + 59) // 60)
+        try:
+            await self._send_dm(
+                client,
+                user,
+                session,
+                (
+                    "Quick check-in: I have not seen an update for a while. "
+                    "If you are still working, send a short note about what changed or reply "
+                    f"`still working`. If I do not hear back within {remaining_minutes} minutes, "
+                    "I will pause the timer so the record stays accurate."
+                ),
+                now,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to send auto clock-out warning to user %s (%s)",
+                user.user_key,
+                user.display_name,
+            )
+            return False
+        session.metadata[_AUTO_CLOCK_OUT_WARNING_KEY] = {
+            "reference_at": reference_key,
+            "warning_sent_at": now.isoformat(),
+            "auto_clock_out_at": warning_deadline.isoformat(),
+        }
         return True
 
     async def _maybe_alert_admin(
@@ -1956,12 +3918,18 @@ class InternManagementRuntime:
     ) -> bool:
         if not session.stuck_since or session.stuck_alerted_at:
             return False
-        stuck_since = datetime.fromisoformat(session.stuck_since)
+        stuck_since = self._coerce_datetime_for_reference(
+            session.stuck_since,
+            reference=now,
+            timezone_name=self.resolve_user_timezone_name(user),
+        )
+        if not stuck_since:
+            return False
         if now - stuck_since < timedelta(hours=self.config.schedule.stuck_alert_after_hours):
             return False
         sent_to = await self._send_admin_notice(
             client,
-            f"{user.display_name} has appeared stuck since {format_admin_datetime(session.stuck_since, reference=now)}. "
+            f"{user.display_name} has appeared stuck since {format_admin_datetime(stuck_since, reference=now)}. "
             f"Latest blocker: {session.latest_blocker or 'No blocker text captured.'}",
             user=user,
             session=session,
@@ -1977,14 +3945,28 @@ class InternManagementRuntime:
         session: SessionState,
         now: datetime,
     ) -> bool:
+        if session.stage in {"awaiting_task_selection", "awaiting_clock_out_artifacts", "clocked_out"}:
+            return False
         prompt = session.metadata.get(_CLICKUP_PROMPT_KEY)
-        if isinstance(prompt, dict) and str(prompt.get("type") or "") in {"task_onboarding", "progress_probe"}:
+        if isinstance(prompt, dict) and str(prompt.get("type") or "") in {
+            "task_onboarding",
+            "task_creation",
+            "task_creation_pending_approval",
+            "progress_probe",
+        }:
             return False
         if self._pending_follow_up(session) or self._pending_follow_up_aggregation(session):
             return False
         if not session.pending_clickup_sync or not session.last_user_message_at:
             return False
-        if now - datetime.fromisoformat(session.last_user_message_at) < timedelta(
+        last_user_message_at = self._coerce_datetime_for_reference(
+            session.last_user_message_at,
+            reference=now,
+            timezone_name=self.resolve_user_timezone_name(user),
+        )
+        if not last_user_message_at:
+            return False
+        if now - last_user_message_at < timedelta(
             minutes=self.config.schedule.inactivity_minutes
         ):
             return False
@@ -2012,21 +3994,52 @@ class InternManagementRuntime:
         *,
         force: bool,
     ) -> bool:
+        if session.stage in {"awaiting_task_selection", "awaiting_clock_out_artifacts"}:
+            return False
         messages = self.list_session_messages(user.user_key, session)
         if session.last_clickup_sync_at and not force:
-            cutoff = datetime.fromisoformat(session.last_clickup_sync_at)
-            messages = [message for message in messages if message.created_at > cutoff]
+            cutoff = self._coerce_datetime(
+                session.last_clickup_sync_at,
+                timezone_name=self.resolve_user_timezone_name(user),
+        )
+            if cutoff:
+                messages = [message for message in messages if message.created_at > cutoff]
         if not messages and not force:
             return False
-        clickup_bundle = await self._get_clickup_context(user, session, messages)
-        self._remember_clickup_context(session, clickup_bundle)
+        tracking = await self._get_task_tracking_state(user, session)
+        self._reconcile_active_task_with_tracking(session, tracking)
+        authoritative_task_id = self._authoritative_active_task_id(session, tracking=tracking)
+        if not authoritative_task_id:
+            return False
+        authoritative_task_name = str(
+            tracking.get("timer_task_name")
+            or session.metadata.get("active_clickup_task_name")
+            or ""
+        ) or None
+        authoritative_selection_reason = str(session.metadata.get("clickup_selection_reason") or "") or None
+        clickup_bundle = await self._get_clickup_context(
+            user,
+            session,
+            messages,
+            preferred_task_id=authoritative_task_id,
+            preferred_task_name=authoritative_task_name,
+            preferred_selection_reason=authoritative_selection_reason,
+        )
+        self._remember_clickup_context(
+            session,
+            clickup_bundle,
+            preserve_active_task=bool(authoritative_task_id),
+        )
         summary = await self.advisor.summarize_updates(user, session, messages, clickup_bundle.context)
         workspace = await self.store.ensure_user_workspace(user, session.session_date)
         comment_text = build_clickup_update(user, session, summary, str(workspace.daily_dir))
         if self.clickup:
+            target_task_id = authoritative_task_id or clickup_bundle.active_task_id
+            if not target_task_id:
+                return False
             task_id = await self.clickup.post_update(
                 user,
-                clickup_bundle.active_task_id,
+                target_task_id,
                 comment_text,
                 summary,
                 int(now.timestamp() * 1000),
@@ -2040,6 +4053,1016 @@ class InternManagementRuntime:
         session.pending_clickup_sync = False
         return True
 
+    async def _maybe_post_slack_daily_update(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        now: datetime,
+    ) -> bool:
+        slack_client = getattr(self, "slack", None)
+        if not self.config or not slack_client or not self.config.slack.daily_updates_enabled:
+            return False
+        if not self.is_user_scheduled_to_work(user, now) and not session.clocked_in_at:
+            return False
+        if not (self.config.slack.post_start_hour <= now.hour < self.config.slack.post_end_hour):
+            return False
+        state = self._load_slack_update_state()
+        last_global_post_at = self._coerce_datetime_for_reference(
+            str(state.get("last_daily_post_at") or ""),
+            reference=now,
+            timezone_name=self.runtime_timezone_name(),
+        )
+        if last_global_post_at and now - last_global_post_at < timedelta(minutes=self.config.slack.min_post_interval_minutes):
+            return False
+        messages = self.list_session_messages(user.user_key, session)
+        active_task_id = str(self._active_task_id(session) or "")
+        if not active_task_id:
+            if not session.clocked_in_at or session.clocked_out_at:
+                return False
+            recent_messages = self._fresh_interesting_slack_messages(messages, since=None)
+            images = self._fresh_interesting_slack_images(
+                messages,
+                previous_image_paths=set(),
+                since=None,
+            )
+            has_work_evidence = self._slack_update_has_anything_to_say(
+                session,
+                recent_messages,
+                images,
+                include_session_context=True,
+                blocker_changed=bool(session.latest_blocker),
+            )
+            if not has_work_evidence:
+                return False
+            clocked_in_at = self._coerce_datetime_for_reference(
+                str(session.clocked_in_at or ""),
+                reference=now,
+                timezone_name=self.resolve_user_timezone_name(user),
+            )
+            if (
+                not clocked_in_at
+                or now - clocked_in_at < _SLACK_MISSING_TASK_ESCALATION_DELAY
+            ):
+                return False
+            newly_recorded = self._record_unmapped_slack_update(
+                state,
+                user,
+                session,
+                now,
+            )
+            escalation_key = f"{user.user_key}:{session.session_date}"
+            escalations = state.setdefault("missing_task_escalations", {})
+            if not isinstance(escalations, dict):
+                escalations = {}
+                state["missing_task_escalations"] = escalations
+            if escalation_key not in escalations:
+                await self._report_operational_issue(
+                    category="slack_update_missing_task",
+                    severity="warning",
+                    summary=(
+                        f"{user.display_name} reported meaningful work but has not confirmed "
+                        "an active ClickUp task after 30 minutes."
+                    ),
+                    details={
+                        "user_key": user.user_key,
+                        "display_name": user.display_name,
+                        "session_date": session.session_date,
+                        "escalated_after_minutes": 30,
+                        "worker_prompted": True,
+                    },
+                    fingerprint_parts=(user.user_key, session.session_date),
+                    now=now,
+                )
+                escalations[escalation_key] = {
+                    "reported_at": now.isoformat(),
+                    "unmapped_update_recorded": newly_recorded,
+                }
+            self._write_slack_update_state(state)
+            return False
+        self._resolve_matching_operational_issue(
+            "slack_update_missing_task",
+            user_key=user.user_key,
+            session_date=session.session_date,
+            now=now,
+        )
+        channel_id, route_label, route_uncertain = await self._resolve_slack_daily_channel(
+            user,
+            session,
+            messages,
+        )
+        if not channel_id:
+            self._record_unmapped_slack_update(state, user, session, now)
+            self._write_slack_update_state(state)
+            return False
+        if route_uncertain:
+            newly_recorded = self._record_unmapped_slack_update(
+                state,
+                user,
+                session,
+                now,
+            )
+            if newly_recorded:
+                await self._report_operational_issue(
+                    category="slack_route_uncertain",
+                    severity="warning",
+                    summary=f"Slack project routing needs review for {user.display_name}.",
+                    details={
+                        "user_key": user.user_key,
+                        "display_name": user.display_name,
+                        "session_date": session.session_date,
+                        "active_task_id": self._active_task_id(session),
+                        "active_task_name": str(
+                            session.metadata.get("active_clickup_task_name") or ""
+                        ),
+                        "fallback_channel_id": channel_id,
+                    },
+                    fingerprint_parts=(
+                        user.user_key,
+                        str(self._active_task_id(session) or ""),
+                    ),
+                    now=now,
+                )
+            if self.config.slack.quarantine_uncertain_routes:
+                self._write_slack_update_state(state)
+                return False
+        else:
+            self._resolve_matching_operational_issue(
+                "slack_route_uncertain",
+                user_key=user.user_key,
+                active_task_id=active_task_id,
+                now=now,
+            )
+        previous_update = self._slack_daily_update_state(state, user.user_key, session.session_date)
+        if str(previous_update.get("active_task_id") or "") != active_task_id:
+            previous_update = {}
+        previous_posted_at = self._coerce_datetime_for_reference(
+            str(previous_update.get("posted_at") or ""),
+            reference=now,
+            timezone_name=self.resolve_user_timezone_name(user),
+        )
+        if previous_posted_at and now - previous_posted_at < _SLACK_USER_MIN_POST_INTERVAL:
+            return False
+        first_update = not bool(previous_update)
+        content_since = previous_posted_at
+        if first_update and session.intake_completed_at:
+            content_since = self._coerce_datetime_for_reference(
+                session.intake_completed_at,
+                reference=now,
+                timezone_name=self.resolve_user_timezone_name(user),
+            )
+        recent_messages = self._fresh_interesting_slack_messages(
+            messages,
+            since=content_since,
+        )
+        posted_text_fingerprints = {
+            str(value)
+            for value in previous_update.get("posted_text_fingerprints", [])
+            if str(value)
+        }
+        recent_messages = [
+            message
+            for message in recent_messages
+            if self._slack_text_fingerprint(message.content or "") not in posted_text_fingerprints
+        ]
+        previous_image_paths = {
+            str(value)
+            for value in previous_update.get("posted_image_paths", [])
+            if str(value)
+        }
+        images = self._fresh_interesting_slack_images(
+            messages,
+            previous_image_paths=previous_image_paths,
+            since=previous_posted_at,
+        )[: self.config.slack.max_images_per_update]
+        blocker_changed = bool(
+            session.latest_blocker
+            and session.latest_blocker != previous_update.get("latest_blocker")
+        )
+        if not self._slack_update_has_anything_to_say(
+            session,
+            recent_messages,
+            images,
+            include_session_context=first_update,
+            blocker_changed=blocker_changed,
+        ):
+            return False
+        factual_progress = await self._summarize_slack_progress_for_post(
+            user,
+            session,
+            recent_messages,
+            include_session_context=first_update,
+        )
+        message = self._build_slack_daily_update_message(
+            user,
+            session,
+            recent_messages,
+            images,
+            route_label=route_label,
+            route_uncertain=route_uncertain,
+            include_session_context=first_update,
+            blocker_changed=blocker_changed,
+            factual_progress=factual_progress,
+        )
+        text_fingerprints = set(posted_text_fingerprints)
+        text_fingerprints.update(
+            self._slack_text_fingerprint(message_record.content or "")
+            for message_record in recent_messages
+            if (message_record.content or "").strip()
+        )
+        if first_update:
+            text_fingerprints.update(
+                self._slack_text_fingerprint(value)
+                for value in (
+                    session.latest_status or "",
+                    session.latest_plan or "",
+                    session.latest_blocker or "",
+                )
+                if value.strip()
+            )
+        content_hash = hashlib.sha256(
+            json.dumps(
+                {
+                    "task_id": self._active_task_id(session),
+                    "texts": sorted(
+                        self._slack_text_fingerprint(message_record.content or "")
+                        for message_record in recent_messages
+                        if (message_record.content or "").strip()
+                    ),
+                    "images": [str(image.get("local_path") or "") for image in images],
+                    "blocker": session.latest_blocker if blocker_changed else "",
+                    "initial_status": session.latest_status if first_update else "",
+                    "initial_plan": session.latest_plan if first_update else "",
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        content_hash_history = {
+            str(value)
+            for value in previous_update.get("content_hash_history", [])
+            if str(value)
+        }
+        if previous_update.get("content_hash"):
+            content_hash_history.add(str(previous_update["content_hash"]))
+        if content_hash in content_hash_history:
+            return False
+        try:
+            root_message_ts = str(previous_update.get("root_message_ts") or "")
+            thread_ts = (
+                root_message_ts
+                if self.config.slack.thread_daily_updates and root_message_ts
+                else None
+            )
+            posted = await slack_client.post_message(
+                channel_id,
+                message,
+                thread_ts=thread_ts,
+            )
+        except Exception:
+            logger.exception("Failed to post Slack daily update for user %s.", user.user_key)
+            return False
+        message_ts = str(posted.get("ts") or "")
+        root_message_ts = str(previous_update.get("root_message_ts") or message_ts)
+        image_posts: list[dict[str, Any]] = []
+        for image in images:
+            image_path = Path(str(image.get("local_path") or ""))
+            if not image_path.exists():
+                continue
+            title = f"{user.display_name}: {image_path.name}"
+            try:
+                uploaded = await slack_client.upload_file(
+                    channel_id,
+                    image_path,
+                    title=title,
+                    initial_comment=self._slack_image_caption(user, session, image),
+                    thread_ts=(
+                        root_message_ts
+                        if self.config.slack.thread_daily_updates and root_message_ts
+                        else None
+                    ),
+                )
+            except Exception:
+                logger.exception("Failed to upload Slack image %s for user %s.", image_path, user.user_key)
+                continue
+            image_ts = self._extract_slack_file_message_ts(uploaded, channel_id)
+            image_posts.append(
+                {
+                    "user_key": user.user_key,
+                    "display_name": user.display_name,
+                    "session_date": session.session_date,
+                    "channel_id": channel_id,
+                    "message_ts": image_ts,
+                    "file_path": str(image_path),
+                    "title": title,
+                    "caption": self._slack_image_caption(user, session, image),
+                    "posted_at": now.isoformat(),
+                    "parent_message_ts": message_ts,
+                }
+            )
+        state["last_daily_post_at"] = now.isoformat()
+        daily_updates = state.setdefault("daily_updates", {})
+        if not isinstance(daily_updates, dict):
+            daily_updates = {}
+            state["daily_updates"] = daily_updates
+        user_updates = daily_updates.setdefault(user.user_key, {})
+        if not isinstance(user_updates, dict):
+            user_updates = {}
+            daily_updates[user.user_key] = user_updates
+        content_hash_history.add(content_hash)
+        previous_image_paths.update(
+            str(item.get("file_path") or "")
+            for item in image_posts
+            if str(item.get("file_path") or "")
+        )
+        user_updates[session.session_date] = {
+            "posted_at": now.isoformat(),
+            "channel_id": channel_id,
+            "route_label": route_label,
+            "route_uncertain": route_uncertain,
+            "message_ts": message_ts,
+            "root_message_ts": root_message_ts,
+            "active_task_id": str(self._active_task_id(session) or ""),
+            "active_task_name": str(
+                session.metadata.get("active_clickup_task_name") or ""
+            ),
+            "content_hash": content_hash,
+            "content_hash_history": sorted(content_hash_history),
+            "posted_text_fingerprints": sorted(text_fingerprints),
+            "posted_image_paths": sorted(previous_image_paths),
+            "latest_blocker": session.latest_blocker,
+            "image_posts": image_posts,
+        }
+        posted_images = state.setdefault("posted_images", [])
+        if not isinstance(posted_images, list):
+            posted_images = []
+            state["posted_images"] = posted_images
+        posted_images.extend(image_posts)
+        self._write_slack_update_state(state)
+        return True
+
+    async def _maybe_collect_slack_update_feedback(
+        self,
+        now: datetime,
+    ) -> int:
+        return await collect_slack_update_feedback(self, now)
+
+    async def _maybe_post_slack_weekly_photo_recap(self, base_now: datetime) -> bool:
+        slack_client = getattr(self, "slack", None)
+        if not self.config or not slack_client or not self.config.slack.weekly_recaps_enabled:
+            return False
+        now = base_now.astimezone(resolve_timezone(self.runtime_timezone_name()))
+        if now.weekday() != self.config.slack.weekly_recap_day or now.hour != self.config.slack.weekly_recap_hour:
+            return False
+        channel_id = (
+            self.config.slack.practice_channel_id
+            or self.config.slack.default_channel_id
+        )
+        if not channel_id:
+            return False
+        state = self._load_slack_update_state()
+        week_key = f"{now.isocalendar().year}-W{now.isocalendar().week:02d}"
+        recaps = state.setdefault("weekly_recaps", {})
+        if not isinstance(recaps, dict):
+            recaps = {}
+            state["weekly_recaps"] = recaps
+        if recaps.get(week_key):
+            return False
+        candidates = self._slack_recent_image_posts(state, now)
+        ranked: list[dict[str, Any]] = []
+        positive = {item.strip(":") for item in self.config.slack.positive_reactions}
+        for item in candidates:
+            item_channel_id = str(item.get("channel_id") or "")
+            message_ts = str(item.get("message_ts") or "")
+            if not item_channel_id or not message_ts:
+                continue
+            try:
+                reactions = await slack_client.get_reactions(item_channel_id, message_ts)
+            except Exception:
+                logger.exception("Failed to read Slack reactions for weekly recap image %s.", message_ts)
+                continue
+            score = 0
+            reaction_summary: list[str] = []
+            for reaction in reactions:
+                name = str(reaction.get("name") or "").strip(":")
+                count = int(reaction.get("count") or 0)
+                if count <= 0:
+                    continue
+                if name in positive:
+                    score += count
+                    reaction_summary.append(f":{name}: {count}")
+            if score > 0:
+                ranked.append({**item, "score": score, "reaction_summary": ", ".join(reaction_summary)})
+        ranked.sort(key=lambda item: (-int(item.get("score") or 0), str(item.get("posted_at") or "")))
+        if not ranked:
+            return False
+        lines = [
+            "*Top progress photos this week*",
+            "A few shots people reacted to most from Don Pollo updates:",
+            "",
+        ]
+        for index, item in enumerate(ranked[:10], start=1):
+            lines.append(
+                f"{index}. *{item.get('display_name') or item.get('user_key')}* "
+                f"({item.get('session_date')}): {item.get('caption') or item.get('title')} "
+                f"- {item.get('score')} positive reaction(s)"
+                + (f" [{item.get('reaction_summary')}]" if item.get("reaction_summary") else "")
+            )
+        try:
+            await slack_client.post_message(channel_id, "\n".join(lines))
+        except Exception:
+            logger.exception("Failed to post Slack weekly photo recap.")
+            return False
+        recaps[week_key] = now.isoformat()
+        self._write_slack_update_state(state)
+        return True
+
+    def _slack_daily_update_state(
+        self,
+        state: dict[str, Any],
+        user_key: str,
+        session_date: str,
+    ) -> dict[str, Any]:
+        daily = state.get("daily_updates")
+        if not isinstance(daily, dict):
+            return {}
+        user_updates = daily.get(user_key)
+        if not isinstance(user_updates, dict):
+            return {}
+        update = user_updates.get(session_date)
+        return update if isinstance(update, dict) else {}
+
+    async def _resolve_slack_daily_channel(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        messages: list[MessageRecord] | None = None,
+    ) -> tuple[str | None, str, bool]:
+        if not self.config:
+            return None, "", True
+        task_id = str(self._active_task_id(session) or "")
+        route_override = self._slack_route_override(
+            user_key=user.user_key,
+            session_date=session.session_date,
+            task_id=task_id,
+        )
+        if route_override:
+            return (
+                str(route_override.get("channel_id") or ""),
+                str(route_override.get("label") or "operator override"),
+                False,
+            )
+        task_name = str(session.metadata.get("active_clickup_task_name") or "")
+        task_ids = {task_id} if task_id else set()
+        task_names = [task_name] if task_name else []
+        list_ids: set[str] = set()
+        list_names: list[str] = []
+        folder_ids: set[str] = set()
+        folder_names: list[str] = []
+        content_values = self._slack_route_content_values(session, messages or [])
+        if task_id and self.clickup:
+            task_chain = await self._load_slack_task_ancestry(task_id)
+            for task in task_chain:
+                chain_task_id = str(task.get("id") or "")
+                chain_task_name = str(task.get("name") or "")
+                if chain_task_id:
+                    task_ids.add(chain_task_id)
+                if chain_task_name and chain_task_name not in task_names:
+                    task_names.append(chain_task_name)
+                task_list = task.get("list") if isinstance(task.get("list"), dict) else {}
+                list_id = str(task_list.get("id") or "")
+                list_name = str(task_list.get("name") or "")
+                if list_id:
+                    list_ids.add(list_id)
+                if list_name and list_name not in list_names:
+                    list_names.append(list_name)
+                task_folder = task.get("folder") if isinstance(task.get("folder"), dict) else {}
+                folder_id = str(task_folder.get("id") or "")
+                folder_name = str(task_folder.get("name") or "")
+                if folder_id:
+                    folder_ids.add(folder_id)
+                if folder_name and folder_name not in folder_names:
+                    folder_names.append(folder_name)
+        practice_channel_id = self.config.slack.practice_channel_id
+        route_matches: list[tuple[Any, bool, bool]] = []
+        for route in self.config.slack.project_routes:
+            task_id_match = task_ids.intersection(route.clickup_task_ids)
+            list_id_match = list_ids.intersection(route.clickup_list_ids)
+            folder_id_match = folder_ids.intersection(route.clickup_folder_ids)
+            task_name_match = self._slack_route_matches_any_name(
+                route.task_name_patterns,
+                task_names,
+            )
+            list_name_match = self._slack_route_matches_any_name(
+                route.list_name_patterns,
+                list_names,
+            )
+            folder_name_match = self._slack_route_matches_any_name(
+                route.folder_name_patterns,
+                folder_names,
+            )
+            content_match = self._slack_route_matches_any_name(
+                route.content_patterns,
+                content_values,
+            )
+            ancestry_match = bool(
+                task_id_match
+                or list_id_match
+                or folder_id_match
+                or task_name_match
+                or list_name_match
+                or folder_name_match
+            )
+            route_matches.append((route, bool(content_match), ancestry_match))
+        for require_content_match in (True, False):
+            for route, content_match, ancestry_match in route_matches:
+                if content_match != require_content_match:
+                    continue
+                if not content_match and not ancestry_match:
+                    continue
+                channel_id = practice_channel_id or route.channel_id
+                fallback_label = task_names[0] if task_names else task_id
+                return channel_id, route.label or fallback_label, False
+        if practice_channel_id:
+            return practice_channel_id, "mapping needed", True
+        if self.config.slack.unmapped_channel_id:
+            return self.config.slack.unmapped_channel_id, "mapping needed", True
+        return self.config.slack.default_channel_id, "default", not bool(self.config.slack.default_channel_id)
+
+    def _slack_route_override(
+        self,
+        *,
+        user_key: str,
+        session_date: str,
+        task_id: str,
+    ) -> dict[str, Any] | None:
+        load_state = getattr(
+            getattr(self, "state_store", None),
+            "get_operational_state",
+            None,
+        )
+        if not callable(load_state):
+            return None
+        overrides = load_state("slack_route_overrides") or {}
+        if not isinstance(overrides, dict):
+            return None
+        keys = []
+        if task_id:
+            keys.append(f"task:{task_id}")
+        keys.append(f"session:{user_key}:{session_date}")
+        for key in keys:
+            override = overrides.get(key)
+            if isinstance(override, dict) and override.get("channel_id"):
+                return override
+        return None
+
+    def set_slack_route_override(
+        self,
+        *,
+        user_key: str,
+        session_date: str,
+        task_id: str,
+        channel_id: str,
+        label: str,
+        resolved_by: str,
+    ) -> dict[str, Any]:
+        if not self.config:
+            raise RuntimeError("Configuration is not loaded.")
+        route = next(
+            (
+                item
+                for item in self.config.slack.project_routes
+                if item.channel_id == channel_id
+            ),
+            None,
+        )
+        if route is None:
+            raise ValueError("Choose a configured Slack project channel.")
+        key = f"task:{task_id}" if task_id else f"session:{user_key}:{session_date}"
+        load_state = getattr(self.state_store, "get_operational_state", None)
+        save_state = getattr(self.state_store, "set_operational_state", None)
+        if not callable(load_state) or not callable(save_state):
+            raise RuntimeError("Operational state storage is unavailable.")
+        overrides = load_state("slack_route_overrides") or {}
+        if not isinstance(overrides, dict):
+            overrides = {}
+        override = {
+            "user_key": user_key,
+            "session_date": session_date,
+            "task_id": task_id,
+            "channel_id": channel_id,
+            "label": label or route.label,
+            "resolved_by": resolved_by,
+            "resolved_at": datetime.now(
+                tz=resolve_timezone(self.runtime_timezone_name())
+            ).isoformat(),
+        }
+        overrides[key] = override
+        save_state("slack_route_overrides", overrides)
+        return override
+
+    def _slack_route_content_values(
+        self,
+        session: SessionState,
+        messages: list[MessageRecord],
+    ) -> list[str]:
+        values = [
+            str(session.latest_status or ""),
+            str(session.latest_plan or ""),
+            str(session.latest_blocker or ""),
+        ]
+        for message in messages:
+            if message.direction != "inbound":
+                continue
+            values.append(str(message.content or ""))
+            for attachment in message.attachments:
+                values.extend(
+                    [
+                        str(attachment.filename or ""),
+                        str(attachment.description or ""),
+                        " ".join(str(tag) for tag in attachment.tags),
+                    ]
+                )
+        return [value for value in values if value.strip()]
+
+    async def _load_slack_task_ancestry(self, task_id: str) -> list[dict[str, Any]]:
+        if not self.clickup:
+            return []
+        task_chain: list[dict[str, Any]] = []
+        seen_task_ids: set[str] = set()
+        current_task_id = task_id
+        while current_task_id and current_task_id not in seen_task_ids and len(task_chain) < 20:
+            seen_task_ids.add(current_task_id)
+            try:
+                task = await self.clickup.get_task(current_task_id)
+            except Exception:
+                logger.exception(
+                    "Could not load ClickUp task %s for Slack contract routing.",
+                    current_task_id,
+                )
+                break
+            if not isinstance(task, dict):
+                break
+            task_chain.append(task)
+            current_task_id = str(task.get("parent") or "")
+        return task_chain
+
+    def _slack_route_matches_any_name(
+        self,
+        patterns: list[str],
+        names: list[str],
+    ) -> bool:
+        return any(
+            self._slack_route_pattern_matches(pattern, name)
+            for pattern in patterns
+            for name in names
+        )
+
+    def _record_unmapped_slack_update(
+        self,
+        state: dict[str, Any],
+        user: UserProfile,
+        session: SessionState,
+        now: datetime,
+    ) -> bool:
+        unmapped = state.setdefault("unmapped_updates", [])
+        if not isinstance(unmapped, list):
+            unmapped = []
+            state["unmapped_updates"] = unmapped
+        key = f"{user.user_key}:{session.session_date}:{self._active_task_id(session) or ''}"
+        if any(str(item.get("key") or "") == key for item in unmapped if isinstance(item, dict)):
+            return False
+        unmapped.append(
+            {
+                "key": key,
+                "user_key": user.user_key,
+                "display_name": user.display_name,
+                "session_date": session.session_date,
+                "active_task_id": self._active_task_id(session),
+                "active_task_name": str(session.metadata.get("active_clickup_task_name") or ""),
+                "recorded_at": now.isoformat(),
+            }
+        )
+        return True
+
+    def _resolve_matching_operational_issue(
+        self,
+        category: str,
+        *,
+        now: datetime,
+        **details_match: Any,
+    ) -> int:
+        resolve_matching = getattr(
+            getattr(self, "state_store", None),
+            "resolve_matching_operational_issues",
+            None,
+        )
+        if not callable(resolve_matching):
+            return 0
+        return int(
+            resolve_matching(
+                category=category,
+                details_match=details_match,
+                resolved_at=now,
+            )
+            or 0
+        )
+
+    def _fresh_interesting_slack_messages(
+        self,
+        messages: list[MessageRecord],
+        *,
+        since: datetime | None,
+    ) -> list[MessageRecord]:
+        fresh: list[MessageRecord] = []
+        for message in messages:
+            if message.direction != "inbound":
+                continue
+            if not self._slack_message_is_newer_than(message, since):
+                continue
+            text = " ".join((message.content or "").split())
+            if len(text) < 12 and not message.attachments:
+                continue
+            if self._slack_message_is_low_signal(text) or self._slack_message_is_workflow_chatter(text):
+                continue
+            fresh.append(message)
+        return fresh[-5:]
+
+    def _fresh_interesting_slack_images(
+        self,
+        messages: list[MessageRecord],
+        *,
+        previous_image_paths: set[str],
+        since: datetime | None,
+    ) -> list[dict[str, Any]]:
+        images: list[dict[str, Any]] = []
+        for message in messages:
+            if message.direction != "inbound":
+                continue
+            if not self._slack_message_is_newer_than(message, since):
+                continue
+            for attachment in message.attachments:
+                local_path = str(attachment.local_path or "")
+                if not local_path or local_path in previous_image_paths:
+                    continue
+                content_type = str(attachment.content_type or "")
+                suffix = Path(local_path).suffix.lower()
+                if not (content_type.startswith("image/") or suffix in {".jpg", ".jpeg", ".png", ".gif", ".webp"}):
+                    continue
+                if not attachment.description and not attachment.tags and not message.content.strip():
+                    continue
+                images.append(
+                    {
+                        "local_path": local_path,
+                        "description": attachment.description or "",
+                        "tags": list(attachment.tags or []),
+                        "message_text": message.content.strip(),
+                        "created_at": message.created_at.isoformat(),
+                    }
+                )
+        return images
+
+    def _slack_update_has_anything_to_say(
+        self,
+        session: SessionState,
+        messages: list[MessageRecord],
+        images: list[dict[str, Any]],
+        *,
+        include_session_context: bool,
+        blocker_changed: bool,
+    ) -> bool:
+        return bool(
+            images
+            or (blocker_changed and session.latest_blocker)
+            or any(self._slack_text_is_interesting(message.content or "") for message in messages)
+            or (
+                include_session_context
+                and (
+                    self._slack_text_is_interesting(session.latest_plan or "")
+                    or (
+                        not session.latest_plan
+                        and self._slack_text_is_interesting(session.latest_status or "")
+                    )
+                )
+            )
+        )
+
+    def _build_slack_daily_update_message(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        messages: list[MessageRecord],
+        images: list[dict[str, Any]],
+        *,
+        route_label: str,
+        route_uncertain: bool,
+        include_session_context: bool,
+        blocker_changed: bool,
+        factual_progress: str | None = None,
+    ) -> str:
+        intern = f"<@{user.slack_user_id}>" if user.slack_user_id else user.display_name
+        task_name = str(session.metadata.get("active_clickup_task_name") or "current task")
+        task_id = str(self._active_task_id(session) or "")
+        task_label = (
+            f"<{self._clickup_task_url(task_id)}|{task_name}>"
+            if task_id
+            else task_name
+        )
+        lines = [f"*{intern} update* - {task_label}"]
+        if route_label and route_label not in {"default", "mapping needed"}:
+            lines.append(f"_Project: {route_label}_")
+        interesting_bits = (
+            self._compact_slack_text(factual_progress, 420)
+            if factual_progress
+            else ""
+        )
+        if interesting_bits:
+            lines.append(f"*What changed:* {interesting_bits}")
+        if session.latest_blocker and (include_session_context or blocker_changed):
+            lines.append(f"*Needs help:* {self._compact_slack_text(session.latest_blocker, 240)}")
+        next_step = self._compact_slack_text(session.latest_plan or "", 220) if include_session_context else ""
+        if next_step:
+            lines.append(f"*Plan today:* {next_step}")
+        if images:
+            image_hint = self._compact_slack_text(
+                str(images[0].get("description") or images[0].get("message_text") or "new progress photo"),
+                180,
+            )
+            lines.append(f"*Photo note:* {image_hint}")
+        return "\n".join(lines)
+
+    async def _summarize_slack_progress_for_post(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        messages: list[MessageRecord],
+        *,
+        include_session_context: bool,
+    ) -> str:
+        candidates = list(messages)
+        if not candidates:
+            if (
+                include_session_context
+                and not session.latest_plan
+                and self._slack_text_is_interesting(session.latest_status or "")
+            ):
+                return self._compact_slack_text(session.latest_status or "", 420)
+            return ""
+        summarize = getattr(getattr(self, "advisor", None), "summarize_slack_progress", None)
+        if callable(summarize):
+            try:
+                result = str(await summarize(user, session, candidates) or "").strip()
+                return self._compact_slack_text(result, 420) if result else ""
+            except Exception:
+                logger.exception("Could not extract factual Slack progress for %s.", user.user_key)
+        return self._slack_interesting_bits(
+            session,
+            candidates,
+            include_session_context=include_session_context,
+        )
+
+    def _slack_interesting_bits(
+        self,
+        session: SessionState,
+        messages: list[MessageRecord],
+        *,
+        include_session_context: bool,
+    ) -> str:
+        pieces: list[str] = []
+        if (
+            include_session_context
+            and not session.latest_plan
+            and self._slack_text_is_interesting(session.latest_status or "")
+        ):
+            pieces.append(str(session.latest_status))
+        for message in messages:
+            if self._slack_text_is_interesting(message.content or ""):
+                pieces.append(message.content)
+        if not pieces:
+            return ""
+        return self._compact_slack_text(" ".join(dict.fromkeys(pieces)), 420)
+
+    def _slack_image_caption(self, user: UserProfile, session: SessionState, image: dict[str, Any]) -> str:
+        task_name = str(session.metadata.get("active_clickup_task_name") or "current task")
+        description = str(image.get("description") or image.get("message_text") or "Progress image").strip()
+        return f"{user.display_name} - {task_name}: {self._compact_slack_text(description, 220)}"
+
+    def _extract_slack_file_message_ts(self, payload: dict[str, Any], channel_id: str) -> str:
+        files = payload.get("files")
+        files = files if isinstance(files, list) else []
+        for file_payload in files:
+            if not isinstance(file_payload, dict):
+                continue
+            shares = file_payload.get("shares")
+            if not isinstance(shares, dict):
+                continue
+            for share_bucket in ("public", "private"):
+                bucket = shares.get(share_bucket)
+                if not isinstance(bucket, dict):
+                    continue
+                channel_shares = bucket.get(channel_id)
+                if isinstance(channel_shares, list) and channel_shares:
+                    first = channel_shares[0]
+                    if isinstance(first, dict) and first.get("ts"):
+                        return str(first.get("ts"))
+        return ""
+
+    def _slack_recent_image_posts(self, state: dict[str, Any], now: datetime) -> list[dict[str, Any]]:
+        raw = state.get("posted_images")
+        if not isinstance(raw, list):
+            return []
+        cutoff = now - timedelta(days=7)
+        recent: list[dict[str, Any]] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            posted_at = self._coerce_datetime_for_reference(
+                str(item.get("posted_at") or ""),
+                reference=now,
+                timezone_name=self.runtime_timezone_name(),
+            )
+            if posted_at and posted_at >= cutoff:
+                recent.append(item)
+        return recent
+
+    def _slack_message_is_low_signal(self, text: str) -> bool:
+        return self._slack_policy().is_low_signal(text)
+
+    def _slack_message_is_workflow_chatter(self, text: str) -> bool:
+        return self._slack_policy().is_workflow_chatter(text)
+
+    def _slack_text_fingerprint(self, text: str) -> str:
+        return self._slack_policy().fingerprint(text)
+
+    def _slack_text_is_interesting(self, text: str) -> bool:
+        return self._slack_policy().is_interesting(text)
+
+    def _slack_policy(self) -> SlackUpdatePolicy:
+        policy = getattr(self, "_slack_policy_instance", None)
+        if not isinstance(policy, SlackUpdatePolicy):
+            policy = SlackUpdatePolicy(self._self_lookup_request_kind)
+            self._slack_policy_instance = policy
+        return policy
+
+    def _slack_route_pattern_matches(self, pattern: str, value: str) -> bool:
+        try:
+            return bool(re.search(pattern, value, re.IGNORECASE))
+        except re.error:
+            logger.warning("Ignoring invalid Slack route regex pattern %r.", pattern)
+            return False
+
+    def _slack_message_is_newer_than(self, message: MessageRecord, since: datetime | None) -> bool:
+        if since is None:
+            return True
+        created_at = message.created_at
+        if created_at.tzinfo is None and since.tzinfo is not None:
+            created_at = created_at.replace(tzinfo=since.tzinfo)
+        elif created_at.tzinfo is not None and since.tzinfo is None:
+            created_at = created_at.replace(tzinfo=None)
+        return created_at > since
+
+    def _compact_slack_text(self, text: str, limit: int) -> str:
+        normalized = " ".join(text.strip().split())
+        if len(normalized) <= limit:
+            return normalized
+        return normalized[: limit - 3].rstrip() + "..."
+
+    def _clickup_task_url(self, task_id: str) -> str:
+        return f"https://app.clickup.com/t/{task_id}"
+
+    def _slack_update_state_path(self) -> Path | None:
+        storage_root = self._storage_root_path()
+        if storage_root is None:
+            return None
+        return storage_root / _SLACK_UPDATE_STATE_RELATIVE_PATH
+
+    def _load_slack_update_state(self) -> dict[str, Any]:
+        load_state = getattr(self.state_store, "get_operational_state", None)
+        if callable(load_state):
+            stored = load_state("slack_updates")
+            if stored is not None:
+                return stored
+        path = self._slack_update_state_path()
+        if path is None or not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            logger.exception("Could not read Slack update state from %s.", path)
+            return {}
+        state = payload if isinstance(payload, dict) else {}
+        save_state = getattr(self.state_store, "set_operational_state", None)
+        if state and callable(save_state):
+            save_state("slack_updates", state)
+        return state
+
+    def _write_slack_update_state(self, state: dict[str, Any]) -> None:
+        save_state = getattr(self.state_store, "set_operational_state", None)
+        if callable(save_state):
+            save_state("slack_updates", state)
+        path = self._slack_update_state_path()
+        if path is None:
+            return
+        atomic_write_json(path, state)
+
     async def _send_dm(
         self,
         client: discord.Client,
@@ -2050,6 +5073,38 @@ class InternManagementRuntime:
         *,
         view: discord.ui.View | None = None,
     ) -> MessageRecord:
+        content, included_meal_guidance = self._append_queued_meal_guidance(
+            user,
+            session,
+            content,
+            now,
+        )
+        if self._should_use_slack_transport(user):
+            if not self.slack or not user.slack_user_id:
+                raise RuntimeError(
+                    f"Slack delivery is selected for {user.user_key}, but Slack is not configured."
+                )
+            slack_content = content
+            if view is not None:
+                slack_content += "\n\nReply with the option text shown above."
+            posted = await self.slack.post_message(user.slack_user_id, slack_content)
+            outbound = MessageRecord(
+                message_id=f"slack:{posted.get('channel') or user.slack_user_id}:{posted.get('ts') or int(now.timestamp())}",
+                direction="outbound",
+                author_id=self._stable_external_author_id("slack:don-pollo"),
+                created_at=now,
+                content=slack_content,
+                attachments=[],
+            )
+            self.state_store.append_message(user.user_key, session.session_date, outbound)
+            session.last_outbound_at = now.isoformat()
+            if included_meal_guidance:
+                self._mark_meal_guidance_delivered(session, now)
+            return outbound
+        if user.discord_user_id is None:
+            raise RuntimeError(
+                f"Discord delivery is selected for {user.user_key}, but discord_user_id is missing."
+            )
         discord_user = await client.fetch_user(user.discord_user_id)
         dm = await discord_user.create_dm()
         sent = await dm.send(content, view=view)
@@ -2063,7 +5118,59 @@ class InternManagementRuntime:
         )
         self.state_store.append_message(user.user_key, session.session_date, outbound)
         session.last_outbound_at = now.isoformat()
+        if included_meal_guidance:
+            self._mark_meal_guidance_delivered(session, now)
         return outbound
+
+    def _append_queued_meal_guidance(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        content: str,
+        now: datetime,
+    ) -> tuple[str, bool]:
+        if (
+            not session.metadata.get("meal_guidance_queued_at")
+            or session.metadata.get("meal_guidance_delivered_at")
+            or session.metadata.get("lunch_started_at")
+            or session.clocked_out_at
+            or session.stage in {"on_lunch_break", "clocked_out", "awaiting_clock_out_artifacts"}
+            or re.search(r"\b(lunch|meal)\b", content, flags=re.IGNORECASE)
+        ):
+            return content, False
+        deadline = self._meal_period_deadline(session, user, now)
+        deadline_text = (
+            deadline.strftime("%I:%M %p").lstrip("0")
+            if deadline
+            else "the end of your fifth hour"
+        )
+        guidance = (
+            f"Friendly lunch reminder: based on your clock-in time, please begin and "
+            f"record a 30-minute lunch by {deadline_text} if you will work more than five "
+            "hours today. We want everyone to get a real, uninterrupted break. If you "
+            "already took it, just tell me so the record stays accurate."
+        )
+        return f"{content}\n\n{guidance}", True
+
+    def _mark_meal_guidance_delivered(
+        self,
+        session: SessionState,
+        now: datetime,
+    ) -> None:
+        session.metadata["meal_guidance_delivered_at"] = now.isoformat()
+        session.metadata.pop("meal_guidance_queued_at", None)
+
+    def _should_use_slack_transport(self, user: UserProfile) -> bool:
+        preferred = str(user.preferred_transport or "auto").strip().lower()
+        if preferred == "slack":
+            return True
+        if preferred == "discord":
+            return False
+        return user.discord_user_id is None and bool(user.slack_user_id)
+
+    def _stable_external_author_id(self, value: str) -> int:
+        digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+        return int(digest[:15], 16)
 
     async def _send_admin_notice(
         self,
@@ -2081,34 +5188,298 @@ class InternManagementRuntime:
             return []
         sent_to: list[str] = []
         for admin in admins:
-            discord_user = await client.fetch_user(admin.discord_user_id)
-            dm = await discord_user.create_dm()
-            view = view_factory(admin) if callable(view_factory) else None
-            if files:
-                if view is None:
-                    sent = await dm.send(content=content[:1900], files=[discord.File(str(path)) for path in files[:10]])
+            delivered = False
+            try:
+                discord_user = await client.fetch_user(admin.discord_user_id)
+                dm = await discord_user.create_dm()
+                view = view_factory(admin) if callable(view_factory) else None
+                if files:
+                    if view is None:
+                        await dm.send(
+                            content=content[:1900],
+                            files=[discord.File(str(path)) for path in files[:10]],
+                        )
+                    else:
+                        await dm.send(
+                            content=content[:1900],
+                            files=[discord.File(str(path)) for path in files[:10]],
+                            view=view,
+                        )
                 else:
-                    sent = await dm.send(content=content[:1900], files=[discord.File(str(path)) for path in files[:10]], view=view)
-            else:
-                if view is None:
-                    sent = await dm.send(content)
-                else:
-                    sent = await dm.send(content, view=view)
-            sent_to.append(admin.name)
-            if user and session:
-                self.state_store.append_message(
-                    user.user_key,
-                    session.session_date,
-                    MessageRecord(
-                        message_id=str(sent.id),
-                        direction="outbound",
-                        author_id=admin.discord_user_id,
-                        created_at=sent.created_at,
-                        content=sent.content,
-                        attachments=[],
-                    ),
-                )
+                    if view is None:
+                        await dm.send(content)
+                    else:
+                        await dm.send(content, view=view)
+                delivered = True
+            except Exception:
+                logger.exception("Failed to send Discord admin notice to %s.", admin.name)
+            slack_client = getattr(self, "slack", None)
+            if slack_client and admin.slack_user_id:
+                try:
+                    await slack_client.post_message(admin.slack_user_id, content)
+                    for path in (files or [])[:3]:
+                        if not path.exists():
+                            continue
+                        await slack_client.upload_file(
+                            admin.slack_user_id,
+                            path,
+                            title=path.name,
+                        )
+                    delivered = True
+                except Exception:
+                    logger.exception("Failed to send Slack admin notice to %s.", admin.name)
+            if delivered:
+                sent_to.append(admin.name)
         return sent_to
+
+    async def _report_operational_issue(
+        self,
+        *,
+        category: str,
+        severity: str,
+        summary: str,
+        details: dict[str, Any] | None = None,
+        fingerprint_parts: tuple[str, ...] = (),
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        reporter = getattr(self, "operations", None)
+        if not isinstance(reporter, OperationalIssueReporter):
+            return {
+                "category": category,
+                "severity": severity,
+                "summary": summary,
+                "details": details or {},
+                "occurrence_count": 1,
+            }
+        return await reporter.report(
+            category=category,
+            severity=severity,
+            summary=summary,
+            details=details,
+            fingerprint_parts=fingerprint_parts,
+            now=now,
+        )
+
+    async def _maybe_send_operational_issue_digest(self, now: datetime) -> bool:
+        reporter = getattr(self, "operations", None)
+        if not isinstance(reporter, OperationalIssueReporter):
+            return False
+        return await reporter.maybe_send_digest(now)
+
+    def _record_interaction_inbound_message(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        interaction: discord.Interaction,
+        *,
+        content: str,
+        now: datetime,
+    ) -> None:
+        self.state_store.append_message(
+            user.user_key,
+            session.session_date,
+            MessageRecord(
+                message_id=f"interaction:{interaction.id}",
+                direction="inbound",
+                author_id=interaction.user.id,
+                created_at=interaction.created_at,
+                content=content,
+                attachments=[],
+            ),
+        )
+        iso_value = now.isoformat()
+        session.last_user_message_at = iso_value
+        session.last_contact_at = iso_value
+        if not session.first_sign_of_life_at:
+            session.first_sign_of_life_at = iso_value
+        session.metadata.pop(_AUTO_CLOCK_OUT_WARNING_KEY, None)
+
+    def _record_interaction_outbound_message(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        interaction: discord.Interaction,
+        *,
+        content: str,
+        now: datetime,
+    ) -> None:
+        if not content:
+            return
+        author = getattr(getattr(interaction, "client", None), "user", None)
+        self.state_store.append_message(
+            user.user_key,
+            session.session_date,
+            MessageRecord(
+                message_id=f"interaction-edit:{interaction.id}",
+                direction="outbound",
+                author_id=getattr(author, "id", 0) or 0,
+                created_at=interaction.created_at,
+                content=content,
+                attachments=[],
+            ),
+        )
+        session.last_outbound_at = now.isoformat()
+
+    async def _start_self_lookup_prompt(
+        self,
+        client: discord.Client,
+        user: UserProfile,
+        session: SessionState,
+        now: datetime,
+    ) -> None:
+        content = (
+            "Do you want to know about your hours or your status?\n\n"
+            "Press `Hours` to choose a time range, `Status` to see your current work summary, or `No` to remove this prompt."
+        )
+        outbound = await self._send_dm(
+            client,
+            user,
+            session,
+            content,
+            now,
+            view=self._self_lookup_chooser_view(user, session.session_date),
+        )
+        session.metadata[_SELF_LOOKUP_PROMPT_KEY] = {
+            "type": "self_lookup",
+            "step": "chooser",
+            "message_id": outbound.message_id,
+            "requested_at": now.isoformat(),
+        }
+
+    async def _start_day_suppression_prompt(
+        self,
+        client: discord.Client,
+        user: UserProfile,
+        session: SessionState,
+        inbound: MessageRecord,
+        now: datetime,
+    ) -> None:
+        content = (
+            "It sounds like you may not be working today.\n\n"
+            "Do you want me to stop sending reminders and check-ins until tomorrow?"
+        )
+        outbound = await self._send_dm(
+            client,
+            user,
+            session,
+            content,
+            now,
+            view=self._day_suppression_confirmation_view(user, session.session_date),
+        )
+        session.metadata[_DAY_SUPPRESSION_PROMPT_KEY] = {
+            "type": "day_suppression_confirmation",
+            "message_id": outbound.message_id,
+            "requested_at": now.isoformat(),
+            "source_message_id": inbound.message_id,
+            "source_excerpt": self._excerpt_text(inbound.content),
+        }
+
+    async def _build_self_hours_reply(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        now: datetime,
+    ) -> str:
+        return await self._build_self_hours_reply_for_range(user, session, now, "this_week")
+
+    async def _build_self_hours_reply_for_range(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        now: datetime,
+        range_key: str,
+    ) -> str:
+        session_copy = self._clone_session_state(session)
+        return await asyncio.to_thread(
+            self._build_self_hours_reply_for_range_sync,
+            user,
+            session_copy,
+            now,
+            range_key,
+        )
+
+    def _build_self_hours_reply_for_range_sync(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        now: datetime,
+        range_key: str,
+    ) -> str:
+        _report_path, rows = self._write_time_tracking_csv_sync(
+            now=now,
+            session_overrides=[(user, session)],
+        )
+        return self._build_self_hours_reply_for_range_from_rows(
+            user,
+            session,
+            rows,
+            now,
+            range_key,
+        )
+
+    def _build_self_status_reply(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        now: datetime,
+    ) -> str:
+        timezone_name = self.resolve_user_timezone_name(user)
+        active_task = str(session.metadata.get("active_clickup_task_name") or self._active_task_id(session) or "").strip()
+        lines = [
+            "Here is your current status:",
+            f"- Stage: {session.stage}",
+        ]
+        if session.clocked_out_at:
+            lines.append("- Clocked-in state: clocked out")
+            lines.append(
+                f"- Clocked out at: {format_user_datetime(session.clocked_out_at, timezone_name, reference=now)}"
+            )
+        elif session.clocked_in_at:
+            lines.append("- Clocked-in state: clocked in")
+            lines.append(
+                f"- Clocked in at: {format_user_datetime(session.clocked_in_at, timezone_name, reference=now)}"
+            )
+        else:
+            lines.append("- Clocked-in state: not clocked in yet")
+        lines.append(f"- Active task: {active_task or 'none confirmed'}")
+        if session.latest_status:
+            lines.append(f"- Latest status: {session.latest_status}")
+        if session.latest_blocker:
+            lines.append(f"- Latest blocker: {session.latest_blocker}")
+        reminder = self._clock_out_artifacts_reminder_text(session)
+        if reminder:
+            lines.append(f"- Outstanding clock-out requirements: {reminder}")
+        return "\n".join(lines)
+
+    def _self_lookup_prompt(self, session: SessionState) -> dict[str, Any] | None:
+        prompt = session.metadata.get(_SELF_LOOKUP_PROMPT_KEY)
+        if isinstance(prompt, dict) and str(prompt.get("type") or "") == "self_lookup":
+            return prompt
+        return None
+
+    def _clear_self_lookup_prompt(self, session: SessionState) -> None:
+        session.metadata.pop(_SELF_LOOKUP_PROMPT_KEY, None)
+
+    def _day_suppression_prompt(self, session: SessionState) -> dict[str, Any] | None:
+        prompt = session.metadata.get(_DAY_SUPPRESSION_PROMPT_KEY)
+        if isinstance(prompt, dict) and str(prompt.get("type") or "") == "day_suppression_confirmation":
+            return prompt
+        return None
+
+    def _clear_day_suppression_prompt(self, session: SessionState) -> None:
+        session.metadata.pop(_DAY_SUPPRESSION_PROMPT_KEY, None)
+
+    def _day_suppression_state(self, session: SessionState) -> dict[str, Any] | None:
+        state = session.metadata.get(_DAY_SUPPRESSION_STATE_KEY)
+        if isinstance(state, dict) and str(state.get("session_date") or "") == session.session_date:
+            return state
+        return None
+
+    def _day_suppression_active_for_session(self, session: SessionState) -> bool:
+        return self._day_suppression_state(session) is not None
+
+    def _clear_day_suppression_state(self, session: SessionState) -> None:
+        session.metadata.pop(_DAY_SUPPRESSION_STATE_KEY, None)
 
     async def _build_inbound_record(
         self,
@@ -2161,6 +5532,92 @@ class InternManagementRuntime:
             attachments=attachments,
         )
 
+    async def _build_slack_inbound_record(
+        self,
+        event: dict[str, Any],
+        session: SessionState,
+        user: UserProfile,
+        created_at: datetime,
+    ) -> MessageRecord:
+        workspace = await self.store.ensure_user_workspace(user, session.session_date)
+        recent_messages = self.list_session_messages(user.user_key, session)
+        inbound_text = str(event.get("text") or "")
+        attachments: list[AttachmentRecord] = []
+        raw_files = event.get("files")
+        raw_files = raw_files if isinstance(raw_files, list) else []
+        for index, raw_file in enumerate(raw_files, start=1):
+            if not isinstance(raw_file, dict):
+                continue
+            original_filename = str(raw_file.get("name") or f"slack-file-{index}")
+            download_url = str(
+                raw_file.get("url_private_download")
+                or raw_file.get("url_private")
+                or ""
+            )
+            content_type = str(raw_file.get("mimetype") or "") or None
+            content = b""
+            if download_url and self.slack:
+                try:
+                    content = await self.slack.download_file(download_url)
+                except Exception:
+                    logger.exception("Could not download Slack file %s.", original_filename)
+            if not content:
+                attachments.append(
+                    AttachmentRecord(
+                        filename=original_filename,
+                        url=download_url,
+                        content_type=content_type,
+                        size=int(raw_file.get("size") or 0) or None,
+                        original_filename=original_filename,
+                        description="Slack attachment could not be downloaded for local analysis.",
+                    )
+                )
+                continue
+            insight = await self.image_intelligence.analyze_attachment(
+                user=user,
+                session=session,
+                original_filename=original_filename,
+                content=content,
+                content_type=content_type,
+                inbound_text=inbound_text,
+                recent_messages=recent_messages,
+            )
+            filename = self.image_intelligence.build_storage_filename(
+                timestamp_prefix=created_at.astimezone(
+                    resolve_timezone(self.resolve_user_timezone_name(user))
+                ).strftime("%H%M%S"),
+                index=index,
+                original_filename=original_filename,
+                insight=insight,
+            )
+            local_path = await self.store.save_attachment(
+                workspace.images_dir,
+                filename,
+                content,
+            )
+            attachments.append(
+                AttachmentRecord(
+                    filename=filename,
+                    url=download_url,
+                    content_type=content_type,
+                    size=len(content),
+                    local_path=str(local_path),
+                    original_filename=original_filename,
+                    description=insight.description,
+                    tags=insight.tags,
+                    analysis_model=insight.analysis_model,
+                )
+            )
+        message_id = str(event.get("client_msg_id") or event.get("event_ts") or event.get("ts") or "")
+        return MessageRecord(
+            message_id=f"slack:{message_id or int(created_at.timestamp())}",
+            direction="inbound",
+            author_id=self._stable_external_author_id(f"slack:{event.get('user') or 'unknown'}"),
+            created_at=created_at,
+            content=inbound_text,
+            attachments=attachments,
+        )
+
     async def _archive_session(self, user: UserProfile, session: SessionState) -> None:
         workspace = await self.store.ensure_user_workspace(user, session.session_date)
         await self.store.touch_file(workspace.daily_dir / _STATE_MACHINE_CHANGES_FILENAME)
@@ -2195,6 +5652,13 @@ class InternManagementRuntime:
             details=details,
         )
         await self._archive_session(user, session)
+        try:
+            await self._write_time_tracking_csv(now=now, session_overrides=[(user, session)])
+        except Exception:
+            logger.exception(
+                "Failed to rebuild time tracking report after persisting session for %s.",
+                user.user_key,
+            )
         return transition_logged
 
     async def _write_state_machine_transition(
@@ -2234,24 +5698,44 @@ class InternManagementRuntime:
         user: UserProfile,
         session: SessionState,
         messages: list[MessageRecord],
+        *,
+        preferred_task_id: str | None = None,
+        preferred_task_name: str | None = None,
+        preferred_selection_reason: str | None = None,
     ) -> ClickUpContextBundle:
         if not self.clickup:
             return ClickUpContextBundle()
-        return await self.clickup.get_context_bundle(user, session, messages)
+        return await self.clickup.get_context_bundle(
+            user,
+            session,
+            messages,
+            preferred_task_id=preferred_task_id,
+            preferred_task_name=preferred_task_name,
+            preferred_selection_reason=preferred_selection_reason,
+        )
 
-    def _remember_clickup_context(self, session: SessionState, bundle: ClickUpContextBundle) -> None:
-        if bundle.active_task_id:
-            session.metadata["active_clickup_task_id"] = bundle.active_task_id
-        else:
-            session.metadata.pop("active_clickup_task_id", None)
-        if bundle.active_task_name:
-            session.metadata["active_clickup_task_name"] = bundle.active_task_name
-        else:
-            session.metadata.pop("active_clickup_task_name", None)
-        if bundle.selection_reason:
-            session.metadata["clickup_selection_reason"] = bundle.selection_reason
-        else:
-            session.metadata.pop("clickup_selection_reason", None)
+    def _remember_clickup_context(
+        self,
+        session: SessionState,
+        bundle: ClickUpContextBundle,
+        *,
+        preserve_active_task: bool = False,
+    ) -> None:
+        if not preserve_active_task or not self._active_task_id(session):
+            session.metadata.pop(_ACTIVE_TASK_AUTHORITY_KEY, None)
+            session.metadata.pop("credible_clickup_activity", None)
+            if bundle.active_task_id:
+                session.metadata["active_clickup_task_id"] = bundle.active_task_id
+            else:
+                session.metadata.pop("active_clickup_task_id", None)
+            if bundle.active_task_name:
+                session.metadata["active_clickup_task_name"] = bundle.active_task_name
+            else:
+                session.metadata.pop("active_clickup_task_name", None)
+            if bundle.selection_reason:
+                session.metadata["clickup_selection_reason"] = bundle.selection_reason
+            else:
+                session.metadata.pop("clickup_selection_reason", None)
         if bundle.candidate_task_ids:
             session.metadata["clickup_candidate_task_ids"] = bundle.candidate_task_ids
         else:
@@ -2412,6 +5896,14 @@ class InternManagementRuntime:
             return await self._handle_task_onboarding_prompt(client, user, session, inbound, now, prompt)
         if prompt_type == "task_creation":
             return await self._handle_task_creation_prompt(client, user, session, inbound, now, prompt)
+        if prompt_type == "task_creation_pending_approval":
+            return await self._handle_pending_task_proposal_prompt(
+                client,
+                user,
+                session,
+                inbound,
+                now,
+            )
         if prompt_type == "progress_probe":
             return await self._handle_progress_probe_prompt(client, user, session, inbound, now, prompt)
         if prompt_type in {"stuck_assistance", "blocker_resolution"}:
@@ -2432,6 +5924,12 @@ class InternManagementRuntime:
             session.metadata.pop(_CLICKUP_PROMPT_KEY, None)
             await self._send_dm(client, user, session, "Okay, I cancelled the blocker-task draft.", now)
             return True
+        if step != "opt_in" and await self._resolve_task_draft_intent(
+            text,
+            prompt_type="blocker_task",
+            step=step,
+        ) == "mistaken_task_creation":
+            return await self._restore_blocker_task_draft_to_opt_in(client, user, session, now, prompt)
         if step == "opt_in":
             if self._is_negative_reply(text):
                 session.metadata.pop(_CLICKUP_PROMPT_KEY, None)
@@ -2489,6 +5987,20 @@ class InternManagementRuntime:
                 return True
             if due_date_ms is not None:
                 draft["due_date_ms"] = due_date_ms
+            if self.config and self.config.clickup.new_task_approval_required:
+                session.metadata.pop(_CLICKUP_PROMPT_KEY, None)
+                await self._submit_unblocker_task_for_admin_review(
+                    client,
+                    user,
+                    session,
+                    draft,
+                    now,
+                    user_message=(
+                        "I sent this blocker-task draft to Erik and George for approval. "
+                        "It will not be created in ClickUp until one of them approves it."
+                    ),
+                )
+                return True
             created = await self._create_blocker_task_from_prompt(user, session, draft)
             session.metadata.pop(_CLICKUP_PROMPT_KEY, None)
             if not created:
@@ -2587,8 +6099,10 @@ class InternManagementRuntime:
                     task = await self.clickup.get_task(recommended_task_id)
                 except Exception:
                     task = None
+                if task and prompt.get("recommended_workspace_option"):
+                    task = {**task, "_don_pollo_workspace_option": True}
             else:
-                task = await self.clickup.resolve_task_for_user(user, text, include_mission_board=False)
+                task = await self._resolve_intern_task_option(user, session, text)
             if not task:
                 await self._send_dm(
                     client,
@@ -2625,6 +6139,31 @@ class InternManagementRuntime:
             return True
         if step == "confirm_task":
             if self._is_affirmative_reply(text):
+                if prompt.get("candidate_workspace_option"):
+                    candidate_task_id = str(prompt.get("candidate_task_id") or "")
+                    try:
+                        candidate_task = await self.clickup.get_task(candidate_task_id)
+                        assigned = await self.clickup.ensure_task_assigned_to_user(
+                            candidate_task,
+                            user,
+                        )
+                    except Exception:
+                        assigned = False
+                    if not assigned:
+                        self._reset_task_onboarding_prompt_to_select_task(prompt)
+                        session.stage = "awaiting_task_selection"
+                        await self._send_dm(
+                            client,
+                            user,
+                            session,
+                            (
+                                "I found that workspace task, but I could not safely assign it to you. "
+                                "I left it unchanged; choose another option or ask Erik or George to assign it.\n\n"
+                                + await self._task_selection_prompt(user, session)
+                            ),
+                            now,
+                        )
+                        return True
                 self._confirm_task_onboarding_candidate(prompt, session)
                 await self._send_dm(
                     client,
@@ -2655,7 +6194,7 @@ class InternManagementRuntime:
                 session.metadata.pop(_CLICKUP_PROMPT_KEY, None)
                 await self._send_dm(client, user, session, "I cannot resolve tasks right now because ClickUp is unavailable.", now)
                 return True
-            task = await self.clickup.resolve_task_for_user(user, text, include_mission_board=False)
+            task = await self._resolve_intern_task_option(user, session, text)
             if not task:
                 await self._send_dm(
                     client,
@@ -2696,6 +6235,33 @@ class InternManagementRuntime:
                 await self._send_dm(client, user, session, self._task_onboarding_missing_text(prompt, step), now)
                 return True
             draft = self._task_onboarding_draft(prompt)
+            from .worker_portal import validate_meaningful_work_detail
+
+            issue, fingerprint = validate_meaningful_work_detail(
+                text,
+                purpose="first move and intended approach",
+                previous_fingerprint=str(draft.get("last_rejected_plan_fingerprint") or ""),
+            )
+            if issue:
+                draft["last_rejected_plan_fingerprint"] = fingerprint
+                draft["weak_plan_attempts"] = int(draft.get("weak_plan_attempts") or 0) + 1
+                attempts = int(draft["weak_plan_attempts"])
+                lead = (
+                    "I’m seeing the same pattern again. "
+                    if attempts >= 2
+                    else "A little more detail will make this useful. "
+                )
+                await self._send_dm(
+                    client,
+                    user,
+                    session,
+                    lead
+                    + issue
+                    + " Clear plans give the project a finish line and let me help when work gets stuck.",
+                    now,
+                )
+                return True
+            draft.pop("last_rejected_plan_fingerprint", None)
             draft["plan"] = text
             prompt["step"] = "tangible_result"
             session.stage = "awaiting_plan"
@@ -2712,6 +6278,33 @@ class InternManagementRuntime:
                 await self._send_dm(client, user, session, self._task_onboarding_missing_text(prompt, step), now)
                 return True
             draft = self._task_onboarding_draft(prompt)
+            from .worker_portal import validate_meaningful_work_detail
+
+            issue, fingerprint = validate_meaningful_work_detail(
+                text,
+                purpose="tangible result",
+                previous_fingerprint=str(draft.get("last_rejected_result_fingerprint") or ""),
+            )
+            if issue:
+                draft["last_rejected_result_fingerprint"] = fingerprint
+                draft["weak_result_attempts"] = int(draft.get("weak_result_attempts") or 0) + 1
+                attempts = int(draft["weak_result_attempts"])
+                lead = (
+                    "I’m seeing another vague or repeated result. "
+                    if attempts >= 2
+                    else "That result is still too vague to start cleanly. "
+                )
+                await self._send_dm(
+                    client,
+                    user,
+                    session,
+                    lead
+                    + issue
+                    + " This detail makes progress visible without requiring a long status report.",
+                    now,
+                )
+                return True
+            draft.pop("last_rejected_result_fingerprint", None)
             draft["tangible_result"] = text
             prompt["step"] = "necessity"
             session.stage = "awaiting_plan"
@@ -3065,12 +6658,23 @@ class InternManagementRuntime:
         )
         if assessment.meaningful_progress or not assessment.needs_probe:
             session.latest_status = text
+            self._record_checkpoint_quality(
+                session,
+                now,
+                meaningful=True,
+                source="scheduled_clarification",
+            )
             await self._close_progress_probe(
                 client,
                 user,
                 session,
                 now,
                 reason="captured_meaningful_progress",
+            )
+            self._renew_checkpoint_after_response(
+                session,
+                now,
+                source="scheduled_clarification_reply",
             )
             await self._send_dm(
                 client,
@@ -3080,28 +6684,12 @@ class InternManagementRuntime:
                 now,
             )
             return True
-        if self._progress_probe_round(prompt) < 2:
-            clarification_text = self._progress_probe_prompt_text(
-                assessment.probe_questions or self._default_progress_probe_questions(),
-                clarification=True,
-            )
-            prompt["probe_round"] = self._progress_probe_round(prompt) + 1
-            sent = await self._send_dm(client, user, session, clarification_text, now)
-            self._record_progress_probe_exchange_entry(
-                prompt,
-                role="bot",
-                content=clarification_text,
-                message_id=sent.message_id if isinstance(sent, MessageRecord) else None,
-            )
-            prompt["last_activity_at"] = now.isoformat()
-            await self._notify_progress_probe_subscribers(
-                client,
-                user,
-                session,
-                prompt,
-                f"Don Pollo asked a follow-up progress probe:\n\n{clarification_text}",
-            )
-            return True
+        self._record_checkpoint_quality(
+            session,
+            now,
+            meaningful=False,
+            source="scheduled_clarification",
+        )
         await self._close_progress_probe(
             client,
             user,
@@ -3109,13 +6697,18 @@ class InternManagementRuntime:
             now,
             reason="probe_exhausted",
         )
+        self._renew_checkpoint_after_response(
+            session,
+            now,
+            source="scheduled_clarification_exhausted",
+        )
         await self._send_dm(
             client,
             user,
             session,
             (
-                "I still could not tell what changed from that response, so I am ending the probe for now. "
-                "On the next check-in, tell me one concrete change, the exact part you worked on, and the next step or blocker."
+                "No problem—keep working. I will not keep interrupting. "
+                "At the next natural checkpoint, use one concrete change, the next step, or the blocker so the update is useful to the team."
             ),
             now,
         )
@@ -3370,6 +6963,12 @@ class InternManagementRuntime:
             draft = {}
             prompt["draft"] = draft
         step = str(prompt.get("step") or "title")
+        if await self._resolve_task_draft_intent(
+            text,
+            prompt_type="unblocker_task_draft",
+            step=step,
+        ) == "mistaken_task_creation":
+            return await self._restore_unblocker_task_draft_return_prompt(client, user, session, now, prompt)
         if step == "title":
             if not text:
                 await self._send_dm(client, user, session, "I still need a short title for the unblocker task.", now)
@@ -3505,12 +7104,17 @@ class InternManagementRuntime:
     def _set_task_onboarding_candidate(self, prompt: dict[str, Any], task: dict[str, Any]) -> None:
         prompt["candidate_task_id"] = str(task.get("id") or "")
         prompt["candidate_task_name"] = str(task.get("name") or "Unnamed task")
+        if task.get("_don_pollo_workspace_option"):
+            prompt["candidate_workspace_option"] = True
+        else:
+            prompt.pop("candidate_workspace_option", None)
 
     def _confirm_task_onboarding_candidate(self, prompt: dict[str, Any], session: SessionState) -> None:
         prompt["task_id"] = str(prompt.get("candidate_task_id") or "")
         prompt["task_name"] = str(prompt.get("candidate_task_name") or "Unnamed task")
         prompt.pop("candidate_task_id", None)
         prompt.pop("candidate_task_name", None)
+        prompt.pop("candidate_workspace_option", None)
         prompt["step"] = "plan"
         session.stage = "awaiting_plan"
         session.awaiting_start_photo = False
@@ -3525,6 +7129,8 @@ class InternManagementRuntime:
         prompt.pop("task_name", None)
         prompt.pop("candidate_task_id", None)
         prompt.pop("candidate_task_name", None)
+        prompt.pop("candidate_workspace_option", None)
+        prompt.pop("recommended_workspace_option", None)
 
     def _task_onboarding_confirmation_prompt(self, prompt: dict[str, Any]) -> str:
         task_name = str(prompt.get("candidate_task_name") or prompt.get("task_name") or "that task")
@@ -3538,6 +7144,15 @@ class InternManagementRuntime:
     def _task_confirmation_view(self, user: UserProfile) -> discord.ui.View:
         return _InternTaskConfirmationView(self, user)
 
+    def _self_lookup_chooser_view(self, user: UserProfile, session_date: str) -> discord.ui.View:
+        return _InternSelfLookupView(self, user, session_date=session_date, step="chooser")
+
+    def _self_lookup_hours_range_view(self, user: UserProfile, session_date: str) -> discord.ui.View:
+        return _InternSelfLookupView(self, user, session_date=session_date, step="range")
+
+    def _day_suppression_confirmation_view(self, user: UserProfile, session_date: str) -> discord.ui.View:
+        return _InternDaySuppressionView(self, user, session_date=session_date)
+
     def _extract_task_onboarding_correction_hint(self, text: str) -> str | None:
         stripped = text.strip()
         if not stripped:
@@ -3550,6 +7165,60 @@ class InternManagementRuntime:
             if pattern.match(stripped):
                 return ""
         return None
+
+    async def _resolve_intern_task_option(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        task_hint: str,
+    ) -> dict[str, Any] | None:
+        if not self.clickup:
+            return None
+        numeric_match = re.fullmatch(r"(?:option\s*)?([1-5])", task_hint.strip(), flags=re.IGNORECASE)
+        if numeric_match:
+            context = await self._task_selection_context(user, session)
+            visible_options = context.get("candidate_tasks")
+            visible_options = visible_options if isinstance(visible_options, list) else []
+            option_index = int(numeric_match.group(1)) - 1
+            if option_index < len(visible_options):
+                selected = visible_options[option_index]
+                if isinstance(selected, dict):
+                    task_id = str(selected.get("id") or "")
+                    if selected.get("workspace_option"):
+                        workspace_options = await self.clickup.suggest_next_tasks(
+                            user,
+                            session,
+                            self.list_session_messages(user.user_key, session),
+                            exclude_task_ids=self._recently_closed_task_ids(session),
+                            limit=8,
+                        )
+                        matched = self.clickup.match_task_hint(workspace_options, task_id)
+                        return {**matched, "_don_pollo_workspace_option": True} if matched else None
+                    return await self.clickup.resolve_task_for_user(
+                        user,
+                        task_id,
+                        include_mission_board=False,
+                    )
+        assigned_task = await self.clickup.resolve_task_for_user(
+            user,
+            task_hint,
+            include_mission_board=False,
+        )
+        if assigned_task:
+            return assigned_task
+        if not hasattr(self.clickup, "suggest_next_tasks") or not hasattr(self.clickup, "match_task_hint"):
+            return None
+        workspace_options = await self.clickup.suggest_next_tasks(
+            user,
+            session,
+            self.list_session_messages(user.user_key, session),
+            exclude_task_ids=self._recently_closed_task_ids(session),
+            limit=8,
+        )
+        matched = self.clickup.match_task_hint(workspace_options, task_hint)
+        if not matched:
+            return None
+        return {**matched, "_don_pollo_workspace_option": True}
 
     async def _restart_task_onboarding_for_correction(
         self,
@@ -3579,7 +7248,7 @@ class InternManagementRuntime:
             session.metadata.pop(_CLICKUP_PROMPT_KEY, None)
             await self._send_dm(client, user, session, "I cannot resolve tasks right now because ClickUp is unavailable.", now)
             return True
-        task = await self.clickup.resolve_task_for_user(user, correction_hint, include_mission_board=False)
+        task = await self._resolve_intern_task_option(user, session, correction_hint)
         if not task:
             self._reset_task_onboarding_prompt_to_select_task(prompt)
             session.stage = "awaiting_task_selection"
@@ -3607,6 +7276,20 @@ class InternManagementRuntime:
                     f"{await self._task_selection_prompt(user, session)}"
                 ),
                 now,
+            )
+            return True
+        if task.get("_don_pollo_workspace_option"):
+            prompt["draft"] = {}
+            self._set_task_onboarding_candidate(prompt, task)
+            prompt["step"] = "confirm_task"
+            session.stage = "awaiting_task_selection"
+            await self._send_dm(
+                client,
+                user,
+                session,
+                self._task_onboarding_confirmation_prompt(prompt),
+                now,
+                view=self._task_confirmation_view(user),
             )
             return True
         prompt["draft"] = {}
@@ -3698,6 +7381,7 @@ class InternManagementRuntime:
         reason: str,
         admin_feedback: str | None = None,
         direct_plan: bool = False,
+        open_task_creation: bool = False,
     ) -> None:
         current_task_id = self._active_task_id(session)
         current_task_name = str(session.metadata.get("active_clickup_task_name") or "")
@@ -3736,9 +7420,12 @@ class InternManagementRuntime:
         prefix_parts = [reason]
         if pause_note:
             prefix_parts.append(pause_note)
+        if open_task_creation:
+            await self._start_task_creation_from_selection(client, user, session, now, prompt)
+            return
         task = target_task
         if not task and task_hint and self.clickup:
-            task = await self.clickup.resolve_task_for_user(user, task_hint, include_mission_board=False)
+            task = await self._resolve_intern_task_option(user, session, task_hint)
         if task:
             task_id = str(task.get("id") or "")
             if task_id and task_id in self._recently_closed_task_ids(session):
@@ -3987,6 +7674,33 @@ class InternManagementRuntime:
         list_id = str(list_payload.get("id") or "").strip()
         return list_id or None
 
+    def _task_option_location_label(self, task: dict[str, Any]) -> str:
+        if self.clickup and hasattr(self.clickup, "task_location_label"):
+            return str(self.clickup.task_location_label(task))
+        labels: list[str] = []
+        for key in ("space", "folder", "list"):
+            payload = task.get(key)
+            if not isinstance(payload, dict):
+                continue
+            label = str(payload.get("name") or "").strip()
+            if label and label not in labels:
+                labels.append(label)
+        return " / ".join(labels) or "ClickUp workspace"
+
+    def _task_workspace_option_line(self, task: dict[str, Any], *, recommended: bool) -> str:
+        task_id = str(task.get("id") or "unknown")
+        task_name = str(task.get("name") or "Unnamed task")
+        priority = (task.get("priority") or {}).get("priority") or "none"
+        marker = " [recommended]" if recommended else ""
+        line = (
+            f"- `{task_name}` | id={task_id} | {self._task_option_location_label(task)} | "
+            f"priority={priority}{marker}"
+        )
+        reason = str(task.get("_don_pollo_suggestion_reason") or "").strip()
+        if reason:
+            line += f" | why: {reason}"
+        return line
+
     async def _task_selection_context(
         self,
         user: UserProfile,
@@ -4000,10 +7714,12 @@ class InternManagementRuntime:
                 "message": "Tell me which ClickUp task you are working on right now.",
                 "tree_text": "",
                 "candidate_tasks": [],
+                "placement_candidates": [],
                 "hidden_count": 0,
             }
         assigned_tasks = list(tasks) if tasks is not None else await self.clickup.list_assigned_tasks(user, limit=8)
         hidden_count = 0
+        recently_closed_ids: set[str] = set()
         if session is not None:
             recently_closed_ids = self._recently_closed_task_ids(session)
             if recently_closed_ids:
@@ -4013,10 +7729,24 @@ class InternManagementRuntime:
                     if str(task.get("id") or "") not in recently_closed_ids
                 ]
                 hidden_count = original_count - len(assigned_tasks)
-        if not assigned_tasks:
+        assigned_ids = {
+            str(task.get("id") or "")
+            for task in assigned_tasks
+            if str(task.get("id") or "")
+        }
+        workspace_options: list[dict[str, Any]] = []
+        if session is not None and hasattr(self.clickup, "suggest_next_tasks"):
+            workspace_options = await self.clickup.suggest_next_tasks(
+                user,
+                session,
+                self.list_session_messages(user.user_key, session),
+                exclude_task_ids=assigned_ids | recently_closed_ids,
+                limit=5,
+            )
+        if not assigned_tasks and not workspace_options:
             message = (
-                "I cannot see any assigned ClickUp tasks for you yet. "
-                "Reply `create task` if you need a new one, or ask admin to assign one."
+                "I cannot see any assigned tasks or strong open workspace options yet. "
+                "Reply `create task` to propose a new one for Erik or George to approve."
             )
             if hidden_count:
                 message = "I hid tasks that were already closed today. " + message
@@ -4024,26 +7754,38 @@ class InternManagementRuntime:
                 "message": message,
                 "tree_text": "",
                 "candidate_tasks": [],
+                "placement_candidates": [],
                 "hidden_count": hidden_count,
             }
-        raw_tasks_by_id: dict[str, dict[str, Any]]
-        if hasattr(self.clickup, "build_assigned_task_hierarchy") and hasattr(self.clickup, "render_assigned_task_hierarchy"):
+        recommended_task_id = str((recommended_task or {}).get("id") or "")
+        if recommended_task_id:
+            assigned_tasks = sorted(
+                assigned_tasks,
+                key=lambda task: str(task.get("id") or "") != recommended_task_id,
+            )
+        assigned_visible_limit = 4 if workspace_options else 5
+        assigned_visible = assigned_tasks[:assigned_visible_limit]
+        workspace_visible = workspace_options[: max(0, 5 - len(assigned_visible))]
+
+        raw_tasks_by_id: dict[str, dict[str, Any]] = {}
+        hierarchy: dict[str, Any] = {}
+        tree_text = ""
+        if assigned_visible and hasattr(self.clickup, "build_assigned_task_hierarchy") and hasattr(self.clickup, "render_assigned_task_hierarchy"):
             hierarchy = await self.clickup.build_assigned_task_hierarchy(
                 user,
-                tasks=assigned_tasks,
-                limit=max(len(assigned_tasks), 8),
+                tasks=assigned_visible,
+                limit=max(len(assigned_visible), 5),
             )
-            recommended_task_id = str((recommended_task or {}).get("id") or "") or None
             tree_text = self.clickup.render_assigned_task_hierarchy(
                 hierarchy,
-                recommended_task_id=recommended_task_id,
+                recommended_task_id=recommended_task_id or None,
             )
             raw_tasks_by_id = hierarchy.get("tasks_by_id")
             raw_tasks_by_id = raw_tasks_by_id if isinstance(raw_tasks_by_id, dict) else {}
-        else:
+        elif assigned_visible:
             raw_tasks_by_id = {
                 str(task.get("id") or ""): task
-                for task in assigned_tasks
+                for task in assigned_visible
                 if str(task.get("id") or "").strip()
             }
             tree_lines = [
@@ -4051,22 +7793,111 @@ class InternManagementRuntime:
                 for task_id, task in raw_tasks_by_id.items()
             ]
             tree_text = "\n".join(tree_lines)
-        candidate_tasks = [
+        assigned_candidates = [
             {
-                "id": str(task_id),
-                "name": str((task or {}).get("name") or task_id),
-                "parent_task_id": self._extract_task_parent_id(task or {}) or "",
-                "list_id": self._extract_task_list_id(task or {}) or "",
+                "id": str(task.get("id") or ""),
+                "name": str(task.get("name") or task.get("id") or "Unnamed task"),
+                "parent_task_id": self._extract_task_parent_id(task) or "",
+                "list_id": self._extract_task_list_id(task) or "",
             }
-            for task_id, task in raw_tasks_by_id.items()
-            if str(task_id).strip()
+            for task in assigned_visible
+            if str(task.get("id") or "").strip()
         ]
+        workspace_candidates = [
+            {
+                "id": str(task.get("id") or ""),
+                "name": str(task.get("name") or "Unnamed task"),
+                "parent_task_id": self._extract_task_parent_id(task) or "",
+                "list_id": self._extract_task_list_id(task) or "",
+                "workspace_option": True,
+                "location": self._task_option_location_label(task),
+            }
+            for task in workspace_visible
+            if str(task.get("id") or "")
+        ]
+        candidate_tasks = (assigned_candidates + workspace_candidates)[:5]
+        placement_candidates: list[dict[str, Any]] = []
+        seen_placement_ids: set[str] = set()
+
+        def _add_placement_candidate(task: dict[str, Any], *, workspace_option: bool = False) -> None:
+            task_id = str(task.get("id") or "").strip()
+            list_id = self._extract_task_list_id(task) or str(task.get("list_id") or "").strip()
+            status_payload = task.get("status")
+            status_payload = status_payload if isinstance(status_payload, dict) else {}
+            status_name = str(status_payload.get("status") or "").strip().lower()
+            status_type = str(status_payload.get("type") or "").strip().lower()
+            if not task_id or not list_id or task_id in seen_placement_ids:
+                return
+            if status_type == "closed" or status_name in {"closed", "complete", "completed"}:
+                return
+            candidate = {
+                "id": task_id,
+                "name": str(task.get("name") or task_id),
+                "parent_task_id": self._extract_task_parent_id(task)
+                or str(task.get("parent_task_id") or ""),
+                "list_id": list_id,
+            }
+            if workspace_option:
+                candidate["workspace_option"] = True
+                candidate["location"] = str(
+                    task.get("location") or self._task_option_location_label(task)
+                )
+            placement_candidates.append(candidate)
+            seen_placement_ids.add(task_id)
+
+        raw_children = hierarchy.get("children_by_parent_id") if isinstance(hierarchy, dict) else {}
+        raw_children = raw_children if isinstance(raw_children, dict) else {}
+
+        def _walk_placement(task_id: str) -> None:
+            task = raw_tasks_by_id.get(task_id)
+            if isinstance(task, dict):
+                _add_placement_candidate(task)
+            child_ids = raw_children.get(task_id)
+            if isinstance(child_ids, list):
+                for child_id in child_ids:
+                    _walk_placement(str(child_id))
+
+        root_ids = hierarchy.get("root_ids") if isinstance(hierarchy, dict) else []
+        if isinstance(root_ids, list):
+            for root_id in root_ids:
+                _walk_placement(str(root_id))
+        for task in assigned_visible:
+            _add_placement_candidate(task)
+        for task in workspace_candidates:
+            _add_placement_candidate(task, workspace_option=True)
         lines = [
-            "I need to confirm your active ClickUp task before you continue. Reply with the task name or ID.",
+            "I need to confirm your active ClickUp task before you continue.",
             "",
-            "Assigned task tree:",
-            tree_text,
+            "Choose one option by replying with its number, name, or ID:",
         ]
+        assigned_task_by_id = {
+            str(task.get("id") or ""): task
+            for task in assigned_visible
+            if str(task.get("id") or "")
+        }
+        workspace_task_by_id = {
+            str(task.get("id") or ""): task
+            for task in workspace_visible
+            if str(task.get("id") or "")
+        }
+        for index, candidate in enumerate(candidate_tasks, start=1):
+            task_id = str(candidate.get("id") or "")
+            task = assigned_task_by_id.get(task_id) or workspace_task_by_id.get(task_id) or {}
+            priority = str((task.get("priority") or {}).get("priority") or "none")
+            location = self._task_option_location_label(task)
+            markers: list[str] = []
+            if candidate.get("workspace_option"):
+                markers.append("workspace option")
+            else:
+                markers.append("assigned")
+            if task_id == recommended_task_id or (not recommended_task_id and index == 1):
+                markers.append("recommended")
+            reason = str(task.get("_don_pollo_suggestion_reason") or "").strip()
+            suffix = f" | why: {reason}" if reason else ""
+            lines.append(
+                f"{index}. `{candidate.get('name') or task_id}` | id={task_id} | {location} | "
+                f"priority={priority} | {' '.join(f'[{marker}]' for marker in markers)}{suffix}"
+            )
         if hidden_count:
             lines.extend(
                 [
@@ -4077,13 +7908,14 @@ class InternManagementRuntime:
         lines.extend(
             [
                 "",
-                "Reply with the name or ID of an `[assigned]` task to choose one, or reply `create task` if none of these fit.",
+                "Reply `create task` if none fit. New tasks still require Erik or George approval.",
             ]
         )
         return {
             "message": "\n".join(lines),
             "tree_text": tree_text,
             "candidate_tasks": candidate_tasks,
+            "placement_candidates": placement_candidates,
             "hidden_count": hidden_count,
         }
 
@@ -4097,6 +7929,7 @@ class InternManagementRuntime:
     ) -> None:
         source = str(prompt.get("source") or "task_onboarding")
         selection_context = await self._task_selection_context(user, session)
+        self._clear_non_authoritative_active_task_context(session)
         session.stage = "awaiting_task_selection"
         session.metadata[_CLICKUP_PROMPT_KEY] = {
             "type": "task_creation",
@@ -4104,7 +7937,11 @@ class InternManagementRuntime:
             "reason": str(prompt.get("reason") or ""),
             "step": "placement",
             "tree_text": selection_context["tree_text"],
-            "placement_candidates": selection_context["candidate_tasks"],
+            "placement_candidates": selection_context.get(
+                "placement_candidates",
+                selection_context["candidate_tasks"],
+            ),
+            "placement_context_version": _TASK_PLACEMENT_CONTEXT_VERSION,
             "draft": {},
         }
         session.metadata["last_task_onboarding_prompt_at"] = now.isoformat()
@@ -4116,14 +7953,64 @@ class InternManagementRuntime:
             now,
         )
 
+    async def _return_task_creation_to_existing_selection(
+        self,
+        client: discord.Client,
+        user: UserProfile,
+        session: SessionState,
+        now: datetime,
+        prompt: dict[str, Any],
+    ) -> bool:
+        source = str(prompt.get("source") or "task_onboarding")
+        session.stage = "awaiting_task_selection"
+        session.metadata[_CLICKUP_PROMPT_KEY] = {
+            "type": "task_onboarding",
+            "source": source,
+            "step": "select_task",
+            "reason": str(prompt.get("reason") or ""),
+            "draft": {},
+        }
+        session.metadata["last_task_onboarding_prompt_at"] = now.isoformat()
+        await self._send_dm(
+            client,
+            user,
+            session,
+            "Okay, I won't create a new task.\n\n" + await self._task_selection_prompt(user, session),
+            now,
+        )
+        return True
+
     def _task_creation_placement_prompt(self, prompt: dict[str, Any]) -> str:
         tree_text = str(prompt.get("tree_text") or "").strip()
+        candidates = prompt.get("placement_candidates")
+        candidates = candidates if isinstance(candidates, list) else []
+        workspace_options = [
+            candidate
+            for candidate in candidates
+            if isinstance(candidate, dict) and candidate.get("workspace_option")
+        ]
+        sections: list[str] = []
         if tree_text:
+            sections.extend(
+                [
+                    "Here is the current assigned task hierarchy I can see:",
+                    tree_text,
+                ]
+            )
+        if workspace_options:
+            option_lines = ["Other possible parent tasks across ClickUp spaces:"]
+            option_lines.extend(
+                f"- `{candidate.get('name') or candidate.get('id')}` | "
+                f"id={candidate.get('id')} | {candidate.get('location') or 'ClickUp workspace'}"
+                for candidate in workspace_options
+            )
+            sections.append("\n".join(option_lines))
+        if sections:
             return (
                 "Okay, let's create a new task.\n\n"
-                "Here is the current task hierarchy I can see:\n\n"
-                f"{tree_text}\n\n"
-                "Reply with a shown parent task name or ID if the new task belongs under it, or reply `top level` if it does not fit anywhere in this hierarchy."
+                + "\n\n".join(sections)
+                + "\n\nReply with a shown parent task name or ID if the new task belongs under it, "
+                "or reply `top level` if it does not fit anywhere shown."
             )
         return (
             "Okay, let's create a new task.\n\n"
@@ -4159,11 +8046,120 @@ class InternManagementRuntime:
         )
         return True
 
+    async def _restore_blocker_task_draft_to_opt_in(
+        self,
+        client: discord.Client,
+        user: UserProfile,
+        session: SessionState,
+        now: datetime,
+        prompt: dict[str, Any],
+    ) -> bool:
+        draft = prompt.get("draft")
+        origin_message_id = None
+        if isinstance(draft, dict):
+            origin_message_id = draft.get("origin_message_id")
+        prompt["step"] = "opt_in"
+        prompt["draft"] = {"origin_message_id": origin_message_id} if origin_message_id else {}
+        session.metadata[_CLICKUP_PROMPT_KEY] = prompt
+        await self._send_dm(
+            client,
+            user,
+            session,
+            "Okay, I won't create a blocker task.\n\n" + self._blocker_task_opt_in_prompt(),
+            now,
+        )
+        return True
+
+    async def _restore_unblocker_task_draft_return_prompt(
+        self,
+        client: discord.Client,
+        user: UserProfile,
+        session: SessionState,
+        now: datetime,
+        prompt: dict[str, Any],
+    ) -> bool:
+        return_prompt = prompt.get("return_prompt")
+        if not isinstance(return_prompt, dict):
+            session.metadata.pop(_CLICKUP_PROMPT_KEY, None)
+            await self._send_dm(client, user, session, "Okay, I cancelled the unblocker-task draft.", now)
+            return True
+        restored_prompt = deepcopy(return_prompt)
+        step = str(restored_prompt.get("step") or "offer_help")
+        session.metadata[_CLICKUP_PROMPT_KEY] = restored_prompt
+        await self._send_dm(
+            client,
+            user,
+            session,
+            "Okay, I won't create an unblocker task.\n\n" + self._blocker_resolution_prompt_text(restored_prompt),
+            now,
+            view=self._blocker_resolution_view(user, step),
+        )
+        return True
+
+    async def _resolve_task_draft_intent(
+        self,
+        text: str,
+        *,
+        prompt_type: str,
+        step: str,
+        source: str | None = None,
+    ) -> str | None:
+        interpreter = getattr(self, "interface_intelligence", None)
+        if not interpreter or not hasattr(interpreter, "resolve_task_draft_intent"):
+            return None
+        try:
+            match = await interpreter.resolve_task_draft_intent(
+                text,
+                prompt_type=prompt_type,
+                step=step,
+                source=source,
+            )
+        except Exception:
+            return None
+        if not match:
+            return None
+        action = str(getattr(match, "action", "") or "").strip().lower()
+        return action or None
+
+    async def _resolve_daily_availability_intent(
+        self,
+        text: str,
+        *,
+        stage: str,
+    ) -> str | None:
+        interpreter = getattr(self, "interface_intelligence", None)
+        if interpreter and hasattr(interpreter, "resolve_daily_availability_intent"):
+            try:
+                match = await interpreter.resolve_daily_availability_intent(
+                    text,
+                    stage=stage,
+                )
+            except Exception:
+                match = None
+            if match:
+                action = str(getattr(match, "action", "") or "").strip().lower()
+                if action:
+                    return action
+        if self._looks_like_not_working_today_request(text):
+            return "not_working_today"
+        return None
+
     def _task_creation_candidates(self, prompt: dict[str, Any]) -> list[dict[str, Any]]:
         raw = prompt.get("placement_candidates")
         if not isinstance(raw, list):
             return []
         return [item for item in raw if isinstance(item, dict)]
+
+    async def _refresh_legacy_task_creation_placement_context(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        prompt: dict[str, Any],
+    ) -> None:
+        context = await self._task_selection_context(user, session)
+        prompt["tree_text"] = context.get("tree_text") or ""
+        prompt["placement_candidates"] = context.get("placement_candidates") or []
+        prompt["placement_context_version"] = _TASK_PLACEMENT_CONTEXT_VERSION
 
     def _match_task_creation_parent_candidate(
         self,
@@ -4215,6 +8211,161 @@ class InternManagementRuntime:
         )
         await self._send_admin_notice(client, message, user=user, session=session)
 
+    def _task_proposal_category(self, draft: dict[str, Any]) -> str:
+        if not self.config:
+            return "project"
+        text = " ".join(
+            str(draft.get(key) or "")
+            for key in ("title", "description", "parent_task_name")
+        )
+        for pattern in self.config.labor.overhead_name_patterns:
+            try:
+                if re.search(pattern, text, re.IGNORECASE):
+                    return "overhead"
+            except re.error:
+                logger.warning("Ignoring invalid overhead task regex pattern %r.", pattern)
+        return "project"
+
+    def _task_approval_admins(self) -> list[AdminProfile]:
+        admins = self.admin_profiles()
+        if not self.config:
+            return admins
+        allowed = {
+            self._normalize_identifier_value(name)
+            for name in self.config.clickup.new_task_approver_names
+            if name.strip()
+        }
+        selected = [
+            admin
+            for admin in admins
+            if any(
+                allowed_name == self._normalize_identifier_value(admin.name)
+                or self._normalize_identifier_value(admin.name).startswith(allowed_name)
+                or allowed_name.startswith(self._normalize_identifier_value(admin.name))
+                for allowed_name in allowed
+            )
+        ]
+        return selected or admins
+
+    async def _notify_other_task_approvers(
+        self,
+        client: discord.Client,
+        *,
+        resolved_by: str,
+        content: str,
+        user: UserProfile,
+        session: SessionState,
+    ) -> None:
+        actor = self._normalize_identifier_value(resolved_by)
+        others = [
+            admin
+            for admin in self._task_approval_admins()
+            if self._normalize_identifier_value(admin.name) != actor
+        ]
+        if not others:
+            return
+        await self._send_admin_notice(
+            client,
+            content,
+            target_admins=others,
+            user=user,
+            session=session,
+        )
+
+    async def _submit_new_task_for_admin_review(
+        self,
+        client: discord.Client,
+        user: UserProfile,
+        session: SessionState,
+        prompt: dict[str, Any],
+        draft: dict[str, Any],
+        now: datetime,
+    ) -> None:
+        proposal = {
+            "submitted_at": now.isoformat(),
+            "category": self._task_proposal_category(draft),
+            "source": str(prompt.get("source") or "task_onboarding"),
+            "reason": str(prompt.get("reason") or ""),
+            "draft": deepcopy(draft),
+            "original_prompt": deepcopy(prompt),
+        }
+        session.metadata["pending_admin_task_proposal"] = proposal
+        session.metadata[_CLICKUP_PROMPT_KEY] = {
+            "type": "task_creation_pending_approval",
+            "submitted_at": now.isoformat(),
+        }
+        session.stage = "awaiting_task_selection"
+        category = str(proposal["category"])
+        await self._send_dm(
+            client,
+            user,
+            session,
+            (
+                f"I submitted `{draft.get('title')}` as a {category} task proposal to Erik and George. "
+                "I have not created it in ClickUp or started its timer. I will continue onboarding "
+                "after one of them approves it."
+            ),
+            now,
+        )
+        await self._send_admin_task_proposal_request(client, user, session)
+
+    async def _send_admin_task_proposal_request(
+        self,
+        client: discord.Client,
+        user: UserProfile,
+        session: SessionState,
+    ) -> None:
+        proposal = self._pending_admin_task_proposal(session) or {}
+        draft = proposal.get("draft") if isinstance(proposal, dict) else {}
+        if not isinstance(draft, dict):
+            return
+        placement = (
+            f"under `{draft.get('parent_task_name') or draft.get('parent_task_id')}`"
+            if draft.get("parent_task_id")
+            else "at the top level in Mission Board"
+        )
+        message = (
+            f"{user.display_name} proposed a new {proposal.get('category') or 'project'} task. "
+            "It has not been created in ClickUp.\n\n"
+            f"Task: `{draft.get('title') or 'Untitled task'}`\n"
+            f"Placement: {placement}\n"
+            f"Requested assignee: {user.display_name}\n\n"
+            f"Context:\n{draft.get('description') or 'No description provided.'}\n\n"
+            f"Approve with `run review.task_proposal_approve user={user.user_key}`.\n"
+            f"Request changes with `run review.task_proposal_revise user={user.user_key} comments=\"...\"`."
+        )
+        await self._send_admin_notice(
+            client,
+            message,
+            target_admins=self._task_approval_admins(),
+            user=user,
+            session=session,
+        )
+
+    async def _handle_pending_task_proposal_prompt(
+        self,
+        client: discord.Client,
+        user: UserProfile,
+        session: SessionState,
+        inbound: MessageRecord,
+        now: datetime,
+    ) -> bool:
+        del inbound
+        proposal = self._pending_admin_task_proposal(session)
+        if not proposal:
+            session.metadata.pop(_CLICKUP_PROMPT_KEY, None)
+            return False
+        draft = proposal.get("draft") if isinstance(proposal, dict) else {}
+        title = str(draft.get("title") or "the proposed task") if isinstance(draft, dict) else "the proposed task"
+        await self._send_dm(
+            client,
+            user,
+            session,
+            f"`{title}` is still waiting for Erik or George to approve it. It has not been created or timed yet.",
+            now,
+        )
+        return True
+
     async def _handle_task_creation_prompt(
         self,
         client: discord.Client,
@@ -4243,6 +8394,13 @@ class InternManagementRuntime:
                     prompt,
                     message_prefix="Okay, let's go back to your task tree.",
                 )
+            if await self._resolve_task_draft_intent(
+                text,
+                prompt_type="task_creation",
+                step=step,
+                source=str(prompt.get("source") or ""),
+            ) == "mistaken_task_creation":
+                return await self._return_task_creation_to_existing_selection(client, user, session, now, prompt)
             if lowered in {"top level", "toplevel", "top"}:
                 mission_board_list_id = self.config.clickup.mission_board_list_id if self.config else None
                 if not mission_board_list_id:
@@ -4267,6 +8425,17 @@ class InternManagementRuntime:
                 )
                 return True
             candidate = self._match_task_creation_parent_candidate(prompt, text)
+            if (
+                not candidate
+                and int(prompt.get("placement_context_version") or 0)
+                < _TASK_PLACEMENT_CONTEXT_VERSION
+            ):
+                await self._refresh_legacy_task_creation_placement_context(
+                    user,
+                    session,
+                    prompt,
+                )
+                candidate = self._match_task_creation_parent_candidate(prompt, text)
             if not candidate:
                 await self._send_dm(
                     client,
@@ -4313,6 +8482,13 @@ class InternManagementRuntime:
                     now,
                 )
                 return True
+            if await self._resolve_task_draft_intent(
+                text,
+                prompt_type="task_creation",
+                step=step,
+                source=str(prompt.get("source") or ""),
+            ) == "mistaken_task_creation":
+                return await self._return_task_creation_to_existing_selection(client, user, session, now, prompt)
             if not text:
                 await self._send_dm(client, user, session, "I still need a task title before I can create it.", now)
                 return True
@@ -4339,6 +8515,13 @@ class InternManagementRuntime:
                     now,
                 )
                 return True
+            if await self._resolve_task_draft_intent(
+                text,
+                prompt_type="task_creation",
+                step=step,
+                source=str(prompt.get("source") or ""),
+            ) == "mistaken_task_creation":
+                return await self._return_task_creation_to_existing_selection(client, user, session, now, prompt)
             if not text:
                 await self._send_dm(client, user, session, "I still need a short description for the new task.", now)
                 return True
@@ -4366,6 +8549,17 @@ class InternManagementRuntime:
                 )
                 return True
             draft["description"] = text
+            draft["assignee_id"] = assignee_id
+            if self.config.clickup.new_task_approval_required:
+                await self._submit_new_task_for_admin_review(
+                    client,
+                    user,
+                    session,
+                    prompt,
+                    draft,
+                    now,
+                )
+                return True
             created = await self.clickup.create_task(
                 list_id,
                 name=str(draft.get("title") or "Untitled task"),
@@ -4465,6 +8659,7 @@ class InternManagementRuntime:
         else:
             selection_reason = "Confirmed by intern during task onboarding."
         session.metadata["clickup_selection_reason"] = selection_reason
+        session.metadata[_ACTIVE_TASK_AUTHORITY_KEY] = "intern_confirmed"
         if source in {"intern_switch", "review_rework_switch"}:
             self._clear_pending_intern_task_switch(session)
         session.stage = "active"
@@ -4484,6 +8679,8 @@ class InternManagementRuntime:
         user: UserProfile,
         session: SessionState,
         now: datetime,
+        *,
+        automatic: bool = False,
     ) -> bool:
         self._clear_pending_lunch_confirmation(session)
         if self._progress_probe_prompt(session):
@@ -4514,7 +8711,9 @@ class InternManagementRuntime:
                 now,
             )
             return True
-        if session.stage in {"awaiting_admin_review", "awaiting_clock_out_artifacts", "clocked_out"}:
+        if session.stage in {"awaiting_clock_out_artifacts", "clocked_out"} or (
+            session.stage == "awaiting_admin_review" and not automatic
+        ):
             await self._send_dm(
                 client,
                 user,
@@ -4523,7 +8722,16 @@ class InternManagementRuntime:
                 now,
             )
             return True
-        if session.stage not in {"active", "awaiting_task_selection", "awaiting_plan", "awaiting_start_photo", "awaiting_risk"}:
+        allowed_stages = {
+            "active",
+            "awaiting_task_selection",
+            "awaiting_plan",
+            "awaiting_start_photo",
+            "awaiting_risk",
+        }
+        if automatic:
+            allowed_stages.add("awaiting_admin_review")
+        if session.stage not in allowed_stages:
             return False
         active_task_id = self._active_task_id(session)
         active_task_name = str(session.metadata.get("active_clickup_task_name") or "")
@@ -4535,9 +8743,12 @@ class InternManagementRuntime:
             set_hold=False,
             end_reason="lunch_break",
         )
+        self._close_current_work_segment(session, now)
+        self._record_lunch_window_start(session, now)
         session.metadata["lunch_started_at"] = now.isoformat()
         session.metadata["lunch_last_prompt_at"] = now.isoformat()
         session.metadata["lunch_resume_stage"] = previous_stage
+        session.metadata.pop("meal_guidance_queued_at", None)
         session.metadata.pop("lunch_ended_at", None)
         session.metadata.pop("lunch_resume_requested_at", None)
         if active_task_id:
@@ -4545,10 +8756,16 @@ class InternManagementRuntime:
         if active_task_name:
             session.metadata["lunch_resume_task_name"] = active_task_name
         session.stage = "on_lunch_break"
-        parts = [
-            "Got it. I marked you on lunch break.",
-            "I will check back every 30 minutes until you tell me you are back.",
-        ]
+        if automatic:
+            parts = [
+                "I automatically paused your work time because you reached the meal-break deadline without starting lunch.",
+                "You are now marked on lunch. I will check back every 30 minutes; tell me when you are back before resuming work.",
+            ]
+        else:
+            parts = [
+                "Got it. I marked you on lunch break.",
+                "I will check back every 30 minutes until you tell me you are back.",
+            ]
         if pause_note:
             parts.append(pause_note)
         await self._send_dm(client, user, session, "\n\n".join(parts), now)
@@ -4622,8 +8839,20 @@ class InternManagementRuntime:
         if signals.clocking_out:
             await self._start_clock_out(client, user, session, inbound, now)
             return
-        if getattr(signals, "ending_lunch", False) or self._is_affirmative_reply(text):
-            await self._end_lunch_break(client, user, session, now)
+        if (
+            getattr(signals, "ending_lunch", False)
+            or getattr(signals, "clocked_in", False)
+            or self._looks_like_lunch_resume_reply(text)
+            or self._is_affirmative_reply(text)
+        ):
+            returned_at = self._reported_lunch_return_at(user, session, text, now)
+            await self._end_lunch_break(
+                client,
+                user,
+                session,
+                now,
+                returned_at=returned_at,
+            )
             return
         if self._is_negative_reply(text):
             session.metadata["lunch_last_prompt_at"] = now.isoformat()
@@ -4649,7 +8878,38 @@ class InternManagementRuntime:
         user: UserProfile,
         session: SessionState,
         now: datetime,
+        *,
+        returned_at: datetime | None = None,
     ) -> None:
+        lunch_ended_at = returned_at or now
+        lunch_started_at = self._coerce_datetime_for_reference(
+            str(session.metadata.get("lunch_started_at") or ""),
+            reference=now,
+            timezone_name=self.resolve_user_timezone_name(user),
+        )
+        if lunch_started_at is not None:
+            minimum_end_at = lunch_started_at + timedelta(
+                minutes=self.config.labor.meal_minimum_minutes
+            )
+            if lunch_ended_at < minimum_end_at:
+                remaining_seconds = max(
+                    1,
+                    int((minimum_end_at - lunch_ended_at).total_seconds()),
+                )
+                remaining_minutes = max(1, (remaining_seconds + 59) // 60)
+                session.metadata["lunch_last_prompt_at"] = now.isoformat()
+                await self._send_dm(
+                    client,
+                    user,
+                    session,
+                    (
+                        "Your unpaid meal period is still in progress. "
+                        f"Check back in after about {remaining_minutes} more minute"
+                        f"{'s' if remaining_minutes != 1 else ''}; I will then resume your task timer."
+                    ),
+                    now,
+                )
+                return
         resume_stage = str(session.metadata.get("lunch_resume_stage") or "active")
         task_id = str(session.metadata.get("lunch_resume_task_id") or self._active_task_id(session) or "")
         task_name = str(
@@ -4658,10 +8918,32 @@ class InternManagementRuntime:
             or ""
         )
         prompt = session.metadata.get(_CLICKUP_PROMPT_KEY)
-        session.metadata["lunch_ended_at"] = now.isoformat()
+        session.metadata["lunch_ended_at"] = lunch_ended_at.isoformat()
+        self._record_lunch_window_end(session, lunch_ended_at)
+        self._start_new_work_segment(session, lunch_ended_at)
+        if returned_at is not None and returned_at != now:
+            session.metadata["last_reported_lunch_return"] = {
+                "returned_at": returned_at.isoformat(),
+                "reported_at": now.isoformat(),
+                "source": "intern_message",
+            }
         session.last_follow_up_at = now.isoformat()
         session.metadata.pop("lunch_last_prompt_at", None)
         session.metadata.pop("lunch_resume_requested_at", None)
+        clock_out_guidance = self._post_lunch_clock_out_guidance(user, session, now)
+        if resume_stage == "awaiting_admin_review":
+            session.stage = "awaiting_admin_review"
+            await self._send_dm(
+                client,
+                user,
+                session,
+                "Welcome back. Your completed task is still waiting on admin review; I will message you when they respond.",
+                now,
+            )
+            session.metadata.pop("lunch_resume_stage", None)
+            session.metadata.pop("lunch_resume_task_id", None)
+            session.metadata.pop("lunch_resume_task_name", None)
+            return
         if resume_stage in {"awaiting_task_selection", "awaiting_plan", "awaiting_start_photo", "awaiting_risk"} and isinstance(prompt, dict):
             session.stage = resume_stage
             if resume_stage == "awaiting_start_photo":
@@ -4672,7 +8954,15 @@ class InternManagementRuntime:
                 client,
                 user,
                 session,
-                f"Welcome back. Let's pick up where we left off.\n\n{reminder}",
+                "\n\n".join(
+                    part
+                    for part in (
+                        "Welcome back. Let's pick up where we left off.",
+                        reminder,
+                        clock_out_guidance,
+                    )
+                    if part
+                ),
                 now,
             )
             session.metadata.pop("lunch_resume_stage", None)
@@ -4682,13 +8972,20 @@ class InternManagementRuntime:
         if task_id:
             session.stage = "active"
             session.awaiting_start_photo = False
-            await self._start_task_timer(user, session, now, task_id, task_name)
+            await self._start_task_timer(user, session, lunch_ended_at, task_id, task_name)
             label = task_name or task_id
             await self._send_dm(
                 client,
                 user,
                 session,
-                f"Welcome back. I resumed task tracking for `{label}`.",
+                "\n\n".join(
+                    part
+                    for part in (
+                        f"Welcome back. I resumed task tracking for `{label}`.",
+                        clock_out_guidance,
+                    )
+                    if part
+                ),
                 now,
             )
             session.metadata.pop("lunch_resume_stage", None)
@@ -4710,7 +9007,15 @@ class InternManagementRuntime:
             client,
             user,
             session,
-            f"Welcome back.\n\n{await self._task_onboarding_intro(user, session, tracking)}",
+            "\n\n".join(
+                part
+                for part in (
+                    "Welcome back.",
+                    await self._task_onboarding_intro(user, session, tracking),
+                    clock_out_guidance,
+                )
+                if part
+            ),
             now,
         )
         session.metadata.pop("lunch_resume_stage", None)
@@ -4789,6 +9094,12 @@ class InternManagementRuntime:
             "say `no help`, or say `not blocked`."
         )
 
+    def _blocker_task_opt_in_prompt(self) -> str:
+        return (
+            "I can open a Mission Board blocker task for this. Reply `yes` if you want that, "
+            "or `no` if you only want me to log the blocker locally."
+        )
+
     def _blocker_choose_admin_prompt(self) -> str:
         admin_names = ", ".join(admin.name for admin in self.admin_profiles()) or "the configured admins"
         return (
@@ -4801,6 +9112,14 @@ class InternManagementRuntime:
             "Got it. Do you want me to keep this blocker logged for visibility, or clear it?\n\n"
             "Use the buttons or reply with `keep logged` or `clear it`."
         )
+
+    def _blocker_resolution_prompt_text(self, prompt: dict[str, Any]) -> str:
+        step = str(prompt.get("step") or "offer_help")
+        if step == "choose_admin":
+            return self._blocker_choose_admin_prompt()
+        if step == "declined_help_followup":
+            return self._blocker_declined_help_followup_prompt()
+        return self._blocker_offer_help_prompt()
 
     def _blocker_resolution_view(self, user: UserProfile, step: str) -> discord.ui.View | None:
         if step == "choose_admin" and not self.admin_profiles():
@@ -4831,6 +9150,7 @@ class InternManagementRuntime:
                 "blocker_text": blocker_text or session.latest_blocker or "",
                 "origin_message_id": origin_message_id,
             },
+            "return_prompt": deepcopy(stuck_prompt),
         }
         await self._send_dm(
             client,
@@ -4910,41 +9230,56 @@ class InternManagementRuntime:
                     view=None,
                 )
             return
-        session, now = self.get_user_session_for_moment(user, interaction.created_at)
-        previous_session = self._clone_session_state(session)
-        prompt = session.metadata.get(_CLICKUP_PROMPT_KEY)
-        if not isinstance(prompt, dict) or str(prompt.get("type") or "") not in {"blocker_resolution", "stuck_assistance"}:
-            if interaction.response.is_done():
-                await interaction.followup.send("That blocker prompt is no longer active.")
-            else:
-                await interaction.response.edit_message(content="That blocker prompt is no longer active.", view=None)
-            return
-        await self._handle_blocker_resolution_prompt(
-            interaction.client,
-            user,
-            session,
-            MessageRecord(
-                message_id=f"interaction:{interaction.id}",
-                direction="inbound",
-                author_id=interaction.user.id,
-                created_at=interaction.created_at,
+        async with self._user_session_lock(user.user_key):
+            session, now = self.get_user_session_for_moment(user, interaction.created_at)
+            previous_session = self._clone_session_state(session)
+            prompt = session.metadata.get(_CLICKUP_PROMPT_KEY)
+            if not isinstance(prompt, dict) or str(prompt.get("type") or "") not in {"blocker_resolution", "stuck_assistance"}:
+                if interaction.response.is_done():
+                    await interaction.followup.send("That blocker prompt is no longer active.")
+                else:
+                    await interaction.response.edit_message(content="That blocker prompt is no longer active.", view=None)
+                return
+            self._record_interaction_inbound_message(
+                user,
+                session,
+                interaction,
                 content=action,
-                attachments=[],
-            ),
-            now,
-            prompt,
-            action=action,
-        )
-        session.pending_clickup_sync = True
-        await self._persist_session_state(
-            user,
-            session,
-            now=now,
-            previous_session=previous_session,
-            trigger="blocker_resolution_interaction",
-            details={"action": action},
-        )
-        await self.write_dashboard()
+                now=now,
+            )
+            await self._handle_blocker_resolution_prompt(
+                interaction.client,
+                user,
+                session,
+                MessageRecord(
+                    message_id=f"interaction:{interaction.id}",
+                    direction="inbound",
+                    author_id=interaction.user.id,
+                    created_at=interaction.created_at,
+                    content=action,
+                    attachments=[],
+                ),
+                now,
+                prompt,
+                action=action,
+            )
+            session.pending_clickup_sync = True
+            self._record_interaction_outbound_message(
+                user,
+                session,
+                interaction,
+                content="Recorded.",
+                now=now,
+            )
+            await self._persist_session_state(
+                user,
+                session,
+                now=now,
+                previous_session=previous_session,
+                trigger="blocker_resolution_interaction",
+                details={"action": action},
+            )
+            await self.write_dashboard()
         if interaction.response.is_done():
             await interaction.edit_original_response(content="Recorded.", view=None)
         else:
@@ -4966,41 +9301,56 @@ class InternManagementRuntime:
                     view=None,
                 )
             return
-        session, now = self.get_user_session_for_moment(user, interaction.created_at)
-        previous_session = self._clone_session_state(session)
-        prompt = session.metadata.get(_CLICKUP_PROMPT_KEY)
-        if not isinstance(prompt, dict) or str(prompt.get("type") or "") != "task_onboarding" or str(prompt.get("step") or "") != "confirm_task":
-            if interaction.response.is_done():
-                await interaction.followup.send("That task confirmation is no longer active.")
-            else:
-                await interaction.response.edit_message(content="That task confirmation is no longer active.", view=None)
-            return
-        content = "yes" if action == "confirm" else "no"
-        await self._handle_task_onboarding_prompt(
-            interaction.client,
-            user,
-            session,
-            MessageRecord(
-                message_id=f"interaction:{interaction.id}",
-                direction="inbound",
-                author_id=interaction.user.id,
-                created_at=interaction.created_at,
+        async with self._user_session_lock(user.user_key):
+            session, now = self.get_user_session_for_moment(user, interaction.created_at)
+            previous_session = self._clone_session_state(session)
+            prompt = session.metadata.get(_CLICKUP_PROMPT_KEY)
+            if not isinstance(prompt, dict) or str(prompt.get("type") or "") != "task_onboarding" or str(prompt.get("step") or "") != "confirm_task":
+                if interaction.response.is_done():
+                    await interaction.followup.send("That task confirmation is no longer active.")
+                else:
+                    await interaction.response.edit_message(content="That task confirmation is no longer active.", view=None)
+                return
+            content = "yes" if action == "confirm" else "no"
+            self._record_interaction_inbound_message(
+                user,
+                session,
+                interaction,
                 content=content,
-                attachments=[],
-            ),
-            now,
-            prompt,
-        )
-        session.pending_clickup_sync = True
-        await self._persist_session_state(
-            user,
-            session,
-            now=now,
-            previous_session=previous_session,
-            trigger="task_onboarding_confirmation_interaction",
-            details={"action": action},
-        )
-        await self.write_dashboard()
+                now=now,
+            )
+            await self._handle_task_onboarding_prompt(
+                interaction.client,
+                user,
+                session,
+                MessageRecord(
+                    message_id=f"interaction:{interaction.id}",
+                    direction="inbound",
+                    author_id=interaction.user.id,
+                    created_at=interaction.created_at,
+                    content=content,
+                    attachments=[],
+                ),
+                now,
+                prompt,
+            )
+            session.pending_clickup_sync = True
+            self._record_interaction_outbound_message(
+                user,
+                session,
+                interaction,
+                content="Recorded.",
+                now=now,
+            )
+            await self._persist_session_state(
+                user,
+                session,
+                now=now,
+                previous_session=previous_session,
+                trigger="task_onboarding_confirmation_interaction",
+                details={"action": action},
+            )
+            await self.write_dashboard()
         if interaction.response.is_done():
             await interaction.edit_original_response(content="Recorded.", view=None)
         else:
@@ -5019,45 +9369,372 @@ class InternManagementRuntime:
             else:
                 await interaction.response.edit_message(content="I could not find that user anymore.", view=None)
             return
-        session, now = self.get_user_session_for_moment(user, interaction.created_at)
-        previous_session = self._clone_session_state(session)
-        prompt = session.metadata.get(_CLICKUP_PROMPT_KEY)
-        if not isinstance(prompt, dict) or str(prompt.get("type") or "") != "queued_review_rework_decision":
-            if interaction.response.is_done():
-                await interaction.followup.send("That rework decision is no longer active.")
-            else:
-                await interaction.response.edit_message(content="That rework decision is no longer active.", view=None)
-            return
-        await self._handle_queued_review_rework_decision_prompt(
-            interaction.client,
-            user,
-            session,
-            MessageRecord(
-                message_id=f"interaction:{interaction.id}",
-                direction="inbound",
-                author_id=interaction.user.id,
-                created_at=interaction.created_at,
+        async with self._user_session_lock(user.user_key):
+            session, now = self.get_user_session_for_moment(user, interaction.created_at)
+            previous_session = self._clone_session_state(session)
+            prompt = session.metadata.get(_CLICKUP_PROMPT_KEY)
+            if not isinstance(prompt, dict) or str(prompt.get("type") or "") != "queued_review_rework_decision":
+                if interaction.response.is_done():
+                    await interaction.followup.send("That rework decision is no longer active.")
+                else:
+                    await interaction.response.edit_message(content="That rework decision is no longer active.", view=None)
+                return
+            self._record_interaction_inbound_message(
+                user,
+                session,
+                interaction,
                 content=action,
-                attachments=[],
-            ),
-            now,
-            prompt,
-            action=action,
-        )
-        session.pending_clickup_sync = True
-        await self._persist_session_state(
-            user,
-            session,
-            now=now,
-            previous_session=previous_session,
-            trigger="queued_review_choice_interaction",
-            details={"action": action},
-        )
-        await self.write_dashboard()
+                now=now,
+            )
+            await self._handle_queued_review_rework_decision_prompt(
+                interaction.client,
+                user,
+                session,
+                MessageRecord(
+                    message_id=f"interaction:{interaction.id}",
+                    direction="inbound",
+                    author_id=interaction.user.id,
+                    created_at=interaction.created_at,
+                    content=action,
+                    attachments=[],
+                ),
+                now,
+                prompt,
+                action=action,
+            )
+            session.pending_clickup_sync = True
+            self._record_interaction_outbound_message(
+                user,
+                session,
+                interaction,
+                content="Recorded.",
+                now=now,
+            )
+            await self._persist_session_state(
+                user,
+                session,
+                now=now,
+                previous_session=previous_session,
+                trigger="queued_review_choice_interaction",
+                details={"action": action},
+            )
+            await self.write_dashboard()
         if interaction.response.is_done():
             await interaction.edit_original_response(content="Recorded.", view=None)
         else:
             await interaction.response.edit_message(content="Recorded.", view=None)
+
+    async def _edit_interaction_message(
+        self,
+        interaction: discord.Interaction,
+        *,
+        content: str,
+        view: discord.ui.View | None = None,
+    ) -> None:
+        if interaction.response.is_done():
+            edit_original = getattr(interaction, "edit_original_response", None)
+            if callable(edit_original):
+                await edit_original(content=content, view=view)
+                return
+            message = getattr(interaction, "message", None)
+            edit_message = getattr(message, "edit", None)
+            if callable(edit_message):
+                await edit_message(content=content, view=view)
+                return
+            followup = getattr(interaction, "followup", None)
+            send = getattr(followup, "send", None)
+            if callable(send):
+                await send(content)
+                return
+            return
+        await interaction.response.edit_message(content=content, view=view)
+
+    async def _defer_interaction_response(self, interaction: discord.Interaction) -> None:
+        response = getattr(interaction, "response", None)
+        if response is None or response.is_done():
+            return
+        defer = getattr(response, "defer", None)
+        if callable(defer):
+            await defer()
+
+    async def _dismiss_interaction_message(
+        self,
+        interaction: discord.Interaction,
+        *,
+        fallback_content: str,
+    ) -> None:
+        message = getattr(interaction, "message", None)
+        delete_message = getattr(message, "delete", None)
+        if callable(delete_message):
+            try:
+                await delete_message()
+            except Exception:
+                pass
+            else:
+                if not interaction.response.is_done():
+                    defer = getattr(interaction.response, "defer", None)
+                    if callable(defer):
+                        await defer()
+                return
+        await self._edit_interaction_message(
+            interaction,
+            content=fallback_content,
+            view=None,
+        )
+
+    async def handle_self_lookup_interaction(
+        self,
+        interaction: discord.Interaction,
+        user_key: str,
+        session_date: str,
+        action: str,
+    ) -> None:
+        await self._defer_interaction_response(interaction)
+        user = self.roster_by_key.get(user_key)
+        if not user:
+            await self._edit_interaction_message(
+                interaction,
+                content="I could not find that user anymore.",
+                view=None,
+            )
+            return
+        async with self._user_session_lock(user.user_key):
+            session = self.state_store.get_session(user.user_key, session_date)
+            self._normalize_session_state(session, user=user)
+            now = self.resolve_user_local_now(user, interaction.created_at)
+            previous_session = self._clone_session_state(session)
+            prompt = self._self_lookup_prompt(session)
+            prompt_message_id = str((prompt or {}).get("message_id") or "")
+            interaction_message_id = str(getattr(getattr(interaction, "message", None), "id", "") or "")
+            if (
+                not prompt
+                or (
+                    prompt_message_id
+                    and interaction_message_id
+                    and prompt_message_id != interaction_message_id
+                )
+            ):
+                await self._edit_interaction_message(
+                    interaction,
+                    content="That info request is no longer active.",
+                    view=None,
+                )
+                return
+            self._record_interaction_inbound_message(
+                user,
+                session,
+                interaction,
+                content=action,
+                now=now,
+            )
+            prompt_step = str(prompt.get("step") or "chooser")
+            if action == "dismiss":
+                self._clear_self_lookup_prompt(session)
+                await self._persist_session_state(
+                    user,
+                    session,
+                    now=now,
+                    previous_session=previous_session,
+                    trigger="self_lookup_interaction",
+                    details={"action": action},
+                )
+                await self.write_dashboard()
+                await self._dismiss_interaction_message(
+                    interaction,
+                    fallback_content="Okay, dismissed.",
+                )
+                return
+            if prompt_step == "chooser" and action == "hours":
+                reply = "What range of hours do you want to know?"
+                prompt["step"] = "range"
+                prompt["last_action_at"] = now.isoformat()
+                if interaction_message_id:
+                    prompt["message_id"] = interaction_message_id
+                self._record_interaction_outbound_message(
+                    user,
+                    session,
+                    interaction,
+                    content=reply,
+                    now=now,
+                )
+                await self._persist_session_state(
+                    user,
+                    session,
+                    now=now,
+                    previous_session=previous_session,
+                    trigger="self_lookup_interaction",
+                    details={"action": action},
+                )
+                await self.write_dashboard()
+                await self._edit_interaction_message(
+                    interaction,
+                    content=reply,
+                    view=self._self_lookup_hours_range_view(user, session.session_date),
+                )
+                return
+            if prompt_step == "chooser" and action == "status":
+                self._clear_self_lookup_prompt(session)
+                reply = self._build_self_status_reply(user, session, now)
+                self._record_interaction_outbound_message(
+                    user,
+                    session,
+                    interaction,
+                    content=reply,
+                    now=now,
+                )
+                await self._persist_session_state(
+                    user,
+                    session,
+                    now=now,
+                    previous_session=previous_session,
+                    trigger="self_lookup_interaction",
+                    details={"action": action},
+                )
+                await self.write_dashboard()
+                await self._edit_interaction_message(
+                    interaction,
+                    content=reply,
+                    view=None,
+                )
+                return
+            if prompt_step == "range" and action in _SELF_LOOKUP_RANGE_LABELS:
+                self._clear_self_lookup_prompt(session)
+                reply = await self._build_self_hours_reply_for_range(user, session, now, action)
+                self._record_interaction_outbound_message(
+                    user,
+                    session,
+                    interaction,
+                    content=reply,
+                    now=now,
+                )
+                await self._persist_session_state(
+                    user,
+                    session,
+                    now=now,
+                    previous_session=previous_session,
+                    trigger="self_lookup_interaction",
+                    details={"action": action},
+                )
+                await self.write_dashboard()
+                await self._edit_interaction_message(
+                    interaction,
+                    content=reply,
+                    view=None,
+                )
+                return
+        await self._edit_interaction_message(
+            interaction,
+            content="That info request is no longer active.",
+            view=None,
+        )
+
+    async def handle_day_suppression_interaction(
+        self,
+        interaction: discord.Interaction,
+        user_key: str,
+        session_date: str,
+        action: str,
+    ) -> None:
+        user = self.roster_by_key.get(user_key)
+        if not user:
+            await self._edit_interaction_message(
+                interaction,
+                content="I could not find that user anymore.",
+                view=None,
+            )
+            return
+        async with self._user_session_lock(user.user_key):
+            session = self.state_store.get_session(user.user_key, session_date)
+            self._normalize_session_state(session, user=user)
+            now = self.resolve_user_local_now(user, interaction.created_at)
+            previous_session = self._clone_session_state(session)
+            prompt = self._day_suppression_prompt(session)
+            prompt_message_id = str((prompt or {}).get("message_id") or "")
+            interaction_message_id = str(getattr(getattr(interaction, "message", None), "id", "") or "")
+            if (
+                not prompt
+                or (
+                    prompt_message_id
+                    and interaction_message_id
+                    and prompt_message_id != interaction_message_id
+                )
+            ):
+                await self._edit_interaction_message(
+                    interaction,
+                    content="That schedule pause request is no longer active.",
+                    view=None,
+                )
+                return
+            self._record_interaction_inbound_message(
+                user,
+                session,
+                interaction,
+                content=action,
+                now=now,
+            )
+            if action == "confirm":
+                self._clear_day_suppression_prompt(session)
+                session.metadata[_DAY_SUPPRESSION_STATE_KEY] = {
+                    "session_date": session.session_date,
+                    "confirmed_at": now.isoformat(),
+                    "source_message_id": str(prompt.get("source_message_id") or ""),
+                    "source_excerpt": str(prompt.get("source_excerpt") or ""),
+                }
+                reply = "Okay, I will stop reminders and check-ins for the rest of today."
+                if session.clocked_in_at and not session.clocked_out_at:
+                    reply += " If you still need to end your shift, tell me to clock out when you are ready."
+                self._record_interaction_outbound_message(
+                    user,
+                    session,
+                    interaction,
+                    content=reply,
+                    now=now,
+                )
+                await self._persist_session_state(
+                    user,
+                    session,
+                    now=now,
+                    previous_session=previous_session,
+                    trigger="day_suppression_interaction",
+                    details={"action": action},
+                )
+                await self.write_dashboard()
+                await self._edit_interaction_message(
+                    interaction,
+                    content=reply,
+                    view=None,
+                )
+                return
+            if action == "cancel":
+                self._clear_day_suppression_prompt(session)
+                reply = "Okay, I will keep today's normal reminders on."
+                self._record_interaction_outbound_message(
+                    user,
+                    session,
+                    interaction,
+                    content=reply,
+                    now=now,
+                )
+                await self._persist_session_state(
+                    user,
+                    session,
+                    now=now,
+                    previous_session=previous_session,
+                    trigger="day_suppression_interaction",
+                    details={"action": action},
+                )
+                await self.write_dashboard()
+                await self._edit_interaction_message(
+                    interaction,
+                    content=reply,
+                    view=None,
+                )
+                return
+        await self._edit_interaction_message(
+            interaction,
+            content="That schedule pause request is no longer active.",
+            view=None,
+        )
 
     async def handle_progress_probe_admin_interaction(
         self,
@@ -5083,66 +9760,67 @@ class InternManagementRuntime:
             else:
                 await interaction.response.edit_message(content="I could not find that user anymore.", view=None)
             return
-        session = self.state_store.get_session(user.user_key, session_date)
-        now = self.resolve_user_local_now(user, interaction.created_at)
-        previous_session = self._clone_session_state(session)
-        prompt = self._progress_probe_prompt(session)
-        if prompt and str(prompt.get("probe_id") or "") == probe_id:
-            subscribed = prompt.setdefault("subscribed_admin_ids", [])
-            if admin.discord_user_id not in subscribed:
-                subscribed.append(admin.discord_user_id)
-            prompt["last_activity_at"] = now.isoformat()
-            session.pending_clickup_sync = True
-            await self._persist_session_state(
-                user,
-                session,
-                now=now,
-                previous_session=previous_session,
-                trigger="progress_probe_admin_subscription",
-                details={"admin": admin.name, "probe_id": probe_id},
-            )
-            await self.write_dashboard()
-            await self._send_progress_probe_exchange_to_admin(
-                interaction.client,
-                admin,
-                user,
-                session,
-                prompt,
-                include_closure=False,
-            )
-            if interaction.response.is_done():
-                await interaction.edit_original_response(
-                    content="Subscribed. I will forward later probe replies here.",
-                    view=None,
+        async with self._user_session_lock(user.user_key):
+            session = self.state_store.get_session(user.user_key, session_date)
+            now = self.resolve_user_local_now(user, interaction.created_at)
+            previous_session = self._clone_session_state(session)
+            prompt = self._progress_probe_prompt(session)
+            if prompt and str(prompt.get("probe_id") or "") == probe_id:
+                subscribed = prompt.setdefault("subscribed_admin_ids", [])
+                if admin.discord_user_id not in subscribed:
+                    subscribed.append(admin.discord_user_id)
+                prompt["last_activity_at"] = now.isoformat()
+                session.pending_clickup_sync = True
+                await self._persist_session_state(
+                    user,
+                    session,
+                    now=now,
+                    previous_session=previous_session,
+                    trigger="progress_probe_admin_subscription",
+                    details={"admin": admin.name, "probe_id": probe_id},
                 )
-            else:
-                await interaction.response.edit_message(
-                    content="Subscribed. I will forward later probe replies here.",
-                    view=None,
+                await self.write_dashboard()
+                await self._send_progress_probe_exchange_to_admin(
+                    interaction.client,
+                    admin,
+                    user,
+                    session,
+                    prompt,
+                    include_closure=False,
                 )
-            return
-        for exchange in reversed(self._progress_probe_history(session)):
-            if str(exchange.get("probe_id") or "") != probe_id:
-                continue
-            await self._send_progress_probe_exchange_to_admin(
-                interaction.client,
-                admin,
-                user,
-                session,
-                exchange,
-                include_closure=True,
-            )
-            if interaction.response.is_done():
-                await interaction.edit_original_response(
-                    content="That probe is already closed. I sent you the recorded exchange.",
-                    view=None,
+                if interaction.response.is_done():
+                    await interaction.edit_original_response(
+                        content="Subscribed. I will forward later probe replies here.",
+                        view=None,
+                    )
+                else:
+                    await interaction.response.edit_message(
+                        content="Subscribed. I will forward later probe replies here.",
+                        view=None,
+                    )
+                return
+            for exchange in reversed(self._progress_probe_history(session)):
+                if str(exchange.get("probe_id") or "") != probe_id:
+                    continue
+                await self._send_progress_probe_exchange_to_admin(
+                    interaction.client,
+                    admin,
+                    user,
+                    session,
+                    exchange,
+                    include_closure=True,
                 )
-            else:
-                await interaction.response.edit_message(
-                    content="That probe is already closed. I sent you the recorded exchange.",
-                    view=None,
-                )
-            return
+                if interaction.response.is_done():
+                    await interaction.edit_original_response(
+                        content="That probe is already closed. I sent you the recorded exchange.",
+                        view=None,
+                    )
+                else:
+                    await interaction.response.edit_message(
+                        content="That probe is already closed. I sent you the recorded exchange.",
+                        view=None,
+                    )
+                return
         if interaction.response.is_done():
             await interaction.followup.send("That progress probe is no longer available.")
         else:
@@ -5299,6 +9977,8 @@ class InternManagementRuntime:
         await self._send_admin_unblocker_task_request(client, user, session, now)
 
     def _self_assigned_unblocker_fallback_reason(self, draft: dict[str, Any]) -> str | None:
+        if self.config and self.config.clickup.new_task_approval_required:
+            return "New ClickUp tasks require Erik or George approval."
         if not self.clickup or not self.config:
             return "I could not create that task directly because ClickUp is unavailable."
         if not self.config.clickup.mission_board_list_id:
@@ -5454,7 +10134,7 @@ class InternManagementRuntime:
             client,
             user,
             session,
-            "I can open a Mission Board blocker task for this. Reply `yes` if you want that, or `no` if you only want me to log the blocker locally.",
+            self._blocker_task_opt_in_prompt(),
             now,
         )
 
@@ -5622,6 +10302,7 @@ class InternManagementRuntime:
         await self._send_admin_notice(
             client,
             message,
+            target_admins=self._task_approval_admins(),
             user=user,
             session=session,
         )
@@ -5761,6 +10442,158 @@ class InternManagementRuntime:
         await self.write_dashboard()
         return "The blocker is cleared, but I still need the active task re-confirmed before I can resume it."
 
+    async def resolve_admin_task_proposal(
+        self,
+        client: discord.Client,
+        user: UserProfile,
+        session: SessionState,
+        *,
+        approve_create: bool,
+        admin_message: str,
+        resolved_by: str = "Admin",
+        now: datetime | None = None,
+    ) -> str:
+        await self.refresh_configuration()
+        if not self.config or not self.clickup:
+            return "ClickUp is not configured."
+        proposal = self._pending_admin_task_proposal(session)
+        if not proposal:
+            return f"{user.display_name} does not have a new-task proposal waiting on approval."
+        draft = proposal.get("draft")
+        if not isinstance(draft, dict):
+            return f"{user.display_name} does not have a valid new-task proposal saved."
+        previous_session = self._clone_session_state(session)
+        now = now or self.resolve_user_local_now(user)
+        if approve_create:
+            list_id = str(draft.get("list_id") or "").strip()
+            if not list_id:
+                return "The proposal is missing its ClickUp list placement. Request a revision instead."
+            created = await self.clickup.create_task(
+                list_id,
+                name=str(draft.get("title") or "Untitled task"),
+                description=str(draft.get("description") or ""),
+                assignee_ids=[str(draft["assignee_id"])] if draft.get("assignee_id") else None,
+                parent_task_id=str(draft.get("parent_task_id") or "").strip() or None,
+            )
+            created_id = str(created.get("id") or "")
+            created_name = str(created.get("name") or draft.get("title") or "the new task")
+            session.metadata.pop("pending_admin_task_proposal", None)
+            session.metadata["last_admin_task_proposal_resolution"] = {
+                "decision": "created",
+                "at": now.isoformat(),
+                "message": admin_message,
+                "created_task_id": created_id,
+                "category": str(proposal.get("category") or "project"),
+                "resolved_by": resolved_by,
+            }
+            session.metadata[_CLICKUP_PROMPT_KEY] = {
+                "type": "task_onboarding",
+                "source": str(proposal.get("source") or "task_onboarding"),
+                "step": "plan",
+                "task_id": created_id,
+                "task_name": created_name,
+                "reason": str(proposal.get("reason") or "Approved new task proposal."),
+                "draft": {},
+            }
+            session.metadata["last_task_onboarding_prompt_at"] = now.isoformat()
+            session.stage = "awaiting_plan"
+            session.latest_plan = None
+            session.latest_feedback = None
+            await self._send_dm(
+                client,
+                user,
+                session,
+                (
+                    f"Erik or George approved your {proposal.get('category') or 'project'} task proposal. "
+                    f"I created `{created_name}` in ClickUp and assigned it to you.\n\n"
+                    + self._task_onboarding_question(
+                        session.metadata[_CLICKUP_PROMPT_KEY],
+                        "plan",
+                    )
+                ),
+                now,
+            )
+            await self._notify_other_task_approvers(
+                client,
+                resolved_by=resolved_by,
+                content=(
+                    f"{resolved_by} approved {user.display_name}'s "
+                    f"{proposal.get('category') or 'project'} task proposal and created "
+                    f"`{created_name}` in ClickUp."
+                ),
+                user=user,
+                session=session,
+            )
+            await self._persist_session_state(
+                user,
+                session,
+                now=now,
+                previous_session=previous_session,
+                trigger="admin_task_proposal_resolution",
+                details={
+                    "decision": "create",
+                    "created_task_id": created_id,
+                    "created_task_name": created_name,
+                    "category": str(proposal.get("category") or "project"),
+                    "admin_message_excerpt": self._excerpt_text(admin_message),
+                },
+            )
+            await self.write_dashboard()
+            return f"Created `{created_name}` for {user.display_name}."
+        original_prompt = proposal.get("original_prompt")
+        restored = deepcopy(original_prompt) if isinstance(original_prompt, dict) else {
+            "type": "task_creation",
+            "source": str(proposal.get("source") or "task_onboarding"),
+            "draft": deepcopy(draft),
+        }
+        restored["type"] = "task_creation"
+        restored["step"] = "description"
+        restored["draft"] = deepcopy(draft)
+        session.metadata.pop("pending_admin_task_proposal", None)
+        session.metadata["last_admin_task_proposal_resolution"] = {
+            "decision": "revise",
+            "at": now.isoformat(),
+            "message": admin_message,
+            "resolved_by": resolved_by,
+        }
+        session.metadata[_CLICKUP_PROMPT_KEY] = restored
+        session.stage = "awaiting_task_selection"
+        await self._send_dm(
+            client,
+            user,
+            session,
+            (
+                "Erik or George requested a revision before this task can be created.\n\n"
+                f"Feedback:\n{admin_message}\n\n"
+                "Reply with a revised description, or reply `back` to change the title."
+            ),
+            now,
+        )
+        await self._notify_other_task_approvers(
+            client,
+            resolved_by=resolved_by,
+            content=(
+                f"{resolved_by} requested revisions to {user.display_name}'s "
+                f"{proposal.get('category') or 'project'} task proposal."
+            ),
+            user=user,
+            session=session,
+        )
+        await self._persist_session_state(
+            user,
+            session,
+            now=now,
+            previous_session=previous_session,
+            trigger="admin_task_proposal_resolution",
+            details={
+                "decision": "revise",
+                "category": str(proposal.get("category") or "project"),
+                "admin_message_excerpt": self._excerpt_text(admin_message),
+            },
+        )
+        await self.write_dashboard()
+        return f"Sent task-proposal revision feedback to {user.display_name}."
+
     async def resolve_admin_unblocker_task(
         self,
         client: discord.Client,
@@ -5769,6 +10602,7 @@ class InternManagementRuntime:
         *,
         approve_create: bool,
         admin_message: str,
+        resolved_by: str = "Admin",
         now: datetime | None = None,
     ) -> str:
         await self.refresh_configuration()
@@ -5803,6 +10637,7 @@ class InternManagementRuntime:
                 "at": now.isoformat(),
                 "message": admin_message,
                 "created_task_id": created_id,
+                "resolved_by": resolved_by,
             }
             await self._send_dm(
                 client,
@@ -5810,6 +10645,16 @@ class InternManagementRuntime:
                 session,
                 f"Admin approved the unblocker task, so I created `{created_name}` in ClickUp.",
                 now,
+            )
+            await self._notify_other_task_approvers(
+                client,
+                resolved_by=resolved_by,
+                content=(
+                    f"{resolved_by} approved {user.display_name}'s unblocker task "
+                    f"and created `{created_name}` in ClickUp."
+                ),
+                user=user,
+                session=session,
             )
             await self._persist_session_state(
                 user,
@@ -5830,6 +10675,7 @@ class InternManagementRuntime:
             "decision": "revise",
             "at": now.isoformat(),
             "message": admin_message,
+            "resolved_by": resolved_by,
         }
         session.metadata.pop("pending_admin_unblocker_task", None)
         session.metadata[_CLICKUP_PROMPT_KEY] = {
@@ -5848,6 +10694,16 @@ class InternManagementRuntime:
                 "Send me a revised short title to start the draft again."
             ),
             now,
+        )
+        await self._notify_other_task_approvers(
+            client,
+            resolved_by=resolved_by,
+            content=(
+                f"{resolved_by} requested revisions to {user.display_name}'s "
+                "unblocker task proposal."
+            ),
+            user=user,
+            session=session,
         )
         await self._persist_session_state(
             user,
@@ -5964,7 +10820,12 @@ class InternManagementRuntime:
             and str(prompt.get("step") or "") == "photo"
             and session.stage == "awaiting_start_photo"
         ):
-            last_prompt_at = self._metadata_datetime(session, "last_task_onboarding_prompt_at")
+            last_prompt_at = self._metadata_datetime(
+                session,
+                "last_task_onboarding_prompt_at",
+                reference=now,
+                timezone_name=self.resolve_user_timezone_name(user),
+            )
             if last_prompt_at and now - last_prompt_at < timedelta(minutes=self.config.schedule.task_onboarding_interval_minutes):
                 return False
             session.metadata["last_task_onboarding_prompt_at"] = now.isoformat()
@@ -5981,10 +10842,16 @@ class InternManagementRuntime:
         if session.stage != "active":
             return False
         tracking = await self._get_task_tracking_state(user, session)
+        self._reconcile_active_task_with_tracking(session, tracking)
         if tracking["active_task_id"] and tracking["timer_running"]:
             return False
         if isinstance(prompt, dict) and str(prompt.get("type") or "") == "task_onboarding":
-            last_prompt_at = self._metadata_datetime(session, "last_task_onboarding_prompt_at")
+            last_prompt_at = self._metadata_datetime(
+                session,
+                "last_task_onboarding_prompt_at",
+                reference=now,
+                timezone_name=self.resolve_user_timezone_name(user),
+            )
             if last_prompt_at and now - last_prompt_at < timedelta(minutes=self.config.schedule.task_onboarding_interval_minutes):
                 return False
             session.metadata["last_task_onboarding_prompt_at"] = now.isoformat()
@@ -5996,7 +10863,12 @@ class InternManagementRuntime:
                 now,
             )
             return True
-        last_prompt_at = self._metadata_datetime(session, "last_task_onboarding_prompt_at")
+        last_prompt_at = self._metadata_datetime(
+            session,
+            "last_task_onboarding_prompt_at",
+            reference=now,
+            timezone_name=self.resolve_user_timezone_name(user),
+        )
         if last_prompt_at and now - last_prompt_at < timedelta(minutes=self.config.schedule.task_onboarding_interval_minutes):
             return False
         session.metadata[_CLICKUP_PROMPT_KEY] = {
@@ -6222,6 +11094,7 @@ class InternManagementRuntime:
         session.metadata["active_clickup_task_id"] = task_id
         if task_name:
             session.metadata["active_clickup_task_name"] = task_name
+        session.metadata.setdefault(_ACTIVE_TASK_AUTHORITY_KEY, "activated")
         status_name = await self._safe_set_task_state(session, task_id, "in_progress")
         await self._start_task_timer(user, session, now, task_id, task_name)
         tracking_state = await self._get_task_tracking_state(user, session)
@@ -6250,25 +11123,31 @@ class InternManagementRuntime:
             "source": "local",
         }
         if self.clickup and self.config and self.config.clickup.create_time_entries:
-            assignee_id = await self.clickup.resolve_clickup_user_id(user)
-            if assignee_id:
-                entry = await self.clickup.get_running_time_entry(assignee_id) if self.clickup.can_query_assignee_timers() else None
-                entry_task_id = self._time_entry_task_id(entry) if entry else None
-                if entry and entry_task_id == task_id:
-                    new_tracking["source"] = "remote"
-                    new_tracking["remote_entry_id"] = str(entry.get("id") or entry.get("timer_id") or "")
-                    new_tracking["started_at"] = self._time_entry_start_iso(entry, now)
-                elif self.clickup._assignee_timer_start_supported is not False:
-                    started = await self.clickup.start_assignee_timer(
-                        assignee_id=assignee_id,
-                        task_id=task_id,
-                        start_ms=int(now.timestamp() * 1000),
-                        description=self._build_time_entry_description(session),
-                    )
-                    if started:
+            try:
+                assignee_id = await self.clickup.resolve_clickup_user_id(user)
+                if assignee_id:
+                    entry = await self.clickup.get_running_time_entry(assignee_id) if self.clickup.can_query_assignee_timers() else None
+                    entry_task_id = self._time_entry_task_id(entry) if entry else None
+                    if entry and entry_task_id == task_id:
                         new_tracking["source"] = "remote"
-                        new_tracking["remote_entry_id"] = str(started.get("id") or started.get("timer_id") or "")
-                        new_tracking["started_at"] = self._time_entry_start_iso(started, now)
+                        new_tracking["remote_entry_id"] = str(entry.get("id") or entry.get("timer_id") or "")
+                        new_tracking["started_at"] = self._time_entry_start_iso(entry, now)
+                    elif self.clickup._assignee_timer_start_supported is not False:
+                        started = await self.clickup.start_assignee_timer(
+                            assignee_id=assignee_id,
+                            task_id=task_id,
+                            start_ms=int(now.timestamp() * 1000),
+                            description=self._build_time_entry_description(session),
+                        )
+                        if started:
+                            new_tracking["source"] = "remote"
+                            new_tracking["remote_entry_id"] = str(started.get("id") or started.get("timer_id") or "")
+                            new_tracking["started_at"] = self._time_entry_start_iso(started, now)
+            except Exception:
+                logger.exception(
+                    "Could not start remote task time for %s; using the local timer.",
+                    user.user_key,
+                )
         session.metadata["clickup_time_tracking"] = new_tracking
 
     async def _pause_current_task_tracking(
@@ -6283,7 +11162,13 @@ class InternManagementRuntime:
         active_task_id = self._active_task_id(session)
         active_task_name = str(session.metadata.get("active_clickup_task_name") or "the active task")
         if active_task_id and set_hold:
-            await self._safe_set_task_state(session, active_task_id, "hold")
+            try:
+                await self._safe_set_task_state(session, active_task_id, "hold")
+            except Exception:
+                logger.exception(
+                    "Could not put ClickUp task %s on hold while pausing tracking.",
+                    active_task_id,
+                )
         tracking = session.metadata.get("clickup_time_tracking")
         if not isinstance(tracking, dict) or tracking.get("closed_at"):
             return None
@@ -6296,29 +11181,35 @@ class InternManagementRuntime:
         start_dt = datetime.fromisoformat(started_at)
         synced = False
         if self.clickup and self.config and self.config.clickup.create_time_entries:
-            remote_entry_id = str(tracking.get("remote_entry_id") or "")
-            if remote_entry_id:
-                synced = bool(
-                    await self.clickup.close_time_entry(
-                        timer_id=remote_entry_id,
-                        start_ms=int(start_dt.timestamp() * 1000),
-                        stop_ms=int(now.timestamp() * 1000),
-                        description=description,
-                        task_id=tracked_task_id or None,
-                    )
-                )
-            else:
-                assignee_id = await self.clickup.resolve_clickup_user_id(user)
-                if assignee_id:
+            try:
+                remote_entry_id = str(tracking.get("remote_entry_id") or "")
+                if remote_entry_id:
                     synced = bool(
-                        await self.clickup.create_time_entry(
-                            assignee_id=assignee_id,
-                            task_id=tracked_task_id or None,
+                        await self.clickup.close_time_entry(
+                            timer_id=remote_entry_id,
                             start_ms=int(start_dt.timestamp() * 1000),
                             stop_ms=int(now.timestamp() * 1000),
                             description=description,
+                            task_id=tracked_task_id or None,
                         )
                     )
+                else:
+                    assignee_id = await self.clickup.resolve_clickup_user_id(user)
+                    if assignee_id:
+                        synced = bool(
+                            await self.clickup.create_time_entry(
+                                assignee_id=assignee_id,
+                                task_id=tracked_task_id or None,
+                                start_ms=int(start_dt.timestamp() * 1000),
+                                stop_ms=int(now.timestamp() * 1000),
+                                description=description,
+                            )
+                        )
+            except Exception:
+                logger.exception(
+                    "Could not synchronize paused task time for %s; keeping the local window.",
+                    user.user_key,
+                )
         tracking["closed_at"] = now.isoformat()
         tracking["duration_seconds"] = max(0, int((now - start_dt).total_seconds()))
         tracking["sync_result"] = "synced" if synced else "local_only"
@@ -6425,6 +11316,48 @@ class InternManagementRuntime:
             "timer_elapsed_seconds": timer_elapsed_seconds,
         }
 
+    def _reconcile_active_task_with_tracking(
+        self,
+        session: SessionState,
+        tracking: dict[str, Any],
+    ) -> bool:
+        timer_task_id = str(tracking.get("timer_task_id") or "").strip()
+        if not timer_task_id:
+            return False
+        timer_task_name = str(tracking.get("timer_task_name") or "").strip() or None
+        active_task_id = self._active_task_id(session)
+        active_task_name = str(session.metadata.get("active_clickup_task_name") or "").strip() or None
+        changed = False
+        drifted = bool(active_task_id and active_task_id != timer_task_id)
+
+        if active_task_id != timer_task_id:
+            session.metadata["active_clickup_task_id"] = timer_task_id
+            tracking["active_task_id"] = timer_task_id
+            changed = True
+        if not session.metadata.get(_ACTIVE_TASK_AUTHORITY_KEY):
+            session.metadata[_ACTIVE_TASK_AUTHORITY_KEY] = "timer_recovered"
+            changed = True
+        if timer_task_name:
+            if active_task_name != timer_task_name:
+                session.metadata["active_clickup_task_name"] = timer_task_name
+                changed = True
+            tracking["active_task_name"] = timer_task_name
+        elif active_task_id != timer_task_id and active_task_name:
+            session.metadata.pop("active_clickup_task_name", None)
+            tracking["active_task_name"] = None
+            changed = True
+        if drifted:
+            session.metadata["clickup_selection_reason"] = (
+                "Recovered from the running task timer after active task metadata drifted."
+            )
+            changed = True
+        if str(tracking.get("timer_task_id") or "").strip() == str(tracking.get("active_task_id") or "").strip():
+            tracking["timer_running"] = bool(tracking.get("timer_task_id"))
+            timer_note = str(tracking.get("timer_note") or "")
+            if timer_note.startswith("timer appears tied to a different task"):
+                tracking["timer_note"] = None
+        return changed
+
     def _build_time_entry_description(self, session: SessionState) -> str:
         parts = ["Intern work session"]
         if session.latest_plan:
@@ -6463,11 +11396,1160 @@ class InternManagementRuntime:
             return fallback_now.isoformat()
         return datetime.fromtimestamp(start_ms / 1000, tz=fallback_now.tzinfo).isoformat()
 
+    def _storage_root_path(self) -> Path | None:
+        storage_root = getattr(self.bootstrap, "storage_root_path", None)
+        if not storage_root:
+            return None
+        return Path(storage_root)
+
+    def _time_tracking_report_path(self) -> Path | None:
+        storage_root = self._storage_root_path()
+        if storage_root is None:
+            return None
+        return storage_root / _TIME_TRACKING_REPORT_RELATIVE_PATH
+
+    def _resolve_session_archive_path(
+        self,
+        user: UserProfile,
+        session_date: str,
+    ) -> Path | None:
+        storage_root = self._storage_root_path()
+        if storage_root is None:
+            return None
+        return (
+            storage_root
+            / "people"
+            / _safe_storage_name(user.storage_folder_name or user.user_key)
+            / session_date
+            / "session.json"
+        )
+
+    def _manual_time_edits_path(
+        self,
+        user: UserProfile,
+        session_date: str,
+    ) -> Path | None:
+        archive_path = self._resolve_session_archive_path(user, session_date)
+        if archive_path is None:
+            return None
+        return archive_path.with_name(_MANUAL_TIME_EDITS_FILENAME)
+
+    def _load_session_for_manual_time_edit(
+        self,
+        user: UserProfile,
+        session_date: str,
+    ) -> SessionState:
+        session = self.state_store.get_session(user.user_key, session_date)
+        self._normalize_session_state(session, user=user)
+        if (
+            session.session_date == session_date
+            and (
+                session.work_segments
+                or session.clocked_in_at
+                or session.clocked_out_at
+                or session.metadata
+                or session.stage != "awaiting_clock_in"
+            )
+        ):
+            return session
+        archive_path = self._resolve_session_archive_path(user, session_date)
+        if archive_path is None or not archive_path.exists():
+            return session
+        try:
+            archived = SessionState(**json.loads(archive_path.read_text(encoding="utf-8")))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return session
+        self._normalize_session_state(archived, user=user)
+        return archived
+
+    async def preview_manual_time_edit(
+        self,
+        user_key: str,
+        session_date: str,
+        segments: list[dict[str, Any]],
+        *,
+        edited_by: str,
+        reason: str,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        await self.refresh_configuration()
+        user = self.resolve_user_profile(user_key)
+        if user is None:
+            raise ValueError(f"Unknown user_key {user_key!r}.")
+        reference_now = now or self.resolve_user_local_now(user)
+        session = self._load_session_for_manual_time_edit(user, session_date)
+        _edited_session, preview_payload, _audit_entry = self._build_manual_time_edit_preview(
+            user,
+            session,
+            segments,
+            edited_by=edited_by,
+            reason=reason,
+            now=reference_now,
+        )
+        return preview_payload
+
+    async def apply_manual_time_edit(
+        self,
+        user_key: str,
+        session_date: str,
+        segments: list[dict[str, Any]],
+        *,
+        edited_by: str,
+        reason: str,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        await self.refresh_configuration()
+        user = self.resolve_user_profile(user_key)
+        if user is None:
+            raise ValueError(f"Unknown user_key {user_key!r}.")
+        reference_now = now or self.resolve_user_local_now(user)
+        current_session = self._load_session_for_manual_time_edit(user, session_date)
+        previous_session = self._clone_session_state(current_session)
+        edited_session, preview_payload, audit_entry = self._build_manual_time_edit_preview(
+            user,
+            current_session,
+            segments,
+            edited_by=edited_by,
+            reason=reason,
+            now=reference_now,
+        )
+        self._append_manual_time_edit_metadata(edited_session, audit_entry)
+        await self._persist_session_state(
+            user,
+            edited_session,
+            now=reference_now,
+            previous_session=previous_session,
+            trigger="manual_time_edit",
+            details={
+                "edited_by": str(audit_entry.get("edited_by") or ""),
+                "reason": str(audit_entry.get("reason") or ""),
+                "session_date": session_date,
+                "old_segment_count": len(audit_entry.get("old_work_segments") or []),
+                "new_segment_count": len(audit_entry.get("new_work_segments") or []),
+                "clocked_in_delta_seconds": (
+                    int(audit_entry.get("new_clocked_in_total_seconds") or 0)
+                    - int(audit_entry.get("old_clocked_in_total_seconds") or 0)
+                ),
+                "task_tracked_delta_seconds": (
+                    int(audit_entry.get("new_task_tracked_total_seconds") or 0)
+                    - int(audit_entry.get("old_task_tracked_total_seconds") or 0)
+                ),
+            },
+        )
+        workspace = await self.store.ensure_user_workspace(user, session_date)
+        await self.store.append_json_line(
+            workspace.daily_dir / _MANUAL_TIME_EDITS_FILENAME,
+            audit_entry,
+        )
+        try:
+            await self.write_dashboard()
+        except Exception:
+            logger.exception(
+                "Failed to rebuild dashboard after manual time edit for %s on %s.",
+                user.user_key,
+                session_date,
+            )
+        preview_payload["applied"] = True
+        preview_payload["latest_manual_edit"] = audit_entry
+        return preview_payload
+
+    def _build_manual_time_edit_preview(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        segments: list[dict[str, Any]],
+        *,
+        edited_by: str,
+        reason: str,
+        now: datetime,
+    ) -> tuple[SessionState, dict[str, Any], dict[str, Any]]:
+        edited_by_text, reason_text, normalized_segments = self._validate_manual_time_edit_request(
+            user,
+            session.session_date,
+            segments,
+            edited_by=edited_by,
+            reason=reason,
+            now=now,
+        )
+        timezone_name = self.resolve_user_timezone_name(user)
+        original_session = self._clone_session_state(session)
+        edited_session = self._clone_session_state(session)
+        self._normalize_session_state(original_session, user=user)
+        self._normalize_session_state(edited_session, user=user)
+
+        before_now = self._session_time_summary_reference_now(original_session, user, now)
+        self._refresh_session_time_summary(original_session, before_now)
+
+        edited_session.work_segments = normalized_segments
+        edited_session.clocked_in_at = normalized_segments[0]["clocked_in_at"]
+        edited_session.clocked_out_at = normalized_segments[-1]["clocked_out_at"]
+        edited_session.stage = "clocked_out"
+        edited_session.awaiting_start_photo = False
+        edited_session.awaiting_clock_out_photo = False
+        edited_session.awaiting_clock_out_summary = False
+        edited_session.pending_clickup_sync = False
+        edited_session.metadata.pop(_CLICKUP_PROMPT_KEY, None)
+        edited_session.metadata.pop("session_reactivated_at", None)
+        self._clear_follow_up_probe_tracking(edited_session)
+        self._clear_pending_lunch_confirmation(edited_session)
+        self._clear_auto_clock_out_metadata(edited_session)
+        self._ensure_work_segments_consistency(edited_session)
+
+        work_segment_bounds = self._build_work_segment_bounds(
+            edited_session.work_segments,
+            timezone_name=timezone_name,
+        )
+        clamped_tracking, tracking_stats = self._clamp_time_tracking_entries_to_work_segments(
+            edited_session,
+            work_segment_bounds,
+            timezone_name=timezone_name,
+        )
+        if clamped_tracking:
+            edited_session.metadata["clickup_time_tracking_history"] = clamped_tracking
+        else:
+            edited_session.metadata.pop("clickup_time_tracking_history", None)
+        edited_session.metadata.pop("clickup_time_tracking", None)
+
+        retro_stats = self._clamp_retro_backfill_task_windows_to_work_segments(
+            edited_session,
+            work_segment_bounds,
+            timezone_name=timezone_name,
+        )
+
+        after_now = self._session_time_summary_reference_now(edited_session, user, now)
+        self._refresh_session_time_summary(edited_session, after_now)
+
+        warnings: list[str] = []
+        if tracking_stats["dropped"] > 0:
+            warnings.append(
+                f"Dropped {tracking_stats['dropped']} ClickUp tracking window(s) that no longer overlap the edited work segments."
+            )
+        if tracking_stats["closed_open"] > 0:
+            warnings.append(
+                f"Closed {tracking_stats['closed_open']} open task-tracking window(s) at the edited work-segment boundary."
+            )
+        if tracking_stats["split"] > 0:
+            warnings.append(
+                f"Split {tracking_stats['split']} task-tracking overlap(s) across separate edited work segments."
+            )
+        if retro_stats["dropped"] > 0:
+            warnings.append(
+                f"Dropped {retro_stats['dropped']} retro-backfill task window(s) outside the edited work segments."
+            )
+        if retro_stats["split"] > 0:
+            warnings.append(
+                f"Split {retro_stats['split']} retro-backfill task-window overlap(s) across separate edited work segments."
+            )
+
+        before_payload = self._manual_time_edit_session_payload(
+            user,
+            original_session,
+            reference_now=before_now,
+        )
+        after_payload = self._manual_time_edit_session_payload(
+            user,
+            edited_session,
+            reference_now=after_now,
+        )
+        audit_entry = {
+            "edited_at": now.isoformat(),
+            "edited_by": edited_by_text,
+            "reason": reason_text,
+            "session_date": session.session_date,
+            "user_key": user.user_key,
+            "display_name": user.display_name,
+            "timezone": timezone_name,
+            "old_stage": original_session.stage,
+            "new_stage": edited_session.stage,
+            "old_work_segments": before_payload["work_segments"],
+            "new_work_segments": after_payload["work_segments"],
+            "old_clocked_in_total_seconds": before_payload["clocked_in_total_seconds"],
+            "new_clocked_in_total_seconds": after_payload["clocked_in_total_seconds"],
+            "old_task_tracked_total_seconds": before_payload["task_tracked_total_seconds"],
+            "new_task_tracked_total_seconds": after_payload["task_tracked_total_seconds"],
+            "warnings": warnings,
+            "tracking_adjustments": tracking_stats,
+            "retro_task_window_adjustments": retro_stats,
+        }
+        preview_payload = {
+            "applied": False,
+            "user_key": user.user_key,
+            "display_name": user.display_name,
+            "session_date": session.session_date,
+            "timezone": timezone_name,
+            "edited_by": edited_by_text,
+            "reason": reason_text,
+            "before": before_payload,
+            "after": after_payload,
+            "warnings": warnings,
+        }
+        return edited_session, preview_payload, audit_entry
+
+    def _validate_manual_time_edit_request(
+        self,
+        user: UserProfile,
+        session_date: str,
+        segments: list[dict[str, Any]],
+        *,
+        edited_by: str,
+        reason: str,
+        now: datetime,
+    ) -> tuple[str, str, list[dict[str, str | None]]]:
+        edited_by_text = str(edited_by or "").strip()
+        if not edited_by_text:
+            raise ValueError("`edited_by` is required.")
+        reason_text = str(reason or "").strip()
+        if not reason_text:
+            raise ValueError("`reason` is required.")
+        current_workday = self.resolve_user_workday_date(user, now)
+        if session_date >= current_workday:
+            raise ValueError(
+                f"Only past workdays can be edited. {session_date} is not earlier than the current effective workday {current_workday}."
+            )
+        if not isinstance(segments, list) or not segments:
+            raise ValueError("At least one complete work segment is required.")
+        timezone_name = self.resolve_user_timezone_name(user)
+        normalized_segments: list[dict[str, str | None]] = []
+        previous_end: datetime | None = None
+        for index, raw_segment in enumerate(segments, start=1):
+            if not isinstance(raw_segment, dict):
+                raise ValueError(f"Segment {index} is not a valid object.")
+            start_raw = str(
+                raw_segment.get("start_local")
+                or raw_segment.get("clocked_in_local")
+                or raw_segment.get("clocked_in_at")
+                or ""
+            ).strip()
+            end_raw = str(
+                raw_segment.get("end_local")
+                or raw_segment.get("clocked_out_local")
+                or raw_segment.get("clocked_out_at")
+                or ""
+            ).strip()
+            if not start_raw or not end_raw:
+                raise ValueError(f"Segment {index} must include both a start and an end time.")
+            start_dt = self._parse_manual_time_edit_local_datetime(start_raw, timezone_name=timezone_name)
+            end_dt = self._parse_manual_time_edit_local_datetime(end_raw, timezone_name=timezone_name)
+            if end_dt <= start_dt:
+                raise ValueError(f"Segment {index} must end after it starts.")
+            if previous_end is not None and start_dt < previous_end:
+                raise ValueError(f"Segment {index} overlaps or is out of order.")
+            normalized_segments.append(
+                {
+                    "clocked_in_at": start_dt.isoformat(),
+                    "clocked_out_at": end_dt.isoformat(),
+                }
+            )
+            previous_end = end_dt
+        return edited_by_text, reason_text, normalized_segments
+
+    def _parse_manual_time_edit_local_datetime(
+        self,
+        raw_value: str,
+        *,
+        timezone_name: str,
+    ) -> datetime:
+        text = str(raw_value or "").strip()
+        if not text:
+            raise ValueError("Missing datetime value.")
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid datetime value {text!r}. Use a local datetime like 2026-06-10T08:30."
+            ) from exc
+        return localize_datetime(parsed, timezone_name)
+
+    def _build_work_segment_bounds(
+        self,
+        work_segments: list[dict[str, Any]],
+        *,
+        timezone_name: str,
+    ) -> list[tuple[datetime, datetime]]:
+        bounds: list[tuple[datetime, datetime]] = []
+        for segment in work_segments:
+            if not isinstance(segment, dict):
+                continue
+            started_at = self._coerce_datetime(
+                str(segment.get("clocked_in_at") or ""),
+                timezone_name=timezone_name,
+            )
+            ended_at = self._coerce_datetime(
+                str(segment.get("clocked_out_at") or ""),
+                timezone_name=timezone_name,
+            )
+            if started_at is None or ended_at is None or ended_at <= started_at:
+                continue
+            bounds.append((started_at, ended_at))
+        return bounds
+
+    def _clip_time_range_to_work_segments(
+        self,
+        start_dt: datetime,
+        end_dt: datetime,
+        work_segment_bounds: list[tuple[datetime, datetime]],
+    ) -> list[tuple[datetime, datetime]]:
+        clipped: list[tuple[datetime, datetime]] = []
+        for segment_start, segment_end in work_segment_bounds:
+            overlap_start = max(start_dt, segment_start)
+            overlap_end = min(end_dt, segment_end)
+            if overlap_end > overlap_start:
+                clipped.append((overlap_start, overlap_end))
+        return clipped
+
+    def _clamp_time_tracking_entries_to_work_segments(
+        self,
+        session: SessionState,
+        work_segment_bounds: list[tuple[datetime, datetime]],
+        *,
+        timezone_name: str,
+    ) -> tuple[list[dict[str, Any]], dict[str, int]]:
+        entries: list[dict[str, Any]] = []
+        history = session.metadata.get("clickup_time_tracking_history")
+        if isinstance(history, list):
+            entries.extend(item for item in history if isinstance(item, dict))
+        current = session.metadata.get("clickup_time_tracking")
+        if isinstance(current, dict):
+            entries.append(current)
+        fallback_end = work_segment_bounds[-1][1] if work_segment_bounds else None
+        clamped: list[dict[str, Any]] = []
+        stats = {"dropped": 0, "split": 0, "closed_open": 0}
+        for entry in entries:
+            started_at = self._coerce_datetime(
+                str(entry.get("started_at") or ""),
+                timezone_name=timezone_name,
+            )
+            if started_at is None:
+                stats["dropped"] += 1
+                continue
+            raw_closed_at = str(entry.get("closed_at") or "").strip()
+            closed_at = self._coerce_datetime(raw_closed_at, timezone_name=timezone_name)
+            if closed_at is None:
+                if fallback_end is None:
+                    stats["dropped"] += 1
+                    continue
+                closed_at = fallback_end
+                stats["closed_open"] += 1
+            if closed_at <= started_at:
+                stats["dropped"] += 1
+                continue
+            overlaps = self._clip_time_range_to_work_segments(started_at, closed_at, work_segment_bounds)
+            if not overlaps:
+                stats["dropped"] += 1
+                continue
+            if len(overlaps) > 1:
+                stats["split"] += len(overlaps) - 1
+            for overlap_start, overlap_end in overlaps:
+                clone = dict(entry)
+                clone["started_at"] = overlap_start.isoformat()
+                clone["closed_at"] = overlap_end.isoformat()
+                clone["duration_seconds"] = max(0, int((overlap_end - overlap_start).total_seconds()))
+                if not raw_closed_at:
+                    clone["end_reason"] = str(clone.get("end_reason") or "manual_time_edit")
+                    clone["sync_result"] = str(clone.get("sync_result") or "local_only")
+                clamped.append(clone)
+        clamped.sort(key=lambda item: str(item.get("started_at") or ""))
+        return clamped, stats
+
+    def _clamp_retro_backfill_task_windows_to_work_segments(
+        self,
+        session: SessionState,
+        work_segment_bounds: list[tuple[datetime, datetime]],
+        *,
+        timezone_name: str,
+    ) -> dict[str, int]:
+        retro = session.metadata.get(_RETRO_HOURS_BACKFILL_METADATA_KEY)
+        if not isinstance(retro, dict):
+            return {"dropped": 0, "split": 0}
+        raw_windows = retro.get("task_windows")
+        if not isinstance(raw_windows, list):
+            return {"dropped": 0, "split": 0}
+        fallback_end = work_segment_bounds[-1][1] if work_segment_bounds else None
+        clamped: list[dict[str, Any]] = []
+        stats = {"dropped": 0, "split": 0}
+        for window in raw_windows:
+            if not isinstance(window, dict):
+                stats["dropped"] += 1
+                continue
+            started_at = self._coerce_datetime(
+                str(window.get("started_at") or ""),
+                timezone_name=timezone_name,
+            )
+            if started_at is None:
+                stats["dropped"] += 1
+                continue
+            raw_ended_at = str(window.get("ended_at") or "").strip()
+            ended_at = self._coerce_datetime(raw_ended_at, timezone_name=timezone_name)
+            if ended_at is None:
+                if fallback_end is None:
+                    stats["dropped"] += 1
+                    continue
+                ended_at = fallback_end
+            if ended_at <= started_at:
+                stats["dropped"] += 1
+                continue
+            overlaps = self._clip_time_range_to_work_segments(started_at, ended_at, work_segment_bounds)
+            if not overlaps:
+                stats["dropped"] += 1
+                continue
+            if len(overlaps) > 1:
+                stats["split"] += len(overlaps) - 1
+            for overlap_start, overlap_end in overlaps:
+                clone = dict(window)
+                clone["started_at"] = overlap_start.isoformat()
+                clone["ended_at"] = overlap_end.isoformat()
+                clone["duration_seconds"] = max(0, int((overlap_end - overlap_start).total_seconds()))
+                clamped.append(clone)
+        retro["task_windows"] = clamped
+        return stats
+
+    def _serialize_work_segments_for_editor(
+        self,
+        work_segments: list[dict[str, Any]],
+        *,
+        timezone_name: str,
+    ) -> list[dict[str, str]]:
+        serialized: list[dict[str, str]] = []
+        for segment in work_segments:
+            if not isinstance(segment, dict):
+                continue
+            started_text = str(segment.get("clocked_in_at") or "").strip()
+            ended_text = str(segment.get("clocked_out_at") or "").strip()
+            if not started_text or not ended_text:
+                continue
+            started_at = self._coerce_datetime(started_text, timezone_name=timezone_name)
+            ended_at = self._coerce_datetime(ended_text, timezone_name=timezone_name)
+            if started_at is None or ended_at is None:
+                continue
+            serialized.append(
+                {
+                    "clocked_in_at": started_at.isoformat(),
+                    "clocked_out_at": ended_at.isoformat(),
+                    "start_local": localize_datetime(started_at, timezone_name).strftime("%Y-%m-%dT%H:%M"),
+                    "end_local": localize_datetime(ended_at, timezone_name).strftime("%Y-%m-%dT%H:%M"),
+                }
+            )
+        return serialized
+
+    def _manual_time_edit_session_payload(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        *,
+        reference_now: datetime,
+    ) -> dict[str, Any]:
+        timezone_name = self.resolve_user_timezone_name(user)
+        return {
+            "stage": session.stage,
+            "clocked_in_at": session.clocked_in_at,
+            "clocked_out_at": session.clocked_out_at,
+            "gross_clocked_in_total_seconds": int(session.time_summary.get("gross_clocked_in_total_seconds") or 0),
+            "gross_clocked_in_total_human": str(session.time_summary.get("gross_clocked_in_total_human") or "0m"),
+            "unpaid_lunch_deducted_seconds": int(session.time_summary.get("unpaid_lunch_deducted_seconds") or 0),
+            "unpaid_lunch_deducted_human": str(session.time_summary.get("unpaid_lunch_deducted_human") or "0m"),
+            "clocked_in_total_seconds": int(session.time_summary.get("clocked_in_total_seconds") or 0),
+            "clocked_in_total_human": str(session.time_summary.get("clocked_in_total_human") or "0m"),
+            "task_tracked_total_seconds": int(session.time_summary.get("task_tracked_total_seconds") or 0),
+            "task_tracked_total_human": str(session.time_summary.get("task_tracked_total_human") or "0m"),
+            "work_segments": self._serialize_work_segments_for_editor(
+                session.work_segments,
+                timezone_name=timezone_name,
+            ),
+            "time_by_task": list(session.time_summary.get("time_by_task") or []),
+            "reference_now": reference_now.isoformat(),
+        }
+
+    def _append_manual_time_edit_metadata(
+        self,
+        session: SessionState,
+        audit_entry: dict[str, Any],
+    ) -> None:
+        history = session.metadata.get("manual_time_edits")
+        if not isinstance(history, list):
+            history = []
+        history.append(audit_entry)
+        session.metadata["manual_time_edits"] = history[-20:]
+        session.metadata["latest_manual_time_edit"] = audit_entry
+
+    async def _write_time_tracking_csv(
+        self,
+        *,
+        now: datetime,
+        session_overrides: list[tuple[UserProfile, SessionState]] | None = None,
+    ) -> Path | None:
+        report_path, _rows = await asyncio.to_thread(
+            self._write_time_tracking_csv_sync,
+            now,
+            session_overrides,
+        )
+        return report_path
+
+    def _write_time_tracking_csv_sync(
+        self,
+        now: datetime,
+        session_overrides: list[tuple[UserProfile, SessionState]] | None = None,
+    ) -> tuple[Path | None, list[dict[str, Any]]]:
+        rows = self._collect_time_tracking_report_rows_sync(
+            now,
+            session_overrides=session_overrides,
+        )
+        report_path = self._time_tracking_report_path()
+        if report_path is None:
+            return None, rows
+        try:
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            with report_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(_TIME_TRACKING_REPORT_FIELDS))
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow(row)
+        except OSError:
+            logger.exception("Failed to write time tracking report to %s.", report_path)
+            return None, rows
+        write_time_tracking_dashboard(self._storage_root_path())
+        return report_path.resolve(), rows
+
+    def _collect_time_tracking_report_rows_sync(
+        self,
+        now: datetime,
+        *,
+        session_overrides: list[tuple[UserProfile, SessionState]] | None = None,
+    ) -> list[dict[str, Any]]:
+        sessions_by_key: dict[tuple[str, str], tuple[UserProfile, SessionState, Path | None]] = {}
+        storage_root = self._storage_root_path()
+        people_dir = storage_root / "people" if storage_root is not None else None
+        if people_dir and people_dir.exists():
+            for user_dir in sorted(people_dir.iterdir(), key=lambda path: path.name.lower()):
+                if not user_dir.is_dir():
+                    continue
+                profile: UserProfile | None = None
+                profile_path = user_dir / "profile.json"
+                if profile_path.exists():
+                    try:
+                        profile = UserProfile(**json.loads(profile_path.read_text(encoding="utf-8")))
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        profile = None
+                for daily_dir in sorted(user_dir.iterdir(), key=lambda path: path.name):
+                    if not daily_dir.is_dir() or not _SESSION_DATE_DIRECTORY_PATTERN.fullmatch(daily_dir.name):
+                        continue
+                    session_path = daily_dir / "session.json"
+                    if not session_path.exists():
+                        continue
+                    try:
+                        session = SessionState(**json.loads(session_path.read_text(encoding="utf-8")))
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    row_user = profile or UserProfile(
+                        user_key=session.user_key,
+                        display_name=session.user_key,
+                        discord_user_id=0,
+                        discord_username=session.user_key,
+                        storage_folder_name=user_dir.name,
+                    )
+                    sessions_by_key[(session.user_key, session.session_date)] = (
+                        row_user,
+                        session,
+                        session_path.resolve(),
+                    )
+        for override_user, override_session in session_overrides or []:
+            session_copy = self._clone_session_state(override_session)
+            session_path = self._resolve_session_archive_path(override_user, session_copy.session_date)
+            sessions_by_key[(session_copy.user_key, session_copy.session_date)] = (
+                override_user,
+                session_copy,
+                session_path.resolve() if session_path is not None else None,
+            )
+        rows: list[dict[str, Any]] = []
+        for _key, (row_user, row_session, session_path) in sorted(
+            sessions_by_key.items(),
+            key=lambda item: (item[0][0].lower(), item[0][1]),
+        ):
+            self._normalize_session_state(row_session, user=row_user)
+            rows.append(
+                self._build_time_tracking_report_row(
+                    row_user,
+                    row_session,
+                    now=now,
+                    session_path=session_path,
+                )
+            )
+        return rows
+
+    def _build_time_tracking_report_row(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        *,
+        now: datetime,
+        session_path: Path | None,
+    ) -> dict[str, Any]:
+        summary_now = self._session_time_summary_reference_now(session, user, now)
+        self._refresh_session_time_summary(session, summary_now)
+        time_by_task = session.time_summary.get("time_by_task")
+        if not isinstance(time_by_task, list):
+            time_by_task = []
+        manual_edits = session.metadata.get("manual_time_edits")
+        manual_edit_count = len(manual_edits) if isinstance(manual_edits, list) else 0
+        latest_manual_edit = session.metadata.get("latest_manual_time_edit")
+        latest_manual_edit_json = (
+            json.dumps(latest_manual_edit, sort_keys=True, separators=(",", ":"))
+            if isinstance(latest_manual_edit, dict)
+            else ""
+        )
+        retro_backfill = session.metadata.get(_RETRO_HOURS_BACKFILL_METADATA_KEY)
+        retro_backfill = retro_backfill if isinstance(retro_backfill, dict) else {}
+        retro_warnings = retro_backfill.get("warnings")
+        review = self._build_time_tracking_review_snapshot(user, session, now=now)
+        return {
+            "user_key": session.user_key,
+            "display_name": user.display_name,
+            "timezone": self.resolve_user_timezone_name(user),
+            "session_date": session.session_date,
+            "gross_clocked_in_total_seconds": int(session.time_summary.get("gross_clocked_in_total_seconds") or 0),
+            "gross_clocked_in_total_human": str(session.time_summary.get("gross_clocked_in_total_human") or "0m"),
+            "unpaid_lunch_deducted_seconds": int(session.time_summary.get("unpaid_lunch_deducted_seconds") or 0),
+            "unpaid_lunch_deducted_human": str(session.time_summary.get("unpaid_lunch_deducted_human") or "0m"),
+            "clocked_in_total_seconds": int(session.time_summary.get("clocked_in_total_seconds") or 0),
+            "clocked_in_total_human": str(session.time_summary.get("clocked_in_total_human") or "0m"),
+            "task_tracked_total_seconds": int(session.time_summary.get("task_tracked_total_seconds") or 0),
+            "task_tracked_total_human": str(session.time_summary.get("task_tracked_total_human") or "0m"),
+            "work_segment_count": int(session.time_summary.get("work_segment_count") or 0),
+            "has_open_work_segment": bool(session.time_summary.get("has_open_work_segment")),
+            "active_task_timer_running": bool(session.time_summary.get("active_task_timer_running")),
+            "manual_edit_count": manual_edit_count,
+            "latest_manual_edit_json": latest_manual_edit_json,
+            "retro_backfill_confidence": str(retro_backfill.get("confidence") or ""),
+            "retro_backfill_warning_count": len(retro_warnings) if isinstance(retro_warnings, list) else 0,
+            "time_record_origin": str(session.metadata.get(_TIME_RECORD_ORIGIN_METADATA_KEY) or "live"),
+            "review_status": str(review.get("status") or "likely_correct"),
+            "review_summary": str(review.get("summary") or ""),
+            "review_reasons_json": json.dumps(review.get("reasons") or [], sort_keys=True, separators=(",", ":")),
+            "review_gap_seconds": int(review.get("gap_seconds") or 0),
+            "review_gap_human": str(review.get("gap_human") or "0m"),
+            "time_by_task_json": json.dumps(time_by_task, sort_keys=True, separators=(",", ":")),
+            "session_path": str(session_path.resolve()) if session_path is not None else "",
+        }
+
+    def _build_time_tracking_review_snapshot(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        *,
+        now: datetime,
+    ) -> dict[str, Any]:
+        clocked_in_total_seconds = int(session.time_summary.get("clocked_in_total_seconds") or 0)
+        gross_clocked_in_total_seconds = int(session.time_summary.get("gross_clocked_in_total_seconds") or 0)
+        recorded_lunch_seconds = int(session.time_summary.get("unpaid_lunch_deducted_seconds") or 0)
+        task_tracked_total_seconds = int(session.time_summary.get("task_tracked_total_seconds") or 0)
+        work_segment_count = int(session.time_summary.get("work_segment_count") or 0)
+        has_open_work_segment = bool(session.time_summary.get("has_open_work_segment"))
+        active_task_timer_running = bool(session.time_summary.get("active_task_timer_running"))
+        overlapping_work_segment_count = self._overlapping_work_segment_count(session, now)
+        gap_seconds = abs(clocked_in_total_seconds - task_tracked_total_seconds)
+        current_workday = self.resolve_user_workday_date(user, now)
+        is_current_workday = session.session_date == current_workday
+        manual_edits = session.metadata.get("manual_time_edits")
+        manual_edit_count = len(manual_edits) if isinstance(manual_edits, list) else 0
+        retro_backfill = session.metadata.get(_RETRO_HOURS_BACKFILL_METADATA_KEY)
+        retro_backfill = retro_backfill if isinstance(retro_backfill, dict) else {}
+        retro_confidence = str(retro_backfill.get("confidence") or "")
+        retro_warnings = retro_backfill.get("warnings")
+        retro_warning_count = len(retro_warnings) if isinstance(retro_warnings, list) else 0
+        time_record_origin = str(
+            session.metadata.get(_TIME_RECORD_ORIGIN_METADATA_KEY) or "live"
+        )
+        is_legacy_migration = time_record_origin == "legacy_migration"
+
+        if is_current_workday and (
+            has_open_work_segment
+            or active_task_timer_running
+            or (clocked_in_total_seconds > 0 and not session.clocked_out_at and session.stage != "clocked_out")
+        ):
+            return {
+                "status": "in_progress",
+                "summary": "Current workday is still active, so the final totals can still change.",
+                "reasons": [
+                    "Current workday is still active, so the final totals can still change.",
+                ],
+                "gap_seconds": gap_seconds,
+                "gap_human": self._format_duration(gap_seconds),
+            }
+
+        severity = 0
+        issues: list[str] = []
+        notes: list[str] = []
+
+        def add_issue(level: int, message: str) -> None:
+            nonlocal severity
+            severity = max(severity, level)
+            if message not in issues:
+                issues.append(message)
+
+        def add_note(message: str) -> None:
+            if message not in notes:
+                notes.append(message)
+
+        if not is_current_workday and has_open_work_segment:
+            add_issue(2, "Past workday still has an open work segment.")
+        if not is_current_workday and active_task_timer_running:
+            add_issue(2, "Past workday still shows an active task timer.")
+        if overlapping_work_segment_count:
+            add_issue(
+                2,
+                (
+                    f"{overlapping_work_segment_count} overlapping work segment(s) were found. "
+                    "Overlapping time is counted only once, but the raw segments should be corrected."
+                ),
+            )
+        if clocked_in_total_seconds > 0 and work_segment_count <= 0:
+            add_issue(2, "Clocked-in time exists, but no work segments were stored for the day.")
+        if not is_current_workday and clocked_in_total_seconds > 0 and not session.clocked_out_at:
+            add_issue(1, "Past workday never reached a stored clock-out timestamp.")
+        if gross_clocked_in_total_seconds > 14 * 60 * 60:
+            add_issue(
+                2,
+                f"Gross clocked-in time is unusually long at {self._format_duration(gross_clocked_in_total_seconds)}.",
+            )
+        lunch_started_at = str(session.metadata.get("lunch_started_at") or "").strip()
+        lunch_ended_at = str(session.metadata.get("lunch_ended_at") or "").strip()
+        if not is_current_workday and lunch_started_at and not lunch_ended_at:
+            add_issue(2, "Past workday has a recorded lunch start but no recorded return.")
+        elif recorded_lunch_seconds > 90 * 60:
+            add_issue(
+                1,
+                f"Recorded lunch is unusually long at {self._format_duration(recorded_lunch_seconds)}; verify the return time.",
+            )
+
+        task_overrun_seconds = task_tracked_total_seconds - clocked_in_total_seconds
+        if task_overrun_seconds > 5 * 60:
+            add_issue(
+                2,
+                f"Task-tracked time exceeds clocked-in time by {self._format_duration(task_overrun_seconds)}.",
+            )
+        elif task_tracked_total_seconds == 0:
+            if clocked_in_total_seconds >= 4 * 60 * 60 and not is_legacy_migration:
+                add_issue(
+                    1,
+                    f"No task-tracked time was recorded for a {self._format_duration(clocked_in_total_seconds)} day.",
+                )
+        else:
+            uncovered_gap_seconds = clocked_in_total_seconds - task_tracked_total_seconds
+            if uncovered_gap_seconds >= 4 * 60 * 60:
+                add_issue(
+                    2,
+                    f"Clocked-in time exceeds task-tracked time by {self._format_duration(uncovered_gap_seconds)}.",
+                )
+            elif uncovered_gap_seconds >= 2 * 60 * 60 and task_tracked_total_seconds > 0:
+                add_issue(
+                    1,
+                    f"Clocked-in time exceeds task-tracked time by {self._format_duration(uncovered_gap_seconds)}.",
+                )
+
+        if retro_confidence == "unresolved":
+            add_issue(2, "Retro backfill confidence is unresolved for this day.")
+        elif retro_confidence == "low":
+            add_issue(1, "Retro backfill confidence is low for this day.")
+        elif retro_confidence == "medium":
+            add_note("Retro backfill confidence is medium for this day.")
+        elif retro_confidence == "high":
+            add_note("Retro backfill confidence is high for this day.")
+
+        if retro_warning_count > 0:
+            add_issue(1, f"Retro backfill recorded {retro_warning_count} warning(s) for this day.")
+
+        if is_legacy_migration:
+            add_note(
+                "Legacy migration record; task allocation was not imported and is not treated as a current Don Pollo failure."
+            )
+
+        if manual_edit_count > 1 and not is_legacy_migration:
+            add_issue(1, f"This day has been manually corrected {manual_edit_count} times.")
+        elif manual_edit_count == 1 and not is_legacy_migration:
+            add_note("This day has one manual correction on record.")
+
+        latest_manual_edit = session.metadata.get("latest_manual_time_edit")
+        if isinstance(latest_manual_edit, dict):
+            edited_by = str(latest_manual_edit.get("edited_by") or "").strip()
+            if edited_by:
+                add_note(f"Latest manual correction was recorded by {edited_by}.")
+        latest_lunch_edit = session.metadata.get("latest_manual_lunch_edit")
+        if isinstance(latest_lunch_edit, dict):
+            add_note("This day has a transcript-backed manual lunch correction.")
+
+        status = "likely_correct"
+        if severity >= 2:
+            status = "likely_wrong"
+        elif severity == 1:
+            status = "needs_review"
+
+        reasons = issues + notes
+        summary = (
+            issues[0]
+            if issues
+            else notes[0]
+            if notes
+            else "No suspicious timing issues were detected for this day."
+        )
+        return {
+            "status": status,
+            "summary": summary,
+            "reasons": reasons,
+            "gap_seconds": gap_seconds,
+            "gap_human": self._format_duration(gap_seconds),
+        }
+
+    def _session_time_summary_reference_now(
+        self,
+        session: SessionState,
+        user: UserProfile,
+        now: datetime,
+    ) -> datetime:
+        current_workday = self.resolve_user_workday_date(user, now)
+        if session.session_date == current_workday:
+            return now
+        timezone_name = self.resolve_user_timezone_name(user)
+        latest_known = self._latest_known_session_timestamp(session, timezone_name=timezone_name)
+        if latest_known is None:
+            return now
+        comparable_latest = self._coerce_datetime_for_reference(
+            latest_known.isoformat(),
+            reference=now,
+            timezone_name=timezone_name,
+        )
+        if comparable_latest is None:
+            return now
+        return now if comparable_latest > now else comparable_latest
+
+    def _latest_known_session_timestamp(
+        self,
+        session: SessionState,
+        *,
+        timezone_name: str,
+    ) -> datetime | None:
+        latest: datetime | None = None
+        for field_name in _SESSION_STATE_TIMESTAMP_FIELDS:
+            candidate = self._coerce_datetime(
+                getattr(session, field_name),
+                timezone_name=timezone_name,
+            )
+            latest = self._later_datetime(latest, candidate)
+        latest = self._later_datetime(
+            latest,
+            self._latest_known_timestamp_from_container(session.work_segments, timezone_name=timezone_name),
+        )
+        latest = self._later_datetime(
+            latest,
+            self._latest_known_timestamp_from_container(session.metadata, timezone_name=timezone_name),
+        )
+        return latest
+
+    def _latest_known_timestamp_from_container(
+        self,
+        value: Any,
+        *,
+        timezone_name: str,
+    ) -> datetime | None:
+        latest: datetime | None = None
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if isinstance(key, str) and self._should_scan_timestamp_key(key):
+                    candidate = self._coerce_datetime(
+                        item if isinstance(item, str) else None,
+                        timezone_name=timezone_name,
+                    )
+                    latest = self._later_datetime(latest, candidate)
+                latest = self._later_datetime(
+                    latest,
+                    self._latest_known_timestamp_from_container(item, timezone_name=timezone_name),
+                )
+            return latest
+        if isinstance(value, list):
+            for item in value:
+                latest = self._later_datetime(
+                    latest,
+                    self._latest_known_timestamp_from_container(item, timezone_name=timezone_name),
+                )
+        return latest
+
+    def _later_datetime(
+        self,
+        current: datetime | None,
+        candidate: datetime | None,
+    ) -> datetime | None:
+        if candidate is None:
+            return current
+        if current is None or candidate > current:
+            return candidate
+        return current
+
+    def _build_weekly_hours_reply_from_rows(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        rows: list[dict[str, Any]],
+        now: datetime,
+    ) -> str:
+        return self._build_self_hours_reply_for_range_from_rows(
+            user,
+            session,
+            rows,
+            now,
+            "this_week",
+        )
+
+    def _build_self_hours_reply_for_range_from_rows(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        rows: list[dict[str, Any]],
+        now: datetime,
+        range_key: str,
+    ) -> str:
+        effective_date_text = self.resolve_user_workday_date(user, now)
+        effective_date = datetime.fromisoformat(effective_date_text).date()
+        range_label = _SELF_LOOKUP_RANGE_LABELS.get(range_key, "This Week")
+        start_date = effective_date
+        end_date = effective_date
+        if range_key == "this_week":
+            start_date = effective_date - timedelta(days=effective_date.weekday())
+        elif range_key == "last_week":
+            this_week_start = effective_date - timedelta(days=effective_date.weekday())
+            start_date = this_week_start - timedelta(days=7)
+            end_date = this_week_start - timedelta(days=1)
+        elif range_key == "whole_summer":
+            archived_dates: list[date] = []
+            for row in rows:
+                if str(row.get("user_key") or "") != user.user_key:
+                    continue
+                session_date_text = str(row.get("session_date") or "").strip()
+                try:
+                    archived_dates.append(datetime.fromisoformat(session_date_text).date())
+                except ValueError:
+                    continue
+            if archived_dates:
+                start_date = min(archived_dates)
+        elif range_key != "today":
+            start_date = effective_date - timedelta(days=effective_date.weekday())
+        by_day: dict[str, dict[str, int]] = {}
+        for row in rows:
+            if str(row.get("user_key") or "") != user.user_key:
+                continue
+            session_date_text = str(row.get("session_date") or "").strip()
+            try:
+                session_date = datetime.fromisoformat(session_date_text).date()
+            except ValueError:
+                continue
+            if session_date < start_date or session_date > end_date:
+                continue
+            bucket = by_day.setdefault(
+                session_date_text,
+                {
+                    "clocked_in_total_seconds": 0,
+                    "task_tracked_total_seconds": 0,
+                },
+            )
+            bucket["clocked_in_total_seconds"] += int(row.get("clocked_in_total_seconds") or 0)
+            bucket["task_tracked_total_seconds"] += int(row.get("task_tracked_total_seconds") or 0)
+        total_clocked_in = sum(item["clocked_in_total_seconds"] for item in by_day.values())
+        total_task_tracked = sum(item["task_tracked_total_seconds"] for item in by_day.values())
+        if range_key == "today":
+            heading = f"{range_label} ({effective_date_text}):"
+            empty_text = "I do not have any logged time for you yet today."
+        elif range_key == "this_week":
+            heading = f"{range_label} so far ({start_date.isoformat()} to {effective_date_text}):"
+            empty_text = "I do not have any logged time for you yet this week."
+        else:
+            heading = f"{range_label} ({start_date.isoformat()} to {end_date.isoformat()}):"
+            if range_key == "last_week":
+                empty_text = "I do not have any logged time for you from last week."
+            else:
+                empty_text = "I do not have any logged time for you yet."
+        lines = [
+            heading,
+            f"- Clocked-in time: {self._format_duration(total_clocked_in)}",
+            f"- Task-tracked time: {self._format_duration(total_task_tracked)}",
+        ]
+        nonzero_dates = [
+            session_date
+            for session_date in sorted(by_day)
+            if by_day[session_date]["clocked_in_total_seconds"] > 0
+            or by_day[session_date]["task_tracked_total_seconds"] > 0
+        ]
+        if nonzero_dates and range_key == "whole_summer":
+            lines.append(f"- Days with logged time: {len(nonzero_dates)}")
+        elif nonzero_dates:
+            lines.append("")
+            lines.append("Daily breakdown:")
+            for session_date_text in nonzero_dates:
+                day_totals = by_day[session_date_text]
+                day_label = datetime.fromisoformat(session_date_text).strftime("%a %Y-%m-%d")
+                lines.append(
+                    f"- {day_label}: "
+                    f"clocked in {self._format_duration(day_totals['clocked_in_total_seconds'])}; "
+                    f"task tracked {self._format_duration(day_totals['task_tracked_total_seconds'])}"
+                )
+        else:
+            lines.append("")
+            lines.append(empty_text)
+        reminder = self._clock_out_artifacts_reminder_text(session)
+        if reminder:
+            lines.append("")
+            lines.append(reminder)
+        return "\n".join(lines)
+
+    def _clock_out_artifacts_reminder_text(self, session: SessionState) -> str | None:
+        if session.stage != "awaiting_clock_out_artifacts":
+            return None
+        reminders: list[str] = []
+        if session.awaiting_clock_out_photo:
+            reminders.append("the picture")
+        if session.awaiting_clock_out_summary:
+            reminders.append("the written wrap-up")
+        if not reminders:
+            return None
+        return f"I still need {' and '.join(reminders)} before I close out today."
+
     def _tracked_time_totals(
         self,
         session: SessionState,
         now: datetime,
     ) -> tuple[int, list[tuple[str | None, str | None, int]]]:
+        retro_windows = self._retro_backfill_task_windows(session)
+        if retro_windows is not None:
+            totals: dict[str, dict[str, Any]] = {}
+            total_seconds = 0
+            for window in retro_windows:
+                if not isinstance(window, dict):
+                    continue
+                seconds = self._retro_task_window_seconds(window)
+                if seconds <= 0:
+                    continue
+                task_id = str(window.get("task_id") or "") or None
+                task_name = str(window.get("task_name") or "") or None
+                bucket_key = task_id or task_name or "unknown-task"
+                bucket = totals.setdefault(
+                    bucket_key,
+                    {
+                        "task_id": task_id,
+                        "task_name": task_name,
+                        "seconds": 0,
+                    },
+                )
+                bucket["seconds"] += seconds
+                total_seconds += seconds
+            ordered = sorted(
+                (
+                    (
+                        item.get("task_id"),
+                        item.get("task_name"),
+                        int(item.get("seconds") or 0),
+                    )
+                    for item in totals.values()
+                ),
+                key=lambda item: item[2],
+                reverse=True,
+            )
+            return total_seconds, ordered
         totals: dict[str, dict[str, Any]] = {}
         total_seconds = 0
         entries: list[dict[str, Any]] = []
@@ -6514,6 +12596,16 @@ class InternManagementRuntime:
         now: datetime,
     ) -> int:
         total_seconds = 0
+        for start_dt, end_dt in self._work_segment_bounds(session, now):
+            total_seconds += max(0, int((end_dt - start_dt).total_seconds()))
+        return total_seconds
+
+    def _work_segment_bounds(
+        self,
+        session: SessionState,
+        now: datetime,
+    ) -> list[tuple[datetime, datetime]]:
+        bounds: list[tuple[datetime, datetime]] = []
         for segment in session.work_segments:
             if not isinstance(segment, dict):
                 continue
@@ -6521,9 +12613,211 @@ class InternManagementRuntime:
             if not started_at:
                 continue
             closed_at = str(segment.get("clocked_out_at") or "").strip() or None
+            start_dt = self._coerce_datetime(started_at)
             end_dt = self._coerce_datetime(closed_at) or now
-            total_seconds += self._elapsed_seconds_between(started_at, end_dt)
-        return total_seconds
+            if start_dt is None:
+                continue
+            if start_dt.tzinfo is None and end_dt.tzinfo is not None:
+                start_dt = start_dt.replace(tzinfo=end_dt.tzinfo)
+            elif start_dt.tzinfo is not None and end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=start_dt.tzinfo)
+            if end_dt > start_dt:
+                bounds.append((start_dt, end_dt))
+        merged: list[tuple[datetime, datetime]] = []
+        for start_dt, end_dt in sorted(bounds, key=lambda item: item[0]):
+            if not merged or start_dt >= merged[-1][1]:
+                merged.append((start_dt, end_dt))
+                continue
+            previous_start, previous_end = merged[-1]
+            merged[-1] = (previous_start, max(previous_end, end_dt))
+        return merged
+
+    def _overlapping_work_segment_count(
+        self,
+        session: SessionState,
+        now: datetime,
+    ) -> int:
+        raw_bounds: list[tuple[datetime, datetime]] = []
+        for segment in session.work_segments:
+            if not isinstance(segment, dict):
+                continue
+            start_dt = self._coerce_datetime(str(segment.get("clocked_in_at") or ""))
+            end_dt = self._coerce_datetime(str(segment.get("clocked_out_at") or "")) or now
+            if start_dt is None:
+                continue
+            start_dt, end_dt = self._align_datetime_pair(start_dt, end_dt, reference=now)
+            if end_dt > start_dt:
+                raw_bounds.append((start_dt, end_dt))
+        overlap_count = 0
+        furthest_end: datetime | None = None
+        for start_dt, end_dt in sorted(raw_bounds, key=lambda item: item[0]):
+            if furthest_end is not None and start_dt < furthest_end:
+                overlap_count += 1
+            furthest_end = end_dt if furthest_end is None else max(furthest_end, end_dt)
+        return overlap_count
+
+    def _unpaid_lunch_deduction_seconds(
+        self,
+        session: SessionState,
+        now: datetime,
+        gross_seconds: int,
+    ) -> int:
+        if gross_seconds <= 0:
+            return 0
+        work_bounds = self._work_segment_bounds(session, now)
+        if not work_bounds:
+            return 0
+        overlaps: list[tuple[datetime, datetime]] = []
+        for lunch_start, lunch_end in self._recorded_lunch_window_bounds(session, now):
+            for work_start, work_end in work_bounds:
+                comparable_lunch_start, comparable_lunch_end = self._align_datetime_pair(
+                    lunch_start,
+                    lunch_end,
+                    reference=work_start,
+                )
+                comparable_work_start, comparable_work_end = self._align_datetime_pair(
+                    work_start,
+                    work_end,
+                    reference=comparable_lunch_start,
+                )
+                overlap_start = max(comparable_lunch_start, comparable_work_start)
+                overlap_end = min(comparable_lunch_end, comparable_work_end)
+                if overlap_end > overlap_start:
+                    overlaps.append((overlap_start, overlap_end))
+        if not overlaps:
+            return 0
+        merged: list[tuple[datetime, datetime]] = []
+        for start_dt, end_dt in sorted(overlaps, key=lambda item: item[0]):
+            if not merged or start_dt > merged[-1][1]:
+                merged.append((start_dt, end_dt))
+                continue
+            previous_start, previous_end = merged[-1]
+            merged[-1] = (previous_start, max(previous_end, end_dt))
+        deducted_seconds = sum(
+            max(0, int((end_dt - start_dt).total_seconds()))
+            for start_dt, end_dt in merged
+        )
+        return min(gross_seconds, deducted_seconds)
+
+    def _recorded_lunch_window_bounds(
+        self,
+        session: SessionState,
+        now: datetime,
+    ) -> list[tuple[datetime, datetime]]:
+        raw_windows: list[dict[str, Any]] = []
+        stored_windows = session.metadata.get(_LUNCH_WINDOWS_KEY)
+        if isinstance(stored_windows, list):
+            raw_windows.extend(window for window in stored_windows if isinstance(window, dict))
+        retro = session.metadata.get(_RETRO_HOURS_BACKFILL_METADATA_KEY)
+        retro_windows = retro.get("lunch_windows") if isinstance(retro, dict) else None
+        if isinstance(retro_windows, list):
+            raw_windows.extend(window for window in retro_windows if isinstance(window, dict))
+        legacy_start = str(session.metadata.get("lunch_started_at") or "").strip()
+        legacy_end = str(session.metadata.get("lunch_ended_at") or "").strip()
+        if legacy_start:
+            raw_windows.append(
+                {
+                    "started_at": legacy_start,
+                    "ended_at": legacy_end or None,
+                }
+            )
+
+        bounds: list[tuple[datetime, datetime]] = []
+        seen: set[tuple[str, str]] = set()
+        for window in raw_windows:
+            started_at = str(window.get("started_at") or window.get("start_at") or "").strip()
+            ended_at = str(
+                window.get("ended_at")
+                or window.get("end_at")
+                or window.get("closed_at")
+                or ""
+            ).strip()
+            start_dt = self._coerce_datetime(started_at)
+            end_dt = self._coerce_datetime(ended_at) if ended_at else now
+            if start_dt is None or end_dt is None:
+                continue
+            start_dt, end_dt = self._align_datetime_pair(start_dt, end_dt, reference=now)
+            if end_dt <= start_dt:
+                continue
+            key = (start_dt.isoformat(), end_dt.isoformat())
+            if key in seen:
+                continue
+            seen.add(key)
+            bounds.append((start_dt, end_dt))
+        return sorted(bounds, key=lambda item: item[0])
+
+    def _align_datetime_pair(
+        self,
+        start_dt: datetime,
+        end_dt: datetime,
+        *,
+        reference: datetime,
+    ) -> tuple[datetime, datetime]:
+        if start_dt.tzinfo is None and reference.tzinfo is not None:
+            start_dt = start_dt.replace(tzinfo=reference.tzinfo)
+        elif start_dt.tzinfo is not None and reference.tzinfo is None:
+            start_dt = start_dt.replace(tzinfo=None)
+        if end_dt.tzinfo is None and start_dt.tzinfo is not None:
+            end_dt = end_dt.replace(tzinfo=start_dt.tzinfo)
+        elif end_dt.tzinfo is not None and start_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=None)
+        return start_dt, end_dt
+
+    def _record_lunch_window_start(self, session: SessionState, now: datetime) -> None:
+        windows = session.metadata.get(_LUNCH_WINDOWS_KEY)
+        if not isinstance(windows, list):
+            windows = []
+        previous_start = str(session.metadata.get("lunch_started_at") or "").strip()
+        previous_end = str(session.metadata.get("lunch_ended_at") or "").strip()
+        if previous_start and previous_end and not any(
+            isinstance(window, dict)
+            and str(window.get("started_at") or "") == previous_start
+            for window in windows
+        ):
+            windows.append(
+                {
+                    "started_at": previous_start,
+                    "ended_at": previous_end,
+                    "source": "legacy_lunch_record",
+                }
+            )
+        started_at = now.isoformat()
+        if not any(
+            isinstance(window, dict)
+            and str(window.get("started_at") or "") == started_at
+            for window in windows
+        ):
+            windows.append(
+                {
+                    "started_at": started_at,
+                    "ended_at": None,
+                    "source": "runtime_lunch_break",
+                }
+            )
+        session.metadata[_LUNCH_WINDOWS_KEY] = windows
+
+    def _record_lunch_window_end(self, session: SessionState, now: datetime) -> None:
+        windows = session.metadata.get(_LUNCH_WINDOWS_KEY)
+        if not isinstance(windows, list):
+            windows = []
+        started_at = str(session.metadata.get("lunch_started_at") or "").strip()
+        for window in reversed(windows):
+            if not isinstance(window, dict) or str(window.get("ended_at") or "").strip():
+                continue
+            if started_at and str(window.get("started_at") or "").strip() != started_at:
+                continue
+            window["ended_at"] = now.isoformat()
+            session.metadata[_LUNCH_WINDOWS_KEY] = windows
+            return
+        if started_at:
+            windows.append(
+                {
+                    "started_at": started_at,
+                    "ended_at": now.isoformat(),
+                    "source": "runtime_lunch_break",
+                }
+            )
+            session.metadata[_LUNCH_WINDOWS_KEY] = windows
 
     def _refresh_session_time_summary(
         self,
@@ -6531,14 +12825,33 @@ class InternManagementRuntime:
         now: datetime,
     ) -> None:
         self._ensure_work_segments_consistency(session)
-        clocked_in_total_seconds = self._work_segment_total_seconds(session, now)
-        tracked_total_seconds, tracked_tasks = self._tracked_time_totals(session, now)
-        current_tracking = session.metadata.get("clickup_time_tracking")
-        current_tracking = current_tracking if isinstance(current_tracking, dict) else {}
-        timer_running = bool(current_tracking) and not current_tracking.get("closed_at") and bool(
-            current_tracking.get("task_id")
+        gross_clocked_in_total_seconds = self._work_segment_total_seconds(session, now)
+        unpaid_lunch_deducted_seconds = self._unpaid_lunch_deduction_seconds(
+            session,
+            now,
+            gross_clocked_in_total_seconds,
         )
+        clocked_in_total_seconds = max(0, gross_clocked_in_total_seconds - unpaid_lunch_deducted_seconds)
+        tracked_total_seconds, tracked_tasks = self._tracked_time_totals(session, now)
+        retro_windows = self._retro_backfill_task_windows(session)
+        if retro_windows is not None:
+            timer_running = any(
+                isinstance(window, dict)
+                and bool(window.get("task_id") or window.get("task_name"))
+                and not str(window.get("ended_at") or "").strip()
+                for window in retro_windows
+            )
+        else:
+            current_tracking = session.metadata.get("clickup_time_tracking")
+            current_tracking = current_tracking if isinstance(current_tracking, dict) else {}
+            timer_running = bool(current_tracking) and not current_tracking.get("closed_at") and bool(
+                current_tracking.get("task_id")
+            )
         session.time_summary = {
+            "gross_clocked_in_total_seconds": gross_clocked_in_total_seconds,
+            "gross_clocked_in_total_human": self._format_duration(gross_clocked_in_total_seconds),
+            "unpaid_lunch_deducted_seconds": unpaid_lunch_deducted_seconds,
+            "unpaid_lunch_deducted_human": self._format_duration(unpaid_lunch_deducted_seconds),
             "clocked_in_total_seconds": clocked_in_total_seconds,
             "clocked_in_total_human": self._format_duration(clocked_in_total_seconds),
             "task_tracked_total_seconds": tracked_total_seconds,
@@ -6559,6 +12872,30 @@ class InternManagementRuntime:
                 for task_id, task_name, seconds in tracked_tasks
             ],
         }
+
+    def _retro_backfill_task_windows(self, session: SessionState) -> list[dict[str, Any]] | None:
+        retro = session.metadata.get(_RETRO_HOURS_BACKFILL_METADATA_KEY)
+        if not isinstance(retro, dict):
+            return None
+        task_windows = retro.get("task_windows")
+        if task_windows is None:
+            return None
+        if not isinstance(task_windows, list):
+            return []
+        return [window for window in task_windows if isinstance(window, dict)]
+
+    def _retro_task_window_seconds(self, window: dict[str, Any]) -> int:
+        duration_seconds = window.get("duration_seconds")
+        if isinstance(duration_seconds, int) and duration_seconds > 0:
+            return duration_seconds
+        started_at = str(window.get("started_at") or "").strip()
+        ended_at = str(window.get("ended_at") or "").strip()
+        if not started_at or not ended_at:
+            return 0
+        end_dt = self._coerce_datetime(ended_at)
+        if end_dt is None:
+            return 0
+        return self._elapsed_seconds_between(started_at, end_dt)
 
     def _tracking_entry_seconds(self, entry: dict[str, Any], now: datetime) -> int:
         if not isinstance(entry, dict):
@@ -6582,13 +12919,39 @@ class InternManagementRuntime:
             end_dt = end_dt.replace(tzinfo=start_dt.tzinfo)
         return max(0, int((end_dt - start_dt).total_seconds()))
 
-    def _coerce_datetime(self, raw_value: str | None) -> datetime | None:
+    def _coerce_datetime(
+        self,
+        raw_value: str | None,
+        *,
+        timezone_name: str | None = None,
+    ) -> datetime | None:
         if not raw_value:
             return None
         try:
-            return datetime.fromisoformat(raw_value)
+            parsed = datetime.fromisoformat(raw_value)
         except ValueError:
             return None
+        if parsed.tzinfo is None and timezone_name:
+            return localize_datetime(parsed, timezone_name)
+        return parsed
+
+    def _coerce_datetime_for_reference(
+        self,
+        raw_value: str | None,
+        *,
+        reference: datetime,
+        timezone_name: str | None = None,
+    ) -> datetime | None:
+        parsed = self._coerce_datetime(raw_value, timezone_name=timezone_name)
+        if not parsed:
+            return None
+        if reference.tzinfo is None and parsed.tzinfo is not None:
+            return parsed.replace(tzinfo=None)
+        if reference.tzinfo is not None and parsed.tzinfo is None:
+            if timezone_name:
+                return localize_datetime(parsed, timezone_name)
+            return parsed.replace(tzinfo=reference.tzinfo)
+        return parsed
 
     def _format_duration(self, total_seconds: int) -> str:
         if total_seconds <= 0:
@@ -7012,6 +13375,12 @@ class InternManagementRuntime:
             "recovered": bool(getattr(signals, "recovered", False)),
             "starting_lunch": bool(getattr(signals, "starting_lunch", False)),
             "ending_lunch": bool(getattr(signals, "ending_lunch", False)),
+            "starting_short_rest": bool(
+                getattr(signals, "starting_short_rest", False)
+            ),
+            "ending_short_rest": bool(
+                getattr(signals, "ending_short_rest", False)
+            ),
         }
 
     def _excerpt_text(self, text: str, limit: int = 160) -> str:
@@ -7020,12 +13389,107 @@ class InternManagementRuntime:
             return normalized
         return normalized[: limit - 3].rstrip() + "..."
 
-    def _last_inbound_check_in_at(self, session: SessionState) -> datetime | None:
+    def _last_inbound_check_in_at(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        *,
+        reference: datetime | None = None,
+    ) -> datetime | None:
+        timezone_name = self.resolve_user_timezone_name(user)
         for value in (session.last_user_message_at, session.last_contact_at, session.clocked_in_at):
-            parsed = self._coerce_datetime(value)
+            if reference is not None:
+                parsed = self._coerce_datetime_for_reference(
+                    value,
+                    reference=reference,
+                    timezone_name=timezone_name,
+                )
+            else:
+                parsed = self._coerce_datetime(value, timezone_name=timezone_name)
             if parsed:
                 return parsed
         return None
+
+    def _inactivity_auto_clock_out_reference_at(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        *,
+        reference: datetime,
+    ) -> datetime | None:
+        if not self.config or not session.clocked_in_at or session.clocked_out_at:
+            return None
+        if session.stage in {"on_lunch_break", "awaiting_clock_out_artifacts"}:
+            return None
+        return self._last_inbound_check_in_at(user, session, reference=reference)
+
+    async def _inactivity_reference_with_clickup_activity(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        *,
+        reference_at: datetime,
+        now: datetime,
+    ) -> datetime:
+        task_id = str(self._authoritative_active_task_id(session) or "").strip()
+        if not self.clickup or not task_id:
+            return reference_at
+        cache = session.metadata.get("credible_clickup_activity")
+        cache = cache if isinstance(cache, dict) else {}
+        checked_at = self._coerce_datetime_for_reference(
+            str(cache.get("checked_at") or ""),
+            reference=now,
+            timezone_name=self.resolve_user_timezone_name(user),
+        )
+        activity_at = self._coerce_datetime_for_reference(
+            str(cache.get("activity_at") or ""),
+            reference=now,
+            timezone_name=self.resolve_user_timezone_name(user),
+        )
+        if (
+            str(cache.get("task_id") or "") != task_id
+            or checked_at is None
+            or now - checked_at >= timedelta(minutes=5)
+        ):
+            activity_at = None
+            try:
+                task = await self.clickup.get_task(task_id)
+                raw_updated = task.get("date_updated") if isinstance(task, dict) else None
+                if raw_updated not in (None, ""):
+                    try:
+                        activity_at = datetime.fromtimestamp(
+                            int(raw_updated) / 1000,
+                            tz=now.tzinfo,
+                        )
+                    except (TypeError, ValueError, OSError):
+                        activity_at = self._coerce_datetime_for_reference(
+                            str(raw_updated),
+                            reference=now,
+                            timezone_name=self.resolve_user_timezone_name(user),
+                        )
+            except Exception:
+                logger.exception(
+                    "Could not verify ClickUp activity before inactivity enforcement for %s.",
+                    user.user_key,
+                )
+            session.metadata["credible_clickup_activity"] = {
+                "task_id": task_id,
+                "checked_at": now.isoformat(),
+                "activity_at": activity_at.isoformat() if activity_at else "",
+            }
+        if activity_at and reference_at < activity_at <= now:
+            return activity_at
+        return reference_at
+
+    def _auto_clock_out_warning_state(self, session: SessionState) -> dict[str, Any] | None:
+        raw = session.metadata.get(_AUTO_CLOCK_OUT_WARNING_KEY)
+        if not isinstance(raw, dict):
+            return None
+        reference_at = str(raw.get("reference_at") or "").strip()
+        warning_sent_at = str(raw.get("warning_sent_at") or "").strip()
+        if not reference_at or not warning_sent_at:
+            return None
+        return raw
 
     def _message_attachment_paths(self, message: MessageRecord) -> list[str]:
         paths: list[str] = []
@@ -7081,21 +13545,72 @@ class InternManagementRuntime:
         return "\n".join(lines)
 
     def _active_task_id(self, session: SessionState) -> str | None:
-        value = session.metadata.get("active_clickup_task_id")
-        if isinstance(value, str) and value.strip():
-            return value
-        return None
+        return SessionMetadata(session).active_task_id
 
     def _clear_active_task_metadata(self, session: SessionState) -> None:
-        session.metadata.pop("active_clickup_task_id", None)
-        session.metadata.pop("active_clickup_task_name", None)
+        SessionMetadata(session).clear_active_task()
+        session.metadata.pop(_ACTIVE_TASK_AUTHORITY_KEY, None)
+        session.metadata.pop("credible_clickup_activity", None)
+
+    def _authoritative_active_task_id(
+        self,
+        session: SessionState,
+        *,
+        tracking: dict[str, Any] | None = None,
+    ) -> str | None:
+        tracking_state = tracking if isinstance(tracking, dict) else session.metadata.get("clickup_time_tracking")
+        if isinstance(tracking_state, dict) and not tracking_state.get("closed_at"):
+            timer_task_id = str(
+                tracking_state.get("timer_task_id") or tracking_state.get("task_id") or ""
+            ).strip()
+            if timer_task_id:
+                return timer_task_id
+        active_task_id = str(self._active_task_id(session) or "").strip()
+        authority = str(session.metadata.get(_ACTIVE_TASK_AUTHORITY_KEY) or "").strip().lower()
+        if active_task_id and authority in {
+            "intern_confirmed",
+            "activated",
+            "timer_recovered",
+            "admin_confirmed",
+        }:
+            return active_task_id
+        selection_reason = str(session.metadata.get("clickup_selection_reason") or "").strip().lower()
+        if active_task_id and (
+            selection_reason.startswith("confirmed by intern")
+            or selection_reason.startswith("started by the intern")
+            or selection_reason.startswith("recovered from the running task timer")
+        ):
+            return active_task_id
+        if active_task_id and session.intake_completed_at and not selection_reason:
+            return active_task_id
+        for review in self._pending_admin_reviews(session):
+            review_task_id = str(review.get("task_id") or "").strip()
+            if review_task_id and (not active_task_id or review_task_id == active_task_id):
+                return review_task_id
+        return None
+
+    def _clear_non_authoritative_active_task_context(self, session: SessionState) -> bool:
+        if self._authoritative_active_task_id(session):
+            return False
+        changed = bool(
+            self._active_task_id(session)
+            or session.metadata.get("active_clickup_task_name")
+            or session.metadata.get("clickup_selection_reason")
+            or session.metadata.get("credible_clickup_activity")
+        )
+        self._clear_active_task_metadata(session)
         session.metadata.pop("clickup_selection_reason", None)
+        return changed
 
     def _pending_admin_unblocker_task(self, session: SessionState) -> dict[str, Any] | None:
         value = session.metadata.get("pending_admin_unblocker_task")
         if isinstance(value, dict):
             return value
         return None
+
+    def _pending_admin_task_proposal(self, session: SessionState) -> dict[str, Any] | None:
+        value = session.metadata.get("pending_admin_task_proposal")
+        return value if isinstance(value, dict) else None
 
     def _remember_recently_closed_task(
         self,
@@ -7143,25 +13658,10 @@ class InternManagementRuntime:
         return task_ids
 
     def _pending_admin_reviews(self, session: SessionState) -> list[dict[str, Any]]:
-        raw = session.metadata.get(_PENDING_ADMIN_REVIEWS_KEY)
-        reviews: list[dict[str, Any]] = []
-        if isinstance(raw, list):
-            for item in raw:
-                if isinstance(item, dict):
-                    reviews.append(item)
-        legacy = session.metadata.get("pending_admin_review")
-        if isinstance(legacy, dict) and legacy not in reviews:
-            reviews.append(legacy)
-        return reviews
+        return SessionMetadata(session).pending_admin_reviews()
 
     def _set_pending_admin_reviews(self, session: SessionState, reviews: list[dict[str, Any]]) -> None:
-        normalized = [review for review in reviews if isinstance(review, dict)]
-        if normalized:
-            session.metadata[_PENDING_ADMIN_REVIEWS_KEY] = normalized
-            session.metadata.pop("pending_admin_review", None)
-        else:
-            session.metadata.pop(_PENDING_ADMIN_REVIEWS_KEY, None)
-            session.metadata.pop("pending_admin_review", None)
+        SessionMetadata(session).set_pending_admin_reviews(reviews)
 
     def _pending_admin_review(self, session: SessionState) -> dict[str, Any] | None:
         reviews = self._pending_admin_reviews(session)
@@ -7213,14 +13713,161 @@ class InternManagementRuntime:
     def _normalize_identifier_value(self, value: str) -> str:
         return "".join(ch for ch in value.lower() if ch.isalnum())
 
-    def _metadata_datetime(self, session: SessionState, key: str) -> datetime | None:
+    def _normalize_freeform_lookup_text(self, text: str) -> str:
+        return " ".join(re.findall(r"[a-z0-9]+", text.lower()))
+
+    def _looks_like_flexible_self_hours_request(
+        self,
+        text: str,
+        *,
+        normalized: str | None = None,
+    ) -> bool:
+        normalized_text = normalized or self._normalize_freeform_lookup_text(text)
+        if not normalized_text:
+            return False
+        token_set = set(normalized_text.split())
+        has_request_signal = "?" in text or normalized_text.startswith(_SELF_LOOKUP_HOURS_REQUEST_PREFIXES)
+        if not has_request_signal:
+            return False
+        has_time_tracking_topic = any(
+            phrase in normalized_text
+            for phrase in _SELF_LOOKUP_TIME_TRACKING_PHRASES
+        ) or ("time" in token_set and bool({"tracked", "tracking", "logged"} & token_set))
+        if has_time_tracking_topic:
+            return True
+        has_clocked_duration_topic = (
+            "clocked in" in normalized_text
+            and (
+                "hours" in token_set
+                or normalized_text.startswith(("how many ", "how much ", "how long "))
+            )
+        )
+        if has_clocked_duration_topic:
+            return True
+        has_work_duration_topic = normalized_text.startswith(("how many ", "how much ", "how long ")) and bool(
+            {"worked", "working"} & token_set
+        )
+        if has_work_duration_topic:
+            return True
+        if normalized_text.startswith(("how many hours am i at", "what hours am i at")):
+            return True
+        if "hours" not in token_set:
+            return False
+        if token_set & _SELF_LOOKUP_HOURS_REPORT_TOKENS:
+            return True
+        if len(normalized_text.split()) <= 8:
+            return any(
+                difflib.SequenceMatcher(None, normalized_text, pattern).ratio() >= 0.82
+                for pattern in _SELF_LOOKUP_HOURS_REQUEST_PATTERNS
+            )
+        return False
+
+    def _could_be_self_lookup_request(self, text: str) -> bool:
+        normalized = self._normalize_freeform_lookup_text(text)
+        if not normalized or len(normalized.split()) > 20:
+            return False
+        tokens = set(normalized.split())
+        hours_topic = "hours" in tokens or any(
+            phrase in normalized for phrase in _SELF_LOOKUP_TIME_TRACKING_PHRASES
+        )
+        status_topic = "status" in tokens and bool(
+            tokens & {"my", "mine", "current", "show", "what", "whats"}
+        )
+        if not (hours_topic or status_topic):
+            return False
+        progress_markers = {"worked", "spent", "finished", "completed", "today"}
+        if hours_topic and not (
+            "?" in text or normalized.startswith(_SELF_LOOKUP_HOURS_REQUEST_PREFIXES)
+        ):
+            return not bool(tokens & progress_markers)
+        return True
+
+    async def _resolve_self_lookup_request_kind(self, text: str, *, stage: str) -> str | None:
+        interpreter = getattr(self, "interface_intelligence", None)
+        if not interpreter or not hasattr(interpreter, "resolve_self_lookup_intent"):
+            return None
+        try:
+            match = await interpreter.resolve_self_lookup_intent(text, stage=stage)
+        except Exception:
+            return None
+        if not match:
+            return None
+        action = str(getattr(match, "action", "") or "").strip().lower()
+        return action if action in {"hours", "status"} else None
+
+    def _self_lookup_request_kind(self, text: str) -> str | None:
+        normalized = self._normalize_freeform_lookup_text(text)
+        if (
+            normalized in _SELF_LOOKUP_HOURS_REQUEST_PATTERNS
+            or self._looks_like_flexible_self_hours_request(text, normalized=normalized)
+        ):
+            return "hours"
+        if normalized in _SELF_LOOKUP_STATUS_REQUEST_PATTERNS:
+            return "status"
+        return None
+
+    def _looks_like_self_hours_request(self, text: str) -> bool:
+        return self._self_lookup_request_kind(text) == "hours"
+
+    def _looks_like_not_working_today_request(self, text: str) -> bool:
+        normalized = self._normalize_freeform_lookup_text(text)
+        if not normalized or "today" not in normalized:
+            return False
+        if "not working on" in normalized:
+            return False
+        explicit_phrases = (
+            "not working today",
+            "off today",
+            "out today",
+            "taking today off",
+            "not coming in today",
+            "wont be in today",
+            "won't be in today",
+            "cant work today",
+            "can't work today",
+            "not able to work today",
+            "sick today",
+            "home sick today",
+        )
+        return any(phrase in normalized for phrase in explicit_phrases)
+
+    async def _maybe_start_day_suppression_prompt(
+        self,
+        client: discord.Client,
+        user: UserProfile,
+        session: SessionState,
+        inbound: MessageRecord,
+        now: datetime,
+    ) -> bool:
+        if self._day_suppression_active_for_session(session):
+            return False
+        action = await self._resolve_daily_availability_intent(
+            inbound.content,
+            stage=session.stage,
+        )
+        if action != "not_working_today":
+            return False
+        await self._start_day_suppression_prompt(client, user, session, inbound, now)
+        return True
+
+    def _metadata_datetime(
+        self,
+        session: SessionState,
+        key: str,
+        *,
+        reference: datetime | None = None,
+        timezone_name: str | None = None,
+    ) -> datetime | None:
         value = session.metadata.get(key)
         if not isinstance(value, str) or not value:
             return None
-        try:
-            return datetime.fromisoformat(value)
-        except ValueError:
-            return None
+        if reference is not None:
+            return self._coerce_datetime_for_reference(
+                value,
+                reference=reference,
+                timezone_name=timezone_name,
+            )
+        return self._coerce_datetime(value, timezone_name=timezone_name)
 
     def _stuck_acknowledgement(self) -> str:
         if self.config and self.config.clickup.mission_board_list_id:
@@ -7309,6 +13956,82 @@ class InternManagementRuntime:
         lowered = text.strip().lower()
         return lowered in {"no", "n", "nope", "nah", "dont", "don't"} or lowered.startswith("no ")
 
+    def _looks_like_lunch_resume_reply(self, text: str) -> bool:
+        normalized = " ".join(text.strip().lower().split())
+        if normalized in {
+            "done",
+            "im done",
+            "i'm done",
+            "finished",
+            "im finished",
+            "i'm finished",
+            "all done",
+            "back",
+            "im back",
+            "i'm back",
+        }:
+            return True
+        if re.search(r"\bclock(?:ed|\s+me)?(?:\s+back)?\s+in\b", normalized):
+            return True
+        if re.search(r"\b(?:got|came|am|i'?m|been)\s+back\b", normalized):
+            return True
+        if re.search(
+            r"\b(?:off|finished|done with|no (?:more|longer))\s+(?:my\s+)?lunch(?:\s+break)?\b",
+            normalized,
+        ):
+            return True
+        return bool(
+            re.search(r"\b(?:back|returned)\b", normalized)
+            and re.search(r"\b(?:lunch|break)\b", normalized)
+        )
+
+    def _reported_lunch_return_at(
+        self,
+        user: UserProfile,
+        session: SessionState,
+        text: str,
+        now: datetime,
+    ) -> datetime | None:
+        match = _LUNCH_RETURN_TIME_PATTERN.search(text)
+        if not match:
+            return None
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+        if hour > 23 or minute > 59:
+            return None
+        meridiem = re.sub(r"[^apm]", "", (match.group(3) or "").lower())
+        if meridiem and (hour < 1 or hour > 12):
+            return None
+        timezone_name = self.resolve_user_timezone_name(user)
+        local_now = localize_datetime(now, timezone_name)
+        lunch_started_at = self._coerce_datetime(
+            str(session.metadata.get("lunch_started_at") or ""),
+            timezone_name=timezone_name,
+        )
+        if lunch_started_at is None:
+            return None
+        lunch_started_at = localize_datetime(lunch_started_at, timezone_name)
+        if meridiem:
+            candidate_hour = hour % 12
+            if meridiem.startswith("p"):
+                candidate_hour += 12
+            candidate_hours = [candidate_hour]
+        else:
+            candidate_hours = [hour]
+            if 1 <= hour <= 11:
+                candidate_hours.append(hour + 12)
+        candidates = [
+            local_now.replace(hour=candidate_hour, minute=minute, second=0, microsecond=0)
+            for candidate_hour in candidate_hours
+            if 0 <= candidate_hour <= 23
+        ]
+        valid = [
+            candidate
+            for candidate in candidates
+            if lunch_started_at <= candidate <= local_now
+        ]
+        return max(valid) if valid else None
+
     def _normalize_priority(self, text: str) -> str | None:
         lowered = text.strip().lower()
         if lowered in {"urgent", "high", "normal", "low"}:
@@ -7330,12 +14053,26 @@ class InternManagementRuntime:
         session.last_contact_at = iso_value
         session.last_user_message_at = iso_value
         session.pending_clickup_sync = True
+        session.metadata.pop(_AUTO_CLOCK_OUT_WARNING_KEY, None)
 
-    def _normalize_session_state(self, session: SessionState) -> bool:
+    def _normalize_session_state(
+        self,
+        session: SessionState,
+        *,
+        user: UserProfile | None = None,
+    ) -> bool:
         changed = self._ensure_work_segments_consistency(session)
+        timezone_name = self.resolve_user_timezone_name(user) if user is not None else None
+        if timezone_name and self._normalize_session_timestamps(session, timezone_name=timezone_name):
+            changed = True
         normalized_reviews = self._pending_admin_reviews(session)
         if normalized_reviews != session.metadata.get(_PENDING_ADMIN_REVIEWS_KEY):
             self._set_pending_admin_reviews(session, normalized_reviews)
+            changed = True
+        if (
+            session.stage == "awaiting_task_selection"
+            and self._clear_non_authoritative_active_task_context(session)
+        ):
             changed = True
         if not session.intake_completed_at:
             last_task_onboarding_completed_at = str(
@@ -7376,6 +14113,93 @@ class InternManagementRuntime:
             ).isoformat()
             changed = True
         return changed
+
+    def _normalize_session_timestamps(
+        self,
+        session: SessionState,
+        *,
+        timezone_name: str,
+    ) -> bool:
+        changed = False
+        for field_name in _SESSION_STATE_TIMESTAMP_FIELDS:
+            raw_value = getattr(session, field_name)
+            normalized_value, field_changed = self._normalize_timestamp_value(
+                raw_value,
+                timezone_name=timezone_name,
+            )
+            if field_changed:
+                setattr(session, field_name, normalized_value)
+                changed = True
+        for segment in session.work_segments:
+            if not isinstance(segment, dict):
+                continue
+            for key in ("clocked_in_at", "clocked_out_at"):
+                normalized_value, field_changed = self._normalize_timestamp_value(
+                    segment.get(key),
+                    timezone_name=timezone_name,
+                )
+                if field_changed:
+                    segment[key] = normalized_value
+                    changed = True
+        if self._normalize_timestamp_container(session.metadata, timezone_name=timezone_name):
+            changed = True
+        return changed
+
+    def _normalize_timestamp_container(
+        self,
+        value: Any,
+        *,
+        timezone_name: str,
+    ) -> bool:
+        changed = False
+        if isinstance(value, dict):
+            for key, item in list(value.items()):
+                if isinstance(key, str) and self._should_normalize_timestamp_key(key):
+                    normalized_item, item_changed = self._normalize_timestamp_value(
+                        item,
+                        timezone_name=timezone_name,
+                    )
+                    if item_changed:
+                        value[key] = normalized_item
+                        item = normalized_item
+                        changed = True
+                if isinstance(item, (dict, list)) and self._normalize_timestamp_container(
+                    item,
+                    timezone_name=timezone_name,
+                ):
+                    changed = True
+            return changed
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, (dict, list)) and self._normalize_timestamp_container(
+                    item,
+                    timezone_name=timezone_name,
+                ):
+                    changed = True
+        return changed
+
+    def _normalize_timestamp_value(
+        self,
+        raw_value: Any,
+        *,
+        timezone_name: str,
+    ) -> tuple[Any, bool]:
+        if not isinstance(raw_value, str):
+            return raw_value, False
+        text = raw_value.strip()
+        if not text:
+            return raw_value, False
+        parsed = self._coerce_datetime(text, timezone_name=timezone_name)
+        if not parsed:
+            return raw_value, False
+        normalized = parsed.isoformat()
+        return normalized, normalized != raw_value
+
+    def _should_normalize_timestamp_key(self, key: str) -> bool:
+        return key == "at" or key.endswith("_at")
+
+    def _should_scan_timestamp_key(self, key: str) -> bool:
+        return self._should_normalize_timestamp_key(key) or key.endswith("_since")
 
     def _ensure_work_segments_consistency(self, session: SessionState) -> bool:
         normalized_segments: list[dict[str, str | None]] = []
@@ -7424,18 +14248,13 @@ class InternManagementRuntime:
             if not segment.get("clocked_out_at"):
                 segment["clocked_out_at"] = now.isoformat()
                 return
-        if session.clocked_in_at:
-            session.work_segments.append(
-                {
-                    "clocked_in_at": session.clocked_in_at,
-                    "clocked_out_at": now.isoformat(),
-                }
-            )
 
     def _clear_clock_out_state(self, session: SessionState) -> None:
         session.clocked_out_at = None
         session.awaiting_clock_out_photo = False
         session.awaiting_clock_out_summary = False
+        session.metadata.pop(_CLOCK_OUT_RETURN_STATE_KEY, None)
+        session.metadata.pop(_CLOCK_OUT_PAUSE_NOTE_KEY, None)
 
     def _clear_auto_clock_out_metadata(self, session: SessionState) -> None:
         for key in (
@@ -7445,6 +14264,7 @@ class InternManagementRuntime:
             "auto_clock_out_note",
         ):
             session.metadata.pop(key, None)
+        session.metadata.pop(_AUTO_CLOCK_OUT_WARNING_KEY, None)
 
     def _should_track_stuck_signal(self, session: SessionState) -> bool:
         return session.stage in {"active", "awaiting_clock_out_artifacts"}
@@ -7473,6 +14293,33 @@ class InternManagementRuntime:
         inbound: MessageRecord,
         now: datetime,
     ) -> None:
+        if session.clocked_out_at and _CLOCK_OUT_RETURN_STATE_KEY not in session.metadata:
+            await self._send_dm(
+                client,
+                user,
+                session,
+                "You are already clocked out. I did not add another time segment.",
+                now,
+            )
+            return
+        if _CLOCK_OUT_RETURN_STATE_KEY not in session.metadata:
+            prompt = session.metadata.get(_CLICKUP_PROMPT_KEY)
+            tracking = session.metadata.get("clickup_time_tracking")
+            session.metadata[_CLOCK_OUT_RETURN_STATE_KEY] = {
+                "stage": session.stage,
+                "awaiting_clock_out_photo": session.awaiting_clock_out_photo,
+                "awaiting_clock_out_summary": session.awaiting_clock_out_summary,
+                "clickup_prompt": deepcopy(prompt) if isinstance(prompt, dict) else None,
+                "had_clock_out_photo_paths": "clock_out_photo_paths" in session.metadata,
+                "clock_out_photo_paths": deepcopy(session.metadata.get("clock_out_photo_paths")),
+                "had_clock_out_summary_message_id": "clock_out_summary_message_id" in session.metadata,
+                "clock_out_summary_message_id": session.metadata.get("clock_out_summary_message_id"),
+                "pending_lunch_confirmation": session.metadata.get(_LUNCH_CONFIRMATION_REQUESTED_AT_KEY),
+                "task_tracking_was_running": bool(
+                    isinstance(tracking, dict) and not tracking.get("closed_at")
+                ),
+                "clock_out_requested_at": now.isoformat(),
+            }
         self._clear_pending_lunch_confirmation(session)
         self._clear_task_onboarding_prompt(session)
         if self._progress_probe_prompt(session):
@@ -7487,22 +14334,79 @@ class InternManagementRuntime:
             self._clear_follow_up_probe_tracking(session)
         session.stage = "awaiting_clock_out_artifacts"
         session.awaiting_clock_out_photo = not bool(inbound.attachments)
-        session.awaiting_clock_out_summary = not bool(inbound.content.strip())
+        session.awaiting_clock_out_summary = True
+        session.clocked_out_at = now.isoformat()
+        self._close_current_work_segment(session, now)
+        pause_note = await self._pause_current_task_tracking(
+            user,
+            session,
+            now,
+            set_hold=True,
+            end_reason="clock_out_requested",
+        )
+        if pause_note:
+            session.metadata[_CLOCK_OUT_PAUSE_NOTE_KEY] = pause_note
         if inbound.attachments:
             self._record_attachment_paths(session, "clock_out_photo_paths", inbound)
-        if inbound.content.strip():
-            session.metadata["clock_out_summary_message_id"] = inbound.message_id
-        if not session.awaiting_clock_out_photo and not session.awaiting_clock_out_summary:
-            session.clocked_out_at = now.isoformat()
-            self._close_current_work_segment(session, now)
-            session.stage = "clocked_out"
-            note = await self._finalize_clickup_day(user, session, now)
-            message = "Got it. I saved your end-of-day update."
-            if note:
-                message = f"{message}\n\n{note}"
-            await self._send_dm(client, user, session, message, now)
-            return
         await self._send_dm(client, user, session, self.config.prompts.clock_out_prompt, now)
+
+    async def _cancel_clock_out(
+        self,
+        client: discord.Client,
+        user: UserProfile,
+        session: SessionState,
+        now: datetime,
+    ) -> None:
+        return_state = session.metadata.pop(_CLOCK_OUT_RETURN_STATE_KEY, None)
+        return_state = return_state if isinstance(return_state, dict) else {}
+        previous_stage = str(return_state.get("stage") or "")
+        if previous_stage and previous_stage not in {"awaiting_clock_out_artifacts", "clocked_out"}:
+            session.stage = previous_stage
+        else:
+            session.stage = "active" if session.clocked_in_at else "awaiting_clock_in"
+        session.clocked_out_at = None
+        session.awaiting_clock_out_photo = bool(return_state.get("awaiting_clock_out_photo", False))
+        session.awaiting_clock_out_summary = bool(return_state.get("awaiting_clock_out_summary", False))
+
+        restored_prompt = return_state.get("clickup_prompt")
+        if isinstance(restored_prompt, dict):
+            session.metadata[_CLICKUP_PROMPT_KEY] = deepcopy(restored_prompt)
+        else:
+            session.metadata.pop(_CLICKUP_PROMPT_KEY, None)
+
+        for key in ("clock_out_photo_paths", "clock_out_summary_message_id"):
+            had_key = bool(return_state.get(f"had_{key}", False))
+            if had_key:
+                session.metadata[key] = deepcopy(return_state.get(key))
+            else:
+                session.metadata.pop(key, None)
+        pending_lunch_confirmation = return_state.get("pending_lunch_confirmation")
+        if pending_lunch_confirmation:
+            session.metadata[_LUNCH_CONFIRMATION_REQUESTED_AT_KEY] = pending_lunch_confirmation
+        self._start_new_work_segment(session, now)
+        if bool(return_state.get("task_tracking_was_running")):
+            task_id = str(self._active_task_id(session) or "")
+            task_name = str(session.metadata.get("active_clickup_task_name") or "")
+            if task_id:
+                try:
+                    await self._safe_set_task_state(session, task_id, "in_progress")
+                except Exception:
+                    logger.exception(
+                        "Could not restore ClickUp task %s after clock-out cancellation.",
+                        task_id,
+                    )
+                await self._start_task_timer(user, session, now, task_id, task_name)
+        session.metadata.pop(_CLOCK_OUT_PAUSE_NOTE_KEY, None)
+
+        message = "Okay, I canceled the clock-out process. You are still clocked in."
+        if isinstance(restored_prompt, dict) and str(restored_prompt.get("type") or "") == "task_onboarding":
+            step = str(restored_prompt.get("step") or "select_task")
+            if step == "select_task":
+                continuation = "Let's continue onboarding. Reply with the task name or task ID you are working on."
+            else:
+                continuation = self._task_onboarding_question(restored_prompt, step)
+            message = f"{message}\n\n{continuation}"
+        await self._send_dm(client, user, session, message, now)
 
     async def _handle_clock_out_artifacts(
         self,
@@ -7512,6 +14416,20 @@ class InternManagementRuntime:
         inbound: MessageRecord,
         now: datetime,
     ) -> None:
+        if is_clock_out_cancellation(inbound.content):
+            await self._cancel_clock_out(client, user, session, now)
+            return
+        if detect_signals(inbound.content).clocking_out:
+            reminder = self._clock_out_artifacts_reminder_text(session)
+            await self._send_dm(
+                client,
+                user,
+                session,
+                "You are already clocked out; I did not add another time segment."
+                + (f"\n\n{reminder}" if reminder else ""),
+                now,
+            )
+            return
         self._clear_task_onboarding_prompt(session)
         if inbound.attachments:
             self._record_attachment_paths(session, "clock_out_photo_paths", inbound)
@@ -7534,10 +14452,25 @@ class InternManagementRuntime:
                 now,
             )
             return
-        session.clocked_out_at = now.isoformat()
-        self._close_current_work_segment(session, now)
+        if session.stage == "on_lunch_break" or (
+            session.metadata.get("lunch_started_at")
+            and not session.metadata.get("lunch_ended_at")
+        ):
+            session.metadata["lunch_ended_at"] = now.isoformat()
+            self._record_lunch_window_end(session, now)
+        return_state = session.metadata.get(_CLOCK_OUT_RETURN_STATE_KEY)
+        return_state = return_state if isinstance(return_state, dict) else {}
+        session.clocked_out_at = str(
+            return_state.get("clock_out_requested_at")
+            or session.clocked_out_at
+            or now.isoformat()
+        )
         session.stage = "clocked_out"
+        session.metadata.pop(_CLOCK_OUT_RETURN_STATE_KEY, None)
         note = await self._finalize_clickup_day(user, session, now)
+        pause_note = str(session.metadata.pop(_CLOCK_OUT_PAUSE_NOTE_KEY, "") or "").strip()
+        if pause_note:
+            note = f"{pause_note}\n\n{note}" if note else pause_note
         message = "Perfect. I saved everything and will update the project trail."
         if note:
             message = f"{message}\n\n{note}"

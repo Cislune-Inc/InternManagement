@@ -9,10 +9,12 @@ from dotenv import load_dotenv
 from .discord_bot import InternManagementDiscordBot
 from .process_lock import SingleInstanceLock
 from .runtime import InternManagementRuntime
+from .ssl_compat import ensure_ssl_cert_file
 
 
 def main() -> None:
     load_dotenv()
+    ensure_ssl_cert_file()
     token = os.environ["DISCORD_BOT_TOKEN"]
     runtime = InternManagementRuntime()
     try:

@@ -19,11 +19,12 @@ Compared with the original Drive-backed design, this version is simpler and more
 - Discord remains the live coordination channel with interns and admins.
 - Every user gets a predictable local folder with daily subfolders for transcripts and images.
 - Each daily `session.json` now includes a compact `time_summary` block with clocked-in time, task-tracked time, and per-task totals.
+- A consolidated `storage/dashboard/time_tracking/time_tracking.csv` rollup makes archived daily hours visible in one local file, including review-status columns that help separate likely-correct days from ones that need attention.
 
 ## Directory layout
 
 ```text
-InternManagment/
+InternManagement/
   agent/
     ...
   config_templates/
@@ -46,10 +47,19 @@ data/
 storage/
   dashboard/
     dashboard.md
+    time_tracking/
+      time_tracking_dashboard.html
+      time_tracking.csv
+      retro_backfill/
+        20260615-090000/
+          audit.csv
+          summary.json
   people/
     Alex Example/
       profile.json
       2026-05-27/
+        hours_backfill_explanation.json
+        manual_time_edits.jsonl
         session.json
         state_machine_changes.jsonl
         transcript.md
@@ -70,37 +80,291 @@ storage/
 8. Add the Discord bot token and ClickUp token to `.env`.
 9. Run the agent.
 
+Mac/Linux quickstart:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+mkdir -p config
+cp config_templates/agent.config.example.json config/agent.config.json
+cp config_templates/roster.example.csv config/roster.csv
+```
+
+If you already transferred a live local config from another machine, copy those files into `config/` instead of the example files.
+
 ## Run
 
-```powershell
-.\.venv\Scripts\python -m agent.main
+```bash
+.venv/bin/python -m agent.main
 ```
 
 ## Demo
 
 Run a local simulated workday without sending real Discord DMs:
 
-```powershell
-.\.venv\Scripts\python -m agent.demo
+```bash
+.venv/bin/python -m agent.demo
 ```
 
 Or target a specific active `user_key` from `config/roster.csv`:
 
-```powershell
-.\.venv\Scripts\python -m agent.demo --user Andrew
+```bash
+.venv/bin/python -m agent.demo --user alex
 ```
 
 Send a short scripted live demo to one chosen active roster user on Discord:
 
-```powershell
-.\.venv\Scripts\python -m agent.demo --mode live --user Andrew
+```bash
+.venv/bin/python -m agent.demo --mode live --user alex
 ```
 
 List the active `user_key` values available for the live demo:
 
-```powershell
-.\.venv\Scripts\python -m agent.demo --list-users
+```bash
+.venv/bin/python -m agent.demo --list-users
 ```
+
+## Historical Hours Backfill
+
+Retroactively rebuild prior archived hours and write an audit bundle:
+
+```bash
+.venv/bin/python -m agent.backfill_hours --dry-run
+```
+
+Apply the reconstructed hours back into archived `session.json` files, write per-day explanation files, and rebuild the main CSV rollup:
+
+```bash
+.venv/bin/python -m agent.backfill_hours --apply
+```
+
+Open `storage/dashboard/time_tracking/time_tracking_dashboard.html` in a browser to review the read-only hours snapshot and any discovered backfill audit runs.
+
+That exported HTML file is read-only. To manually correct past clock-in / clock-out segments, launch the local editor server instead:
+
+```bash
+.venv/bin/python -m agent.hours_editor
+```
+
+Then open `http://127.0.0.1:8765/` in a browser.
+
+The localhost editor/dashboard is the primary live view:
+
+- `http://127.0.0.1:8765/` and `http://127.0.0.1:8765/time` serve the editable time-tracking dashboard
+- `http://127.0.0.1:8765/work` serves the work dashboard with recent per-intern work, status, blockers, active task, and available ClickUp tasks
+- `http://127.0.0.1:8765/payroll` serves payroll and project-labor review
+- `http://127.0.0.1:8765/exceptions` serves the manager exception queue for blockers, incomplete close-outs, admin reviews, task/timer mismatches, uncertain Slack routing, and integration failures
+- `http://127.0.0.1:8765/health` serves service health, integrations, storage usage, the operational issue queue, and Slack routing review
+
+The worker-facing web beta is entered through Slack rather than through a permanent public URL. A configured beta tester can DM `portal` to Don Pollo and receive a signed 72-hour VPN link. The portal shows five deadline-aware recommendations plus a searchable contract/program hierarchy of open ClickUp work. For a running production runtime, its Start, checkpoint, break, lunch, and clock-out actions use the same durable session and ClickUp timer as Slack; preview-only runtimes remain isolated. Browsing is read-only, while the explicit Claim action adds the tester as a ClickUp assignee without removing existing assignees.
+
+When `OPENAI_API_KEY` is configured, the portal also offers two explicit writing helpers: turn rough intent into a structured plan and improve a rough checkpoint. The worker must review the generated fields and press the ordinary Start or Save button afterward. AI never starts time, approves tasks, evaluates payroll, or controls lunch/overtime enforcement. Responses use strict JSON schemas, API requests set `store=false`, and the existing deterministic quality validation still runs before a record is accepted. `OPENAI_PORTAL_MODEL` selects the model, `OPENAI_PORTAL_DAILY_TOKEN_BUDGET` caps aggregate portal usage per local day, and `OPENAI_PORTAL_MAX_CALLS_PER_WORKER` caps helper requests per worker per day.
+
+- it reads fresh dashboard data from disk on request
+- while it is open, it auto-refreshes every 10 minutes without resetting your filters
+- if you are actively editing a past day, background refresh pauses until you close the editor panel
+- the Hours Rollup view now includes `Likely correct`, `Needs review`, `Likely wrong`, and `In progress` review states with per-day reasons so you can compare local truth against the external hours website faster
+- when the LaunchAgent is bound to `0.0.0.0`, use this Mac's LAN IP in place of `127.0.0.1` to reach the dashboards from the local network
+
+## Slack Project Updates
+
+Slack posting is optional and disabled unless the live local config enables it. To turn it on, set `SLACK_BOT_TOKEN` in `.env`, add `slack_user_id` values to `config/roster.csv` so updates can tag interns, and add `slack.project_routes` in `config/agent.config.json` that map ClickUp task/list/folder IDs or conservative name patterns to Slack channel IDs. Task-name matching follows the active task's ClickUp parent ancestry, so nested intern work can roll up to its contract channel.
+
+### Slack-Only Workers
+
+Don Pollo can run the same clock-in, task selection, ClickUp timer, lunch, status, and clock-out workflow through Slack DMs. Slack inbound messaging uses Socket Mode so the local Mac does not need a public webhook:
+
+1. Enable Socket Mode and Event Subscriptions for the Don Pollo Slack app.
+2. Enable the App Home tab and subscribe the bot to the `message.im` and `app_home_opened` events. The Home tab gives each enabled user a fresh signed portal button; the DM remains the fallback.
+3. Add an app-level token with `connections:write` to `.env` as `SLACK_APP_TOKEN`.
+4. Keep `SLACK_BOT_TOKEN` configured with DM/message and file permissions.
+5. Add the worker to `config/roster.csv` with `slack_user_id` and `preferred_transport=slack`. `discord_user_id` may be blank for Slack-only workers.
+
+The optional roster policy columns are documented in `config_templates/roster.example.csv`. Every active roster member is migrated to time and meal tracking when the reviewed production branch is deployed. `worker_type`, compensation plan, task-aware check-in overrides, Gusto UUIDs, and local labor cost rates remain separate controls.
+
+Use `compensation_plan` to prevent project effort from becoming an accidental payroll instruction:
+
+- `cislune_hourly`: tracked work is eligible for the approval-first Cislune/Gusto bundle.
+- `nasa_stipend`: tracked work stays in project and NASA labor reporting but is excluded from Cislune hourly payroll.
+- `salary` or `external`: tracked work remains available for project reporting and is excluded from hourly payroll.
+- `needs_review`: tracked work is retained but the weekly review is blocked until an operator classifies the plan.
+
+Do not infer `nasa_stipend` merely from `worker_type=intern`; funding source and legal worker classification are different questions. Deployment preserves explicit plans, infers Cislune hourly only from an existing Gusto mapping, and sends all other uncertain records to `needs_review`.
+
+Time policy is deliberately conservative: a recorded, duty-free meal pauses the task timer and is excluded from tracked work and hourly payroll. A meal timer cannot restart until the configured 30-minute minimum has passed, after which the worker can check themselves back in. A declared short rest stays paid and allocated to the active project for up to 10 minutes. The worker must reply `back from break`; if the limit passes without that check-in, Don Pollo clocks them out effective at the 10-minute cutoff, stops project time, and tells them to clock back in before resuming work. The bot also warns before the configured meal and overtime thresholds, automatically starts lunch at the meal deadline, and automatically clocks nonexempt workers out at the unapproved overtime limit. An overtime stop cannot be restarted that workday until Erik or George runs the approval-first `review.overtime_approve` command; the other approver is notified.
+
+Resolved enforcement does not produce an interrupting admin DM. Automatic meal pauses and successful short-rest, inactivity, or overtime clock-outs stay visible in the compliance history and manager dashboards. Direct admin alerts are reserved for unresolved risk, such as continued overtime when automatic enforcement is disabled, or an active blocker that needs help.
+
+### Slack Admin Beta
+
+A configured admin can use the deterministic admin console by DMing the Don Pollo Slack app. Add the admin's Slack member ID as `slack_user_id` in the `admins` list in `config/agent.config.json`; do not add the admin to the worker roster. The same `help`, `flow`, and `run <command-id> ...` grammar works in Slack. Read-only commands return immediately. Commands that send messages or change state return a preview and require the exact `confirm <token>` reply; `cancel` abandons the pending action.
+
+Slack admin DMs and App Home use the same Socket Mode connection as Slack-only workers, so `SLACK_APP_TOKEN` with `connections:write` and the `message.im` plus `app_home_opened` event subscriptions are required. The production controls map Erik's configured admin profile to Slack member `U01SWQKDTBM` for the beta.
+
+## Monday Payroll And Project Labor
+
+Generate an approval-first bundle for the prior completed week:
+
+```bash
+.venv/bin/python -m agent.payroll_export
+```
+
+Or target a specific week-ending date:
+
+```bash
+.venv/bin/python -m agent.payroll_export --week-ending 2026-08-02
+```
+
+The bundle is written under `storage/dashboard/payroll/<week-ending>/` and copied to `storage/dashboard/payroll/latest/`. It includes:
+
+- `payroll_review.csv` with shift, meal, regular, overtime, and review fields
+- `project_labor.csv` with task-to-project labor allocation
+- `nasa_project_labor.csv` as a source-linked reporting backup
+- `project_summary.csv` with budget-hour and labor-cost columns
+- `compliance_events.csv`
+- `gusto_time_sheets.json`, deliberately marked approval-required and not submitted
+
+Open `http://127.0.0.1:8765/payroll` for the human-readable review page and downloads. Review rows can be resolved there with a required reviewer name and note. Resolutions are tied to an evidence fingerprint, so changing the underlying hours automatically reopens the row. Optional learned resolution is deliberately limited to same-worker task-time variances; meal, overtime, compliance, and incomplete-segment reviews are never learned away.
+
+Deployment also writes `compensation_classification_review.csv`, containing only classifications that still need a human decision. Explicit roster classifications, Gusto mappings, and operator overrides can be applied automatically when the evidence is high-confidence. Stipend wording and other best guesses remain in the review file and are never promoted into payroll instructions without confirmation. The production roster records `Rosemead, CA` and `California` as the work location and labor jurisdiction unless a reviewed worker-specific value already exists.
+
+Reviewed classifications can be recorded without hand-editing local JSON:
+
+```bash
+.venv/bin/python ops/record-compensation.py --user example --slack-id U123 --plan cislune-hourly --evidence signed-hourly-agreement --reviewed-by Erik
+.venv/bin/python ops/infer_compensation_plans.py --apply-confident
+```
+
+The recorder preserves unrelated workforce fields, timestamps the decision, stores only a short evidence label, and backs up existing overrides before replacing them.
+
+Missing Gusto mappings are informational for workers explicitly classified as `cislune_hourly`; they remain in the review queue but cannot enter the Gusto bundle. Only mapped Cislune-hourly workers are included in `gusto_time_sheets.json`; everyone remains visible in tracked-time and project-labor exports. The dashboard separately shows all tracked hours, hourly-payroll hours, NASA-stipend effort, and unclassified hours. The installed macOS LaunchAgent runs the exporter each Monday at 7:00 AM. Gusto production submission remains disabled until the company has an approved integration and an operator has reviewed the bundle.
+
+Generate a read-only Slack/ClickUp identity proposal without changing the live roster:
+
+```bash
+.venv/bin/python -m agent.workforce_mapping
+```
+
+The result is `storage/dashboard/payroll/workforce_identity_candidates.csv` and is downloadable from the payroll dashboard. Exact identity matches are kept separate from worker-type estimates so uncertain employees and contractors can be confirmed before onboarding.
+
+When enabled, the bot can post lightweight project-channel updates during configured work hours. It summarizes only new, interesting intern activity, attaches fresh progress images that have useful context, spaces posts out with `slack.min_post_interval_minutes`, and skips posting when there is nothing meaningful to say. If a task cannot be confidently mapped and `slack.unmapped_channel_id` is configured, the update goes there with a mapping-review note instead of guessing a project channel.
+
+Set `slack.practice_channel_id` to force every daily update and weekly recap into one test channel while retaining the configured production route labels. Clear that value only when the production channel map is ready.
+
+Weekly photo recaps use reactions on previously posted progress images. The recap ranks images by configured positive reactions such as `:fire:`, `:heart:`, `:rocket:`, and `:clap:`.
+
+Admins can optionally add `slack_user_id` to their `admins` entry. Don Pollo mirrors
+actionable admin notices there and sends deduplicated operational failures to that
+Slack user. Uncertain Slack routes can be assigned from the System Health page;
+the chosen task or session override is persisted in SQLite and used by future posts.
+
+Operator feedback on daily updates uses lightweight Slack reactions:
+
+- `:white_check_mark:` means useful
+- `:x:` or `:twisted_rightwards_arrows:` means wrong task or channel
+- `:repeat:` means duplicate
+- `:memo:` means too detailed
+
+Don Pollo checks these reactions every six hours. Negative feedback enters the
+Manager Queue. Channel-only errors can be corrected there; when the active ClickUp
+task/project is wrong, use the audited correction panel on the Work Dashboard.
+
+Optional filters:
+
+- `--user <user_key>`
+- `--from YYYY-MM-DD`
+- `--to YYYY-MM-DD`
+
+## Manual Hours Editor
+
+The local hours editor is for archived past workdays only. It lets an operator:
+
+- choose an intern and past workday from the Hours Rollup view
+- edit the full set of work segments for that day
+- require both `edited by` and `reason`
+- preview recalculated clocked-in and task-tracked totals before saving
+
+Save path:
+
+- reads the live session from SQLite first
+- rewrites the archived `session.json`
+- appends `manual_time_edits.jsonl` beside that day
+- rebuilds `storage/dashboard/time_tracking/time_tracking.csv`
+- rebuilds `storage/dashboard/time_tracking/time_tracking_dashboard.html`
+
+## Always-On Local Dashboard On macOS
+
+Versioned LaunchAgent templates for both always-on services live under `ops/`.
+Install them into `~/Library/LaunchAgents/` once, then use the checked-in restart
+and verification scripts after deployments:
+
+```bash
+cp ops/com.pm.internmanagement.bot.plist ~/Library/LaunchAgents/
+cp ops/com.pm.internmanagement.time-tracking.plist ~/Library/LaunchAgents/
+cp ops/com.pm.internmanagement.backup.plist ~/Library/LaunchAgents/
+cp ops/com.pm.internmanagement.integration-health.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pm.internmanagement.bot.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pm.internmanagement.time-tracking.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pm.internmanagement.backup.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pm.internmanagement.integration-health.plist
+ops/restart-services.sh
+```
+
+`ops/restart-services.sh` restarts the bot and dashboard, then verifies Discord
+readiness, backup freshness, scheduled integration checks, and
+`http://127.0.0.1:8765/health`. Run `ops/verify-services.sh` for a read-only health
+check.
+
+The backup LaunchAgent creates an encrypted core backup nightly at 2:30 AM.
+It includes SQLite, `.env`, live config, sessions, transcripts, and audit evidence,
+with 30-day backup retention. The encryption key is created at
+`secrets/backup.key`; preserve a separate secure copy of that key because encrypted
+backups cannot be restored without it. Progress images are deliberately excluded
+from nightly backups and can be included in an explicit full backup:
+
+```bash
+.venv/bin/python -m agent.backup
+.venv/bin/python -m agent.backup --include-images
+.venv/bin/python -m agent.backup --verify backups/<backup-file>.tar.gz.enc
+.venv/bin/python -m agent.backup --restore backups/<backup-file>.tar.gz.enc --restore-to /tmp/don-pollo-restore
+```
+
+Restores always go to a separate staging directory and never overwrite live files.
+The integration-health LaunchAgent checks the bot, database, backup age, dashboard,
+Discord, Slack, ClickUp, and OpenAI every 30 minutes. Failures are deduplicated in
+SQLite and sent to configured Slack admins such as Erik.
+
+## Development And Storage
+
+Install test-only tools separately from production dependencies:
+
+```bash
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python -m pytest
+```
+
+Create a non-destructive inventory of local storage:
+
+```bash
+.venv/bin/python -m agent.storage_maintenance
+```
+
+The report is written to
+`storage/dashboard/system/storage_inventory.json`. It identifies large files and
+storage categories but deliberately never deletes session evidence, transcripts,
+or progress images.
+
+Preview old daily folders for encrypted archival:
+
+```bash
+.venv/bin/python -m agent.storage_maintenance --archive-before 2026-07-01
+```
+
+Creating the verified archive requires `--apply`. Source folders are retained unless
+the operator separately adds `--delete-source`; this prevents routine maintenance
+from silently deleting historical evidence.
 
 ## What the bot does
 
@@ -112,8 +376,20 @@ List the active `user_key` values available for the live demo:
   - a before-start picture
   - optional early blockers
 - Uses ClickUp context to give plan feedback.
-- Checks in every 30 minutes until the user clocks out.
+- Uses a 90-minute average check-in cadence, adapting between 45 and 120 minutes from the task duration supplied during onboarding.
 - Lets a clocked-in intern mark a lunch break, pauses task timing, and checks every 30 minutes until they say they are back.
+- Lets a worker declare a paid short rest while an active ClickUp task keeps running, requires a return check-in within 10 minutes, and clocks them out effective at the cutoff if they do not return.
+- Lets an intern ask for their hours for the current week in DM and replies with both clocked-in time and task-tracked time plus a daily breakdown.
+- Can retroactively rebuild prior archived hours from local artifacts, writing a durable `hours_backfill_explanation.json` beside each applied day plus a per-run audit bundle under `storage/dashboard/time_tracking/retro_backfill/`.
+- Generates a local `storage/dashboard/time_tracking/time_tracking_dashboard.html` file with filterable archived hours plus expandable backfill-audit details.
+- Can post task-linked Slack project updates and weekly progress-photo recaps when routing is configured. Uncertain routes are quarantined, vague/workflow chatter is rejected, and later updates and photos stay in the worker/task thread.
+- Supports the same workflow in Slack DMs for roster users who are not on Discord.
+- Warns a tracked worker near 4.5 recorded hours and automatically pauses work time at the configured meal deadline if lunch has not started.
+- Keeps clocked-in totals equal to recorded work segments; lunch never triggers a flat automatic time deduction.
+- Uses practical intern wording for lunch and end-of-day coaching, while configured employees and contractors receive explicit approval language.
+- Records automatic meal pauses and successful enforcement in compliance history without interrupting admins. Covered hourly workers receive an overtime warning before the configured limit and are automatically clocked out at the limit unless approval is stored; salaried/exempt and external workers can opt out in the roster. The 30-minute meal restart gate is worker self-service, while the overtime restart gate requires Erik or George and tells the other approver. Admin DMs are reserved for unresolved risk.
+- Never deducts, revokes, or changes recorded time merely because a compliance reminder was sent.
+- Generates Monday payroll, project-budget, overhead-review, compliance, NASA-reporting, and Gusto-ready export artifacts.
 - Alerts the configured admin if someone appears stuck for four hours.
 - Accepts admin-only Discord DM commands for roster status, reminder actions, photo review, config checks, and ClickUp-backed planning summaries.
 - Uses the OpenAI API as an optional signal layer for intern messages and advanced admin analysis, but normal admin command routing is deterministic.
@@ -129,12 +405,12 @@ List the active `user_key` values available for the live demo:
 - Can let an intern mark a task finished, ask for both a completion summary and a completion photo when needed, then pause the task and put it into an admin-review loop before closure.
 - Hides tasks that were just closed from the next-task picker so interns do not immediately reselect finished work unless an admin explicitly reopens or reassigns it.
 - Can automatically move the inferred ClickUp task into `in progress`, `hold`, or `complete` when the intern workflow strongly supports it.
-- Can create Mission Board blocker tasks through a short DM prompt sequence instead of relying on people to fill ClickUp out by hand.
+- Can draft project, overhead, blocker, and unblocker tasks through DM, but requires configured management approval before creating them in ClickUp.
 - Can keep per-task timer state locally and sync completed ClickUp time entries on task pause / task switch / clock-out when the workspace token has permission to write them.
-- Can auto-clock out an intern after six hours with no inbound check-in, stopping the local task timer automatically, putting the active ClickUp task on `hold`, and preserving the tracked time in the daily log.
+- Can warn and auto-clock out an inactive worker after the configured interval, stopping the local task timer, putting the active ClickUp task on `hold`, and preserving tracked time in the daily log.
 - Keeps overnight activity in the existing `YYYY-MM-DD` folder layout by using a per-user local workday rollover, so work before `03:30` stays in the previous day's folder.
 - Supports multiple clock-in / clock-out segments inside one local workday bucket without re-running the full morning intake every time.
-- Can suggest likely unassigned Mission Board tasks for the next day based on priority plus overlap with the intern's current work context.
+- Can suggest likely unassigned tasks across every Space in the configured ClickUp workspace, showing Space / Folder / List context and ranking options by status, priority, and overlap with the worker's current project context. Assigned tasks remain preferred; choosing an unassigned workspace option assigns it only after the worker confirms the match.
 - Optionally attaches newly received files to the inferred or pinned ClickUp task.
 - Flushes new developments into ClickUp after 10 minutes of user inactivity.
 
@@ -150,11 +426,15 @@ List the active `user_key` values available for the live demo:
 - `clickup_task_id` and `clickup_list_id` are no longer supported roster columns. Per-user task/list overrides were removed so task selection stays runtime-driven.
 - `admins` in `agent.config.json` is the preferred way to define named admins for DM escalation and admin-targeted stuck-help prompts. The legacy `admin_discord_user_id` value is still used as the primary fallback.
 - If you want the bot to assign ClickUp tasks directly to an admin, include that admin's `clickup_user_id` or `clickup_user_email` in `admins`. The runtime can also attempt a workspace-member lookup by name, but explicit IDs are more reliable.
-- `clickup.mission_board_list_id` should point at the List where new blocker tasks and next-task suggestions should come from.
+- `clickup.mission_board_list_id` should point at the default List for newly approved top-level and blocker tasks. Existing-task suggestions scan the full configured ClickUp workspace rather than only this List.
+- `slack.enabled` defaults to `false`. When enabling it, configure `SLACK_BOT_TOKEN`, roster `slack_user_id` values, and `slack.project_routes` so updates go to the correct project channels. Use `slack.unmapped_channel_id` for mapping-review posts when a ClickUp task is not confidently routed.
 - ClickUp's assignee timer APIs are permission-sensitive. The bot will query/start assignee-linked timers when allowed by the token and workspace, and otherwise it falls back to local running-timer state plus synced closed time entries.
-- `schedule.auto_clock_out_after_hours` controls when a clocked-in but silent intern is treated as clocked out automatically. The default is `6`.
+- `schedule.auto_clock_out_after_hours` controls when a clocked-in but silent worker is treated as clocked out automatically. `schedule.auto_clock_out_warning_minutes` controls the stateful warning lead time. Production uses a `4` hour backstop with a `15` minute warning; ordinary progress prompts are separate, non-punitive conversations. A clock-out cannot occur unless its matching warning was successfully recorded, and a late scheduler tick starts a fresh warning grace period instead of clocking someone out without notice.
+- Before inactivity enforcement, Don Pollo checks the active ClickUp task for a newer credible update. A newer task update resets the inactivity reference; a merely running stale timer does not.
+- Operational warnings are consolidated by worker/task and delivered once daily at the configured 8:00 AM Pacific digest time. Route warnings older than 14 days are retired and recur automatically if the condition returns.
 - `schedule.workday_rollover_time` controls when a user's local workday rolls into the next date folder. The default is `03:30`.
 - Lunch breaks suspend the inactivity auto-clock-out timer and keep the current ClickUp task in `in progress` while local task timing is paused.
+- `labor.short_rest_break_minutes` defaults to `10`. Declared short rests remain paid and project-allocated until the worker checks back in or the exact cutoff is reached.
 - Manual clock-out also parks the current active ClickUp task on `hold`. Task closure should happen through the finish-task admin review flow instead of ordinary clock-out.
 - Daily image metadata is written to `images_manifest.json`, and transcripts include any generated descriptions/tags for saved images.
 - The admin console is grouped and deterministic by default. Normal admin control uses `help`, `menu`, `flow`, and `run <command-id> ...`.
@@ -163,7 +443,7 @@ List the active `user_key` values available for the live demo:
 
 ## Admin Console
 
-The admin Discord user ID from `agent.config.json` can DM the bot directly with:
+Any configured admin can DM the bot through Discord, or use the Slack admin beta when their admin profile includes a `slack_user_id`, with:
 
 - `help` or `menu`
 - `flow`
@@ -182,5 +462,5 @@ Examples:
 - `run system.validate`
 - `run advanced.interpret text="how many people clocked in today"`
 
-The full grouped command catalog and scenario flowchart live in [docs/admin_console.md](</C:/Users/George Ore/Documents/InternManagment/docs/admin_console.md>).
-The current equal-peer multi-admin test matrix and conflict guide live in [docs/multi_admin_scenarios.md](</C:/Users/George Ore/Documents/InternManagment/docs/multi_admin_scenarios.md>).
+The full grouped command catalog and scenario flowchart live in [docs/admin_console.md](docs/admin_console.md).
+The current equal-peer multi-admin test matrix and conflict guide live in [docs/multi_admin_scenarios.md](docs/multi_admin_scenarios.md).
