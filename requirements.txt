@@ -1,4 +1,5 @@
 discord.py>=2.5,<3
+aiohttp>=3.9,<4
 openai>=1.84,<2
 python-dotenv>=1.1,<2
 requests>=2.32,<3

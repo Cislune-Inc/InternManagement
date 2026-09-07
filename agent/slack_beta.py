@@ -63,7 +63,8 @@ async def manager_hours(runtime: Any, admin: Any, slack_id: str, text: str, even
 
 def ledger(runtime: Any) -> SlackTimekeeping:
     return SlackTimekeeping(runtime.state_store, timezone_name=runtime.config.timezone,
-                           daily_limit_hours=runtime.config.labor.overtime_limit_hours)
+                           daily_limit_hours=runtime.config.labor.overtime_limit_hours,
+                           require_kiosk=True)
 
 
 async def archive(runtime: Any, user: Any, session: Any, now: datetime) -> None:
@@ -103,6 +104,9 @@ async def handle_message(runtime: Any, event: dict[str, Any]) -> bool:
         await runtime.slack.post_message(slack_id, "I could not validate this message's timestamp. " + FALLBACK)
         return True
     admin = runtime.admin_profile_by_slack_user_id(slack_id)
+    from .work_sharing import handle as handle_work_sharing
+    if await handle_work_sharing(runtime, slack_id, text):
+        return True
     if text.lower().startswith(("hours add ", "hours resolve ", "hours reports")):
         await manager_hours(runtime, admin, slack_id, text, event_id, now)
         return True
@@ -129,6 +133,12 @@ async def handle_message(runtime: Any, event: dict[str, Any]) -> bool:
         async with runtime._user_session_lock(user.user_key):
             try:
                 response, session = ledger(runtime).handle(user, *command, event_id=event_id, now=now)
+                if response.startswith("KIOSK_REQUIRED"):
+                    from .onsite_kiosk import KioskCodes
+                    code = KioskCodes(runtime.state_store).issue(slack_id, *command)
+                    response = (f"At the shop Mini, enter code `{code}` within two minutes to confirm your {('return' if command[0] == 'back' else 'clock-in')}. "
+                                "The clock changes only when you confirm there. Do not share your code. "
+                                "Offsite work needs Erik's advance approval; use `clock in remote` if approved. " + FALLBACK)
             except ValueError as exc:
                 response, session = str(exc), None
             await runtime.slack.post_message(slack_id, response)
@@ -196,7 +206,9 @@ async def run_slack_only(runtime: Any) -> None:
                 logger.exception("Slack-only scheduler failed; clock records remain durable.")
             await asyncio.sleep(30)
 
-    tasks = [asyncio.create_task(receiver.start()), asyncio.create_task(scheduler())]
+    from .onsite_kiosk import serve
+    tasks = [asyncio.create_task(receiver.start()), asyncio.create_task(scheduler()),
+             asyncio.create_task(serve(runtime))]
     try:
         # A dead socket receiver is a failed service, not a healthy scheduler.
         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)

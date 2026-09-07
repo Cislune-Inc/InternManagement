@@ -38,6 +38,7 @@ _HELP = (
     "`work GRASP: compare wheel-slip runs and save a plot for George`\n"
     "Then use `work detail <why / next result / rough estimate>`, "
     "`work update <what changed or what is blocked>`, or `work status`.\n"
+    "`work next <next step / blocker>` and `work draft` prepare a private, confirmed handoff; nothing posts automatically.\n"
     "Projects: 1 GRASP · 2 CISORT · 3 CITA · 4 Bagworm · 5 CLASP. "
     "Also: shop, meetings, proposals, sales, finance, people, operations, dp, irad, exploration.\n"
     "`work project <name or 1–5>` labels the current proposal. "
@@ -149,7 +150,7 @@ class SlackWorkIntake:
                 f"{i}. {_safe(PROJECTS.get(row['project_key'], 'Project unconfirmed'))} — `{row['id']}`: "
                 + _safe(self._events(conn, row['id'])[0]['text'][:180]) for i, row in enumerate(rows, 1)
             )
-        if command in {"status", "detail", "update", "project", "edit", "evidence", "handoff"}:
+        if command in {"status", "detail", "update", "project", "edit", "next", "evidence", "handoff"}:
             if not item:
                 return "No proposal yet. " + _HELP
             if command == "status":
@@ -175,7 +176,9 @@ class SlackWorkIntake:
             conn.execute("UPDATE work_intake_items SET project_key=?, status=?, revision=revision+1, updated_at=? WHERE id=?",
                          (project, status, now, item["id"]))
             question = follow_up(content, previous)
-            if command == "project":
+            if command == "next":
+                question = "Next step/blocker saved. Use `work draft` to preview a private handoff; nothing is posted automatically."
+            elif command == "project":
                 question = "Project label saved for review; this does not decide which contract may be charged."
             elif len(content.split()) >= 5 and "wording is unchanged" not in question:
                 question = "Update me when the result changes, you need help, or you want to change direction."

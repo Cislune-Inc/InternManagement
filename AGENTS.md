@@ -9,6 +9,17 @@
 
 ## Safety invariants
 
+- The coding assistant must not post to Slack or send email without Erik's explicit
+  send instruction in the current request. Draft confirmation is not publication
+  permission. Do not send general status noise. Hand off website, Drive or GitHub
+  links rather than local Markdown/text files. Runtime private replies to worker
+  actions and accepted clock notices are separate from assistant announcements.
+- Onsite clock-in and meal return require confirmation at the Mini's loopback-only
+  kiosk, not a Slack self-attestation, GPS claim, QR link or VPN source address.
+  Keep the owner company-management remote exception visible; staff remote work
+  still requires Erik's time-bounded advance approval. Remote desktop/SSH access
+  to the kiosk must remain limited to trusted administrators.
+
 - The opt-in hours-first Slack beta (`docs/slack-work-intake-beta.md`) is the sole
   beta clock on the existing SQLite session ledger. Gusto Kiosk is not a fallback;
   workers can always report actual hours to Erik on Slack. Clocking must not depend

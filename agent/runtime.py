@@ -1469,7 +1469,7 @@ class InternManagementRuntime:
                 async with self._user_session_lock(hours_user.user_key):
                     touched = ledger(self).record_activity(hours_user, text, observed_at)
                     await archive(self, hours_user, touched, observed_at)
-            if os.getenv("OPENAI_API_KEY"):
+            if os.getenv("OPENAI_API_KEY") and not re.match(r"^work\s+next\b", text, re.I):
                 from .work_ai import WorkAI
                 from .slack_work_intake import _safe
 
@@ -1526,8 +1526,11 @@ class InternManagementRuntime:
                 {"type": "actions", "elements": buttons[5:]},
                 {"type": "section", "text": {"type": "mrkdwn", "text": (
                     "DP is your beta time clock. No ClickUp task or detailed plan is needed to record hours. "
-                    "Describe your work in Messages and I will help clarify it.\n"
-                    "Clock in only for onsite work or an approved remote window. "
+                    "Describe your work in Messages and I will help clarify it. "
+                    "Use `work update` for results and `work next` for the next step or blocker. "
+                    "Preview update creates a private draft; confirmation saves a handoff, never a channel post.\n"
+                    "Shop check-in code gives you a two-minute code to enter at the Mini. "
+                    "Onsite meal returns also need the Mini; approved remote workers use `clock in remote`. "
                     "For a correction, DM `report hours` with the actual date, times and breaks. "
                     "If DP is unavailable, Slack Erik your actual hours—not Gusto Kiosk.\n\n" + COMPANY_HANDOFF
                 )}},

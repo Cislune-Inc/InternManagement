@@ -3,7 +3,8 @@
 Erik's latest direction supersedes the earlier description-only slice: **DP is
 the beta time clock; Gusto Kiosk is out.** Hours come first, understanding work
 second. ClickUp is an optional reference, not a clock dependency or an accepted
-program plan. This branch implements that change, but is not deployed.
+program plan. The earlier hours-first slice is deployed owner-only; current
+candidate and deployment evidence are tracked in PR #3.
 
 For the September 8 morning sequence, read [the launch packet](slack-beta-launch-2026-09-08.md),
 including the read-only preflight, acceptance matrix and unsent announcement.
@@ -15,10 +16,10 @@ The Messages tab accepts deterministic commands:
 
 | Command | Result |
 |---|---|
-| `clock in onsite` | Attest onsite and record start; no task/photo/prose gate |
-| `clock in onsite GRASP: compare wheel-slip runs` | Record start first, then capture work |
+| `clock in onsite` | Request a two-minute code; confirm at the Mini to record the actual start |
+| `clock in onsite GRASP: compare wheel-slip runs` | Preserve the plan with the kiosk-confirmed start; use `work` for alignment review |
 | `clock out` | Stop immediately without a required summary |
-| `lunch` / `back` | Actual meal start/return; authorize return after 30 minutes |
+| `lunch` / `back` | Actual meal start/return; return after 30 minutes, with kiosk confirmation for onsite shifts |
 | `break` / `back` | Paid rest and actual return |
 | `hours` | Current state, day and week totals |
 | `report hours <actual dates, times, breaks, correction>` | Preserve a claim for reconciliation, including a missing shift |
@@ -62,8 +63,16 @@ data-handling policy. A real model/key roundtrip remains unverified.
 
 ## Enforcement and truthful reconciliation
 
-- Onsite is an explicit worker attestation, **not verified physical presence**.
-  VPN/IP alone cannot establish presence. Remote work requires advance approval.
+- Onsite starts and meal returns require a single-use code entered on the Mini's
+  loopback-only kiosk at http://127.0.0.1:8766. Requests alone add no attendance.
+  A QR code or VPN address is not presence evidence. Do not proxy/tunnel the kiosk.
+  Code sharing and administrator remote desktop access remain known limitations.
+  Staff remote work requires advance approval. Owner company-management remote
+  mode remains an explicit existing exception, not a payroll classification.
+- Before staff enrollment, isolate the kiosk account from manager pages/files,
+  and secure manager-editor network access. Do not call the owner pilot a hardened
+  staff deployment. The mobile personal website/QR handoff is not yet implemented;
+  Slack provides personal hours, updates and clock-out.
 - Daily cap uses configured `labor.overtime_limit_hours`; weekly cap is 40 hours,
   with a seventh-consecutive-workday guard. Remote/overtime approvals require Erik,
   a reason, a window of at most seven days and 24 hours lead.

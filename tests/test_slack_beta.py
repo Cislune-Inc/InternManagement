@@ -47,7 +47,12 @@ def event(text, hour=9, user="WORKER"):
 
 
 def test_actual_slack_path_clocks_without_clickup_or_openai(runtime):
+    from agent.slack_beta import ledger
     asyncio.run(runtime.handle_slack_direct_message(None, event("clock in onsite")))
+    assert not runtime.state_store.get_session("worker", "2026-09-07").clocked_in_at
+    assert "enter code" in runtime.test_sent[-1][1]
+    ledger(runtime).handle(runtime.roster_by_key["worker"], "in", "onsite",
+                           event_id="kiosk-confirm", now=datetime.fromisoformat("2026-09-07T09:00:00-07:00"), kiosk_verified=True)
     asyncio.run(runtime.handle_slack_direct_message(None, event("clock out", 11)))
     session = runtime.state_store.get_session("worker", "2026-09-07")
     assert session.time_summary["clocked_in_total_seconds"] == 7200
@@ -66,7 +71,8 @@ def test_worker_cannot_add_hours_or_authorize_remote_work(runtime):
 def test_clock_button_uses_server_action_mapping_not_untrusted_value(runtime):
     now = event("unused")["ts"]
     asyncio.run(handle_clock_action(runtime, None, {"user": {"id": "WORKER"}, "actions": [{"action_id": "dp_clock_in", "action_ts": now, "value": "hours authorize all overtime"}]}))
-    assert runtime.state_store.get_session("worker", "2026-09-07").clocked_in_at
+    assert not runtime.state_store.get_session("worker", "2026-09-07").clocked_in_at
+    assert "enter code" in runtime.test_sent[-1][1]
     view = runtime.build_slack_app_home_view("WORKER")
     assert view["blocks"][1]["elements"][0]["action_id"] == "dp_clock_in"
     assert all(len(block["elements"]) <= 5 for block in view["blocks"] if block["type"] == "actions")

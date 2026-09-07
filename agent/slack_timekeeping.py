@@ -18,6 +18,7 @@ from .models import SessionState, UserProfile
 HELP = (
     "*Don Pollo time clock*\n"
     "`clock in onsite` · `clock out` · `lunch` · `back` · `break` · `hours`\n"
+    "Onsite start and meal return use a short-lived code confirmed at the shop Mini. "
     "You can add what you are doing after clock-in; task selection is not required. "
     "`report hours <date, actual start/end, breaks and what needs correcting>` saves an exception. "
     "If DP fails, Slack Erik your actual hours. Do not use Gusto Kiosk."
@@ -100,8 +101,10 @@ def paid_seconds(sessions: list[SessionState], now: datetime,
 
 class SlackTimekeeping:
     def __init__(self, state_store: Any, *, timezone_name: str = "America/Los_Angeles",
-                 daily_limit_hours: float = 8, weekly_limit_hours: float = 40) -> None:
+                 daily_limit_hours: float = 8, weekly_limit_hours: float = 40,
+                 require_kiosk: bool = False) -> None:
         self.store = state_store
+        self.require_kiosk = require_kiosk
         self.zone = ZoneInfo(timezone_name)
         self.daily_limit = daily_limit_hours * 3600
         self.weekly_limit = weekly_limit_hours * 3600
@@ -142,7 +145,7 @@ class SlackTimekeeping:
         return next((s for s in sessions if s.session_date == today), SessionState(user_key=user.user_key, session_date=today))
 
     def handle(self, user: UserProfile, command: str, detail: str, *, event_id: str,
-               now: datetime) -> tuple[str, SessionState | None]:
+               now: datetime, kiosk_verified: bool = False) -> tuple[str, SessionState | None]:
         now = now.astimezone(timezone.utc)
         key = f"{user.user_key}:{event_id}"
         with self.store._connect() as conn:
@@ -165,7 +168,9 @@ class SlackTimekeeping:
             previous_event = timestamp(session.metadata.get("slack_clock_last_event_at"))
             if previous_event and now < previous_event:
                 return "This message arrived out of order. No clock time was changed. " + FALLBACK, None
-            response = self._apply(conn, user, session, sessions, command, detail, now)
+            response = self._apply(conn, user, session, sessions, command, detail, now, kiosk_verified=kiosk_verified)
+            if response.startswith("KIOSK_REQUIRED"):
+                return response, None  # A request is not attendance or activity.
             if command not in {"help", "hours"}:
                 session.metadata["slack_clock_last_event_at"] = now.isoformat()
                 session.last_user_message_at = now.isoformat()
@@ -200,7 +205,8 @@ class SlackTimekeeping:
                     f"Recorded work + paid rest · {self.zone.key} · Updated {now.astimezone(self.zone):%H:%M}")
 
     def _apply(self, conn: Any, user: UserProfile, session: SessionState,
-               sessions: list[SessionState], command: str, detail: str, now: datetime) -> str:
+               sessions: list[SessionState], command: str, detail: str, now: datetime,
+               *, kiosk_verified: bool = False) -> str:
         if command == "help":
             return HELP
         running = bool(session.clocked_in_at and not session.clocked_out_at)
@@ -228,7 +234,11 @@ class SlackTimekeeping:
             if remote and user.worker_type != "admin" and not self._authorized(conn, user.user_key, "remote", now):
                 return "Remote work needs Erik's advance approval. No new work is authorized here. " + FALLBACK
             if not remote and not re.match(r"onsite\b", detail, re.I):
+                if self.require_kiosk:
+                    return "Use `clock in onsite` for a shop kiosk code, or `clock in remote` within your approved window. " + FALLBACK
                 return "Reply `clock in onsite` to confirm you are at the shop. This is an attestation, not a location check. " + FALLBACK
+            if not remote and self.require_kiosk and not kiosk_verified:
+                return "KIOSK_REQUIRED: confirm at the shop Mini."
             if over_limit:
                 return "The daily or weekly hours limit is reached. Stop work and contact Erik for authorization. " + FALLBACK
             if session.metadata.get("slack_clock_rest_started_at"):
@@ -244,7 +254,7 @@ class SlackTimekeeping:
             session.awaiting_clock_out_photo = False
             session.awaiting_clock_out_summary = False
             session.metadata.pop("slack_clock_stop_reason", None)
-            session.metadata["slack_clock_location"] = ("company_management_remote" if user.worker_type == "admin" else "approved_remote") if remote else "worker_attested_onsite"
+            session.metadata["slack_clock_location"] = ("company_management_remote" if user.worker_type == "admin" else "approved_remote") if remote else ("mini_kiosk" if kiosk_verified else "worker_attested_onsite")
             session.metadata.pop("slack_clock_inactivity_warning_at", None)
             if len(detail.split(maxsplit=1)) == 2:
                 session.latest_plan = detail.split(maxsplit=1)[1]
@@ -284,6 +294,8 @@ class SlackTimekeeping:
                 remaining = 1800 - (now - meal_start).total_seconds()
                 if remaining > 0:
                     return f"Your recorded meal has {int(remaining / 60) + 1} minutes remaining before work is authorized again. If you already worked, report the actual time; don't adjust it to look compliant."
+                if self.require_kiosk and not kiosk_verified and session.metadata.get("slack_clock_location") not in {"approved_remote", "company_management_remote"}:
+                    return "KIOSK_REQUIRED: confirm your return at the shop Mini."
                 self._finish_meal(session, now)
                 if over_limit:
                     self._stop(session, now, "hours_limit")
