@@ -1,6 +1,13 @@
 # Don Pollo implementation roadmap and live readiness findings
 
-September 7, 2026. Internal developer/coordination packet. Erik requested live
+September 7, 2026. Developer/coordination packet. **Later update:** Erik accepted
+staged implementation and the owner-only pilot is deployed. See
+[the release record](launch-repairs-2026-09-07.md) for current verification and
+remaining gates. The readiness findings below are the preserved pre-deployment
+snapshot, not the current service state. Keep private context out of this public
+source repository.
+
+Erik requested live
 inspection and a plan for a useful, low-friction assistant that gathers company
 work evidence for Codex. Production inspection was read-only. The roadmap below
 is a proposal for approval, not a claim that future features are implemented.

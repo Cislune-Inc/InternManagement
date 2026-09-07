@@ -48,6 +48,24 @@ tracked production files or start the old bot before applying the new cohort.
 
 ## Acceptance and remaining work
 
+### Deployment evidence
+
+Candidate `f7e6b04` deployed successfully as production reconciliation commit
+`9cc9004`, preserving live history and its existing CI workflow. Bot, dashboard,
+backups and integration monitoring passed live verification. A current process's
+Socket Mode connection was verified. The launchd parser now accepts both boolean
+and word-form disabled output on supported macOS versions.
+
+Slack Home was enabled, published to the owner, and subscribed to `app_home_opened`.
+Interactivity and Socket Mode were already enabled. A real structured OpenAI
+generation passed against an isolated temporary test database, with no synthetic
+production work hours. Only the owner is enrolled. Real user DM/clock/export
+acceptance and current worker/payroll confirmation remain separate release gates.
+
+The subsequent context review is in private coordination artifacts, not this
+public repository. No employee DMs, project source text, new channel-history
+permissions or continuous source-ingestion service were added to the application.
+
 Backup was restored in an isolated temporary location; integrity check returned
 ok and 1,184 sessions. Restored plaintext was removed with its temporary directory.
 Targeted tests cover changed behavior; full candidate regression passed before
