@@ -139,6 +139,7 @@ class SlackConfig:
     operational_digest_timezone: str = "America/Los_Angeles"
     manager_queue_url: str = "http://127.0.0.1:8765/exceptions"
     worker_portal_beta_slack_user_ids: list[str] = field(default_factory=list)
+    work_intake_beta_slack_user_ids: list[str] = field(default_factory=list)
     quarantine_uncertain_routes: bool = True
     thread_daily_updates: bool = True
     feedback_poll_interval_minutes: int = 360

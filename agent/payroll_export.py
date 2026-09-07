@@ -43,6 +43,17 @@ class PayrollExporter:
         labor_rows: list[dict[str, Any]] = []
         compliance_rows: list[dict[str, Any]] = []
         gusto_rows: list[dict[str, Any]] = []
+        pending_reports: list[dict[str, Any]] = []
+        state_store = getattr(self.runtime, "state_store", None)
+        if state_store:
+            with state_store._connect() as conn:
+                if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='slack_clock_reports'").fetchone():
+                    # Reports contain actual-time claims in the worker's own
+                    # words. Their work dates cannot be inferred from receipt
+                    # dates; include all unresolved claims, even without shifts.
+                    pending_reports = [dict(row) for row in conn.execute(
+                        "SELECT id,user_key,reported_at,text,status FROM slack_clock_reports WHERE status='pending' ORDER BY reported_at"
+                    )]
         for user in sorted(
             self.runtime.roster_by_key.values(),
             key=lambda item: item.display_name.lower(),
@@ -55,9 +66,14 @@ class PayrollExporter:
                     / session_date.isoformat()
                     / "session.json"
                 )
-                if not session_path.exists():
-                    continue
-                session = _load_session(session_path)
+                # Beta clocks commit to SQLite first. An archive/file failure
+                # must not silently exclude recorded hours from payroll review.
+                state_store = getattr(self.runtime, "state_store", None)
+                session = state_store.get_session(user.user_key, session_date.isoformat()) if state_store else SessionState(user_key=user.user_key, session_date=session_date.isoformat())
+                if not session.metadata.get("slack_clock_beta"):
+                    if not session_path.exists():
+                        continue
+                    session = _load_session(session_path)
                 if session is None:
                     continue
                 reference_now = self.runtime._session_time_summary_reference_now(
@@ -125,6 +141,7 @@ class PayrollExporter:
         _write_csv(output_dir / "nasa_project_labor.csv", labor_rows)
         _write_csv(output_dir / "project_summary.csv", summary_rows)
         _write_csv(output_dir / "compliance_events.csv", compliance_rows)
+        _write_csv(output_dir / "unreconciled_time_reports.csv", pending_reports)
         (output_dir / "gusto_time_sheets.json").write_text(
             json.dumps(
                 {
@@ -133,6 +150,7 @@ class PayrollExporter:
                     "week_start": week_start.isoformat(),
                     "week_ending": week_ending.isoformat(),
                     "time_sheets": gusto_rows,
+                    "unreconciled_time_reports": pending_reports,
                     "unmapped_workers": sorted(
                         {
                             str(row["display_name"])
@@ -196,6 +214,7 @@ class PayrollExporter:
                 }
             ),
             "compliance_events": len(compliance_rows),
+            "unreconciled_time_reports": len(pending_reports),
             "output_dir": str(output_dir.resolve()),
         }
         (output_dir / "summary.json").write_text(
@@ -248,9 +267,18 @@ class PayrollExporter:
         elif meal_seconds > 90 * 60:
             warnings.append("Recorded lunch exceeds 90 minutes; verify the return time.")
             review_codes.append("long_lunch")
-        if abs(paid_seconds - task_seconds) > 15 * 60:
+        if abs(paid_seconds - task_seconds) > 15 * 60 and not session.metadata.get("slack_clock_beta"):
             warnings.append("Paid time and task-tracked time differ by more than 15 minutes.")
             review_codes.append("task_time_variance")
+        if session.metadata.get("slack_clock_meal_started_at"):
+            warnings.append("Reported meal has no confirmed return; reconcile actual time.")
+            review_codes.append("missing_lunch_return")
+        if session.metadata.get("slack_clock_beta") and starts and ends and any(
+            start.astimezone(resolve_timezone(self.runtime.config.timezone)).date() != end.astimezone(resolve_timezone(self.runtime.config.timezone)).date()
+            for start, end in zip(starts, ends)
+        ):
+            warnings.append("Shift spans midnight; split by the configured workday before final overtime classification.")
+            review_codes.append("cross_midnight_classification")
         compliance_events = session.metadata.get("compliance_events")
         if isinstance(compliance_events, list) and compliance_events:
             warnings.append(f"{len(compliance_events)} compliance event(s) require review.")
@@ -468,8 +496,9 @@ class PayrollExporter:
                 "worker_type": user.worker_type,
                 "compensation_plan": user.compensation_plan,
                 "session_date": session.session_date,
-                "event_type": str(event.get("event_type") or ""),
-                "recorded_at": str(event.get("recorded_at") or ""),
+                "event_type": str(event.get("event_type") or event.get("type") or ""),
+                "recorded_at": str(event.get("recorded_at") or event.get("at") or ""),
+                "confirmation": str(event.get("confirmation") or ""),
                 "worked_seconds": int(event.get("worked_seconds") or 0),
                 "worked_hours": _hours(int(event.get("worked_seconds") or 0)),
                 "session_path": str(session_path.resolve()),

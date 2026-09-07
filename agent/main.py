@@ -15,14 +15,22 @@ from .ssl_compat import ensure_ssl_cert_file
 def main() -> None:
     load_dotenv()
     ensure_ssl_cert_file()
-    token = os.environ["DISCORD_BOT_TOKEN"]
     runtime = InternManagementRuntime()
     try:
         asyncio.run(runtime.refresh_configuration(force=True))
-        asyncio.run(runtime.backfill_transcripts_to_pacific_once())
+        slack_only = bool(runtime.config.slack.work_intake_beta_slack_user_ids) or os.getenv("DP_TRANSPORT", "").lower() == "slack"
+        if not slack_only:
+            asyncio.run(runtime.backfill_transcripts_to_pacific_once())
     except (RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
 
+    if slack_only:
+        from .slack_beta import run_slack_only
+
+        with SingleInstanceLock(runtime.bootstrap.state_db_path.parent / "agent.lock"):
+            asyncio.run(run_slack_only(runtime))
+        return
+    token = os.environ["DISCORD_BOT_TOKEN"]
     client = InternManagementDiscordBot(runtime)
     try:
         with SingleInstanceLock(runtime.bootstrap.state_db_path.parent / "agent.lock"):

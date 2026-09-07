@@ -91,8 +91,9 @@ fi
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python -m compileall -q agent
 .venv/bin/python ops/apply_production_controls.py --apply
-PYTHONPATH=. .venv/bin/python ops/apply_production_roster_controls.py --apply
-.venv/bin/python ops/infer_compensation_plans.py --apply-confident
+# Compensation classification is a reviewed roster decision, not a deployment
+# inference. Do not run either the legacy roster-default writer (which also
+# re-adds workers) or compensation inference during a code deployment.
 .venv/bin/python ops/deploy_maintenance.py start --minutes 15
 maintenance_started=1
 ops/restart-services.sh

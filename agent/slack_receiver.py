@@ -3,12 +3,35 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from typing import Any
 
 from .ssl_compat import build_ssl_context
 
 
 logger = logging.getLogger(__name__)
+
+CLOCK_ACTIONS = {
+    "dp_clock_in": ("Clock in · I'm onsite", "clock in onsite"),
+    "dp_clock_out": ("Clock out", "clock out"),
+    "dp_clock_hours": ("My hours", "hours"),
+    "dp_clock_lunch": ("Lunch", "lunch"),
+    "dp_clock_back": ("Back", "back"),
+    "dp_clock_rest": ("Paid rest", "break"),
+}
+
+
+async def handle_clock_action(runtime: Any, discord_client: Any, body: dict[str, Any]) -> None:
+    actions = body.get("actions") or []
+    action = actions[0] if actions else {}
+    selection = CLOCK_ACTIONS.get(str(action.get("action_id") or ""))
+    if not selection:
+        return
+    await runtime.handle_slack_direct_message(discord_client, {
+        "user": str((body.get("user") or {}).get("id") or ""),
+        "text": selection[1],
+        "event_ts": str(action.get("action_ts") or ""),
+    })
 
 
 def build_slack_web_client(bot_token: str) -> Any:
@@ -49,6 +72,11 @@ class SlackSocketReceiver:
 
         web_client = build_slack_web_client(self.bot_token)
         app = AsyncApp(client=web_client)
+
+        @app.action(re.compile(r"^dp_clock_"))
+        async def handle_clock_button(ack: Any, body: dict[str, Any]) -> None:
+            await ack()
+            await handle_clock_action(self.runtime, self.discord_client, body)
 
         @app.event("message")
         async def handle_message(event: dict[str, Any]) -> None:

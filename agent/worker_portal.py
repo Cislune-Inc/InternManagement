@@ -257,6 +257,10 @@ class WorkerPortalService:
 
     async def apply_action(self, token: str, payload: dict[str, Any]) -> dict[str, Any]:
         slack_user_id = validate_worker_portal_token(self.runtime, token)
+        from .slack_beta import enabled
+
+        if enabled(self.runtime, slack_user_id):
+            raise ValueError("Your beta time clock is in Slack. Use clock in onsite, clock out, lunch, back, break or hours. The old portal cannot change beta time.")
         actor = resolve_worker_portal_actor(self.runtime, slack_user_id)
         if actor is None:
             raise ValueError("The beta tester is no longer configured.")
@@ -1468,6 +1472,10 @@ class WorkerPortalService:
         return "Clocked out. The durable time record and task timer are closed."
 
     async def _enforce_live_deadlines(self, actor: PortalActor) -> None:
+        from .slack_beta import enabled
+
+        if enabled(self.runtime, actor.slack_user_id):
+            return  # The Slack clock owns enforcement; no legacy quality logout.
         user = self._live_user(actor)
         lock = self.runtime._user_session_lock(user.user_key)
         async with lock:

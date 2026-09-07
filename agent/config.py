@@ -402,6 +402,9 @@ def _parse_slack_config(raw_slack: Any) -> SlackConfig:
         worker_portal_beta_slack_user_ids=_clean_string_list(
             raw_slack.get("worker_portal_beta_slack_user_ids")
         ),
+        work_intake_beta_slack_user_ids=_clean_string_list(
+            raw_slack.get("work_intake_beta_slack_user_ids")
+        ),
         quarantine_uncertain_routes=bool(
             raw_slack.get("quarantine_uncertain_routes", True)
         ),

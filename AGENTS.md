@@ -9,12 +9,21 @@
 
 ## Safety invariants
 
+- The opt-in hours-first Slack beta (`docs/slack-work-intake-beta.md`) is the sole
+  beta clock on the existing SQLite session ledger. Gusto Kiosk is not a fallback;
+  workers can always report actual hours to Erik on Slack. Clocking must not depend
+  on ClickUp, OpenAI, photos, prose quality or work-plan approval. Keep API coaching
+  bounded and advisory. Preserve original statements and versioned decisions. A project
+  label is not approval, and work approval is not contract-charge, remote-work or
+  overtime approval. Quality/repetition coaching must not erase worked time.
+
 - A tracked worker is warned before the meal deadline, automatically paused at the configured deadline, and notified. Do not invent a flat meal deduction.
 - A covered worker is warned before the overtime limit and automatically clocked out at the limit unless approval is already stored.
 - Inactivity warnings must remain stateful and resilient to scheduler delays; do not rely on a one-minute scheduling window.
 - New ClickUp project, overhead, blocker, and unblocker tasks require management approval when `clickup.new_task_approval_required` is enabled. Notify the configured approvers (normally Erik and George) before creation.
-- Slack project updates require an active ClickUp task and a confident project-channel route. Hold uncertain updates for review instead of posting them to a fallback project channel.
-- Reject workflow chatter and vague progress statements. Thread later updates and progress photos under the first worker/task post of the day.
+- Legacy public project updates require an active ClickUp task and a confident project-channel route. The new beta captures freeform work privately and disables legacy daily/weekly posts; do not let stale ClickUp routes publish unreviewed beta notes.
+- Preserve vague or repeated beta statements, asking one useful question where needed; never reject time records for prose quality. Original legacy task/photo posting rules do not gate the beta clock.
+- Automatic stop instructions are not proof that work stopped. Keep unconfirmed gaps reviewable and actual-hours reports visible in payroll exports, even without a recorded shift. Ordinary worker clock-outs are not manager exceptions.
 - Routine operational warnings belong in the digest. Send immediate Slack alerts only for errors and critical failures.
 
 ## Verification

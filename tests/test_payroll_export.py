@@ -24,6 +24,8 @@ from agent.payroll_dashboard import (
 from agent.payroll_export import PayrollExporter
 from agent.payroll_review import record_review_resolution
 from agent.runtime import InternManagementRuntime
+from agent.state_store import StateStore
+from agent.slack_timekeeping import SlackTimekeeping
 
 
 def _runtime(tmp_path: Path) -> tuple[InternManagementRuntime, UserProfile]:
@@ -80,6 +82,34 @@ def _runtime(tmp_path: Path) -> tuple[InternManagementRuntime, UserProfile]:
     )
     runtime.roster_by_key = {user.user_key: user}
     return runtime, user
+
+
+def test_beta_export_uses_clock_database_when_archive_is_missing(tmp_path: Path) -> None:
+    runtime, user = _runtime(tmp_path)
+    runtime.state_store = StateStore(tmp_path / "state.sqlite3")
+    clock = SlackTimekeeping(runtime.state_store)
+    clock.handle(user, "in", "onsite", event_id="in", now=datetime.fromisoformat("2026-07-27T09:00:00-07:00"))
+    clock.handle(user, "out", "", event_id="out", now=datetime.fromisoformat("2026-07-27T11:00:00-07:00"))
+    summary = asyncio.run(PayrollExporter(runtime).export(date(2026, 8, 2)))
+    assert summary["hourly_payroll_hours"] == 2
+    assert summary["requires_review_days"] == 0
+    assert summary["compliance_events"] == 0
+
+
+def test_payroll_preserves_unresolved_actual_hours_claim_without_shift(tmp_path: Path) -> None:
+    runtime, user = _runtime(tmp_path)
+    runtime.state_store = StateStore(tmp_path / "state.sqlite3")
+    clock = SlackTimekeeping(runtime.state_store)
+    clock.handle(user, "report", "July 27 worked 9-11, DP was unavailable; no meal", event_id="claim",
+                 now=datetime.fromisoformat("2026-08-03T09:00:00-07:00"))
+    summary = asyncio.run(PayrollExporter(runtime).export(date(2026, 8, 2)))
+    assert summary["worker_days"] == 0
+    assert summary["unreconciled_time_reports"] == 1
+    output = Path(summary["output_dir"])
+    bundle = json.loads((output / "gusto_time_sheets.json").read_text())
+    assert bundle["ready_for_submission"] is False
+    assert bundle["unreconciled_time_reports"][0]["text"].startswith("July 27 worked 9-11")
+    assert (output / "unreconciled_time_reports.csv").exists()
 
 
 def test_payroll_export_writes_review_gusto_project_and_compliance_bundle(tmp_path: Path) -> None:
