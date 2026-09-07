@@ -35,7 +35,8 @@ def restart(repo: Path, service: str, agents: Path, *, uid: int,
 
     disabled = call("print-disabled", domain)
     require(disabled, "print-disabled")
-    is_disabled = bool(re.search(r'"' + re.escape(label) + r'"\s*=>\s*true', disabled.stdout))
+    # macOS variants print either the boolean `true` or the word `disabled`.
+    is_disabled = bool(re.search(r'"' + re.escape(label) + r'"\s*=>\s*(?:true|disabled)\b', disabled.stdout))
     loaded = call("print", target).returncode == 0
     if is_disabled:
         if not enable_disabled:

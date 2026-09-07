@@ -6,7 +6,7 @@ import pytest
 from ops.ensure_launchd_service import restart
 
 
-def setup(tmp_path, *, disabled=False, loaded=False):
+def setup(tmp_path, *, disabled=False, loaded=False, state_word=None):
     label = "com.pm.internmanagement.bot"
     (tmp_path / (label + ".plist")).write_bytes(plistlib.dumps({
         "Label": label, "WorkingDirectory": str(tmp_path),
@@ -16,12 +16,13 @@ def setup(tmp_path, *, disabled=False, loaded=False):
     def run(args, **kwargs):
         calls.append(args[1:])
         return SimpleNamespace(returncode=1 if args[1] == "print" and not loaded else 0,
-                               stdout=f'"{label}" => {str(disabled).lower()}', stderr="")
+                               stdout=f'"{label}" => {state_word or str(disabled).lower()}', stderr="")
     return calls, run
 
 
-def test_disabled_requires_deliberate_enable(tmp_path):
-    calls, run = setup(tmp_path, disabled=True)
+@pytest.mark.parametrize('state_word', ['true', 'disabled'])
+def test_disabled_requires_deliberate_enable(tmp_path, state_word):
+    calls, run = setup(tmp_path, disabled=True, state_word=state_word)
     with pytest.raises(ValueError, match="explicitly"):
         restart(tmp_path, "bot", tmp_path, uid=501, run=run)
     assert [x[0] for x in calls] == ["print-disabled", "print"]
