@@ -5,6 +5,9 @@ the beta time clock; Gusto Kiosk is out.** Hours come first, understanding work
 second. ClickUp is an optional reference, not a clock dependency or an accepted
 program plan. This branch implements that change, but is not deployed.
 
+For the September 8 morning sequence, read [the launch packet](slack-beta-launch-2026-09-08.md),
+including the read-only preflight, acceptance matrix and unsent announcement.
+
 ## Worker flow
 
 Slack App Home puts clock controls first, no more than five buttons per row.
