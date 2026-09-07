@@ -26,7 +26,9 @@ historical shifts and current roster enrollment are not authorized for migration
   an explicit label. Manager decisions enqueue durable worker notices with retries.
 - Original note acknowledged before optional AI; TLS uses DP's existing trust setup.
   Bounded schema output remains advisory. Never infer payroll/scope decisions from AI.
-- The recovered production CI workflow is retained verbatim in the candidate.
+- The recovered production CI workflow is preserved by deployment reconciliation.
+  GitHub's current OAuth connection cannot add workflow files (missing workflow
+  scope); candidate publishing therefore does not modify the workflow path.
 
 ## Pilot release command
 
