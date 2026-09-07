@@ -80,6 +80,35 @@ def test_old_portal_cannot_change_beta_clock(runtime, monkeypatch):
         asyncio.run(worker_portal.WorkerPortalService(runtime).apply_action("test", {"action": "start"}))
 
 
+def test_legacy_portal_reads_cannot_enforce_or_mutate_during_cutover(runtime, monkeypatch):
+    from agent import worker_portal
+    monkeypatch.setattr(worker_portal, "validate_worker_portal_token", lambda *args: "NOT_ENROLLED")
+    with pytest.raises(ValueError, match="legacy portal is paused"):
+        asyncio.run(worker_portal.WorkerPortalService(runtime).build_payload("test"))
+    with runtime.state_store._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
+
+
+def test_home_status_does_not_create_a_shift(runtime):
+    view = runtime.build_slack_app_home_view("WORKER")
+    assert "Clocked out" in view["blocks"][2]["text"]["text"]
+    with runtime.state_store._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
+
+
+def test_decision_notification_is_durable_and_cohort_scoped(runtime):
+    from agent.slack_beta import flush_work_notices
+    from agent.slack_work_intake import SlackWorkIntake
+    intake = SlackWorkIntake(runtime.state_store)
+    with runtime.state_store._connect() as conn:
+        conn.execute("INSERT INTO work_decision_notices(owner_id,text) VALUES ('WORKER','Approved plan')")
+        conn.execute("INSERT INTO work_decision_notices(owner_id,text) VALUES ('NOT_ENROLLED','Not for pilot')")
+    asyncio.run(flush_work_notices(runtime))
+    asyncio.run(flush_work_notices(runtime))
+    assert runtime.test_sent == [('WORKER', 'Approved plan')]
+    assert len(intake.pending_notices()) == 1
+
+
 def test_slack_only_boot_does_not_require_discord_or_transcript_backfill(runtime, monkeypatch, tmp_path):
     from agent import main, slack_beta
 

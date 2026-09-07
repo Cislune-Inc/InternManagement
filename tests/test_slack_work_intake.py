@@ -79,7 +79,9 @@ def test_plan_change_revokes_prior_approval_but_preserves_decision(intake):
 
 def test_unknown_project_cannot_be_approved(intake):
     ident = item_id(send(intake, "work cleaning tools"))
-    assert "Confirm the project" in send(intake, f"work approve {ident} 1 good", event="2", manager=True)
+    send(intake, f"work approve {ident} 1 good", event="2", manager=True)
+    assert intake.pending_exceptions()[0]["id"] == ident
+    assert all(e["kind"] != "approved" for e in intake.pending_exceptions()[0]["details"]["events"])
 
 
 def test_worker_cannot_view_other_workers_records(intake):

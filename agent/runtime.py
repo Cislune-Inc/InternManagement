@@ -1473,6 +1473,9 @@ class InternManagementRuntime:
                 from .work_ai import WorkAI
                 from .slack_work_intake import _safe
 
+                # Acknowledge the durable original before any optional network
+                # request. If enrichment fails, the worker already has a receipt.
+                await self.slack.post_message(slack_user_id, response.split("\n", 1)[0])
                 context = "No controlling contract/accepted plan supplied. Alignment remains unverified."
                 if worker and getattr(self, "clickup", None):
                     try:
@@ -1484,11 +1487,14 @@ class InternManagementRuntime:
                     except Exception:
                         context += "\nClickUp unavailable; hours and original note were saved independently."
                 draft = await WorkAI(self.state_store).coach(slack_user_id, text, context=context)
+                if not draft:
+                    await self.slack.post_message(slack_user_id, "AI assistance is unavailable for this note; your original is saved.\n" + response.partition("\n")[2])
+                    return True
                 if draft:
                     match = re.search(r"DP-[0-9a-f]{12}", response)
                     if match:
                         intake.attach_ai_draft(match[0], slack_user_id, draft)
-                    response = "Original note saved. *AI draft—not work approval:* " + _safe(draft["summary"])
+                    response = (f"`{match[0]}` " if match else "") + "*AI draft—not work approval:* " + _safe(draft["summary"])
                     if draft["follow_up_question"]:
                         response += "\n" + _safe(draft["follow_up_question"])
                     if draft["suggested_next_steps"]:
@@ -1501,6 +1507,14 @@ class InternManagementRuntime:
         """Build a durable Slack App Home entry point for the worker portal."""
         if self.config and slack_user_id in self.config.slack.work_intake_beta_slack_user_ids:
             from .slack_receiver import CLOCK_ACTIONS
+            from .slack_beta import clock_user, ledger
+            from .work_evidence import COMPANY_HANDOFF
+
+            user = clock_user(self, slack_user_id)
+            try:
+                clock_status = ledger(self).snapshot(user, datetime.now(timezone.utc)) if user else "Your identity needs a current roster mapping. Slack Erik actual hours."
+            except ValueError:
+                clock_status = "Historical open shifts need reconciliation. Slack Erik your actual hours; no records were changed."
 
             buttons = [{"type": "button", "action_id": key, "text": {"type": "plain_text", "text": label}}
                        for key, (label, _) in CLOCK_ACTIONS.items()]
@@ -1508,13 +1522,14 @@ class InternManagementRuntime:
             return {"type": "home", "blocks": [
                 {"type": "header", "text": {"type": "plain_text", "text": "Don Pollo · Time clock"}},
                 {"type": "actions", "elements": buttons[:5]},
+                {"type": "section", "text": {"type": "mrkdwn", "text": clock_status}},
                 {"type": "actions", "elements": buttons[5:]},
                 {"type": "section", "text": {"type": "mrkdwn", "text": (
                     "DP is your beta time clock. No ClickUp task or detailed plan is needed to record hours. "
                     "Describe your work in Messages and I will help clarify it.\n"
                     "Clock in only for onsite work or an approved remote window. "
                     "For a correction, DM `report hours` with the actual date, times and breaks. "
-                    "If DP is unavailable, Slack Erik your actual hours—not Gusto Kiosk."
+                    "If DP is unavailable, Slack Erik your actual hours—not Gusto Kiosk.\n\n" + COMPANY_HANDOFF
                 )}},
             ]}
         from .worker_portal import build_worker_portal_link, resolve_worker_portal_actor
@@ -2161,7 +2176,7 @@ class InternManagementRuntime:
 
     async def scheduler_tick(self, client: discord.Client) -> None:
         await run_scheduler_tick(self, client)
-        from .slack_beta import enabled, clock_user, tick
+        from .slack_beta import enabled, clock_user, tick, flush_work_notices
 
         for admin in self.admin_profiles():
             if enabled(self, admin.slack_user_id) and admin.slack_user_id not in self.roster_by_slack_id:
@@ -2169,6 +2184,8 @@ class InternManagementRuntime:
                 if user:
                     async with self._user_session_lock(user.user_key):
                         await tick(self, user, datetime.now(timezone.utc))
+        if self.config.slack.work_intake_beta_slack_user_ids:
+            await flush_work_notices(self)
 
     async def _run_scheduler_for_user(
         self,

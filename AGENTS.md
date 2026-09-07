@@ -42,10 +42,18 @@ ops/verify-services.sh
 curl --fail --silent http://127.0.0.1:8765/health
 ```
 
-The dashboard should load at `http://192.168.4.87:8765/` over the office VPN. Operational links sent to admins must use the VPN-reachable address, not localhost.
+The Mini was verified at `192.168.40.177` on September 7. Revalidate its saved SSH
+host key and address before deployment. Operational links must use the verified
+internal origin supplied with `--base-url`, not localhost or a hard-coded old IP.
 
 ## Deployment
 
 - Confirm GitHub checks and review the diff before deploying.
 - From the production checkout, run `ops/deploy-branch.sh agent/<branch>`; it refuses dirty worktrees and non-`agent/*` branches, creates and verifies an encrypted backup, fast-forwards when possible, and otherwise constructs a two-parent reconciliation commit only when both histories descend from GitHub `main`. The reconciliation uses the reviewed candidate tree while preserving production's existing CI workflow, then installs pinned dependencies, restarts services, and runs health checks.
 - If deployment verification fails, leave evidence intact and report the exact failed check. Do not reset or discard live data.
+- Disabled/unloaded jobs require explicit `--enable-disabled` after candidate and
+  cohort verification. Use `--primary-admin-only --primary-admin-slack-id ID` for
+  an isolated owner pilot; do not enroll old workers as a deployment side effect.
+- Historical open shifts may be deferred only with the owner's explicit approval
+  and `--defer-primary-legacy-before YYYY-MM-DD`. This preserves originals and
+  unresolved-hours reports; it does not supply guessed ends or forgive worked time.

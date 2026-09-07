@@ -70,7 +70,7 @@ class PayrollExporter:
                 # must not silently exclude recorded hours from payroll review.
                 state_store = getattr(self.runtime, "state_store", None)
                 session = state_store.get_session(user.user_key, session_date.isoformat()) if state_store else SessionState(user_key=user.user_key, session_date=session_date.isoformat())
-                if not session.metadata.get("slack_clock_beta"):
+                if not session.metadata.get("slack_clock_beta") and not session.metadata.get("slack_clock_legacy_unresolved"):
                     if not session_path.exists():
                         continue
                     session = _load_session(session_path)
@@ -245,6 +245,9 @@ class PayrollExporter:
         warnings: list[str] = []
         review_codes: list[str] = []
         integration_notes: list[str] = []
+        if session.metadata.get("slack_clock_legacy_unresolved"):
+            warnings.append("Historical shift has no confirmed end. Totals are not settled; reconcile the preserved original and actual-hours report.")
+            review_codes.append("unresolved_historical_shift")
         if user.compensation_plan == "needs_review":
             warnings.append(
                 "Compensation plan is unclassified; choose Cislune hourly, NASA stipend, salary, or external."

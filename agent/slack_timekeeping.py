@@ -73,6 +73,8 @@ def paid_seconds(sessions: list[SessionState], now: datetime,
     for session in sessions:
         segments = session.work_segments or [{"clocked_in_at": session.clocked_in_at, "clocked_out_at": session.clocked_out_at}]
         for segment in segments:
+            if session.metadata.get("slack_clock_legacy_unresolved") and not segment.get("clocked_out_at"):
+                continue  # Unknown historical tail is pending review, not work until now.
             start, end = timestamp(segment.get("clocked_in_at")), timestamp(segment.get("clocked_out_at")) or now
             if start:
                 work.append((max(start, window_start) if window_start else start,
@@ -81,6 +83,8 @@ def paid_seconds(sessions: list[SessionState], now: datetime,
         if session.metadata.get("lunch_started_at"):
             windows.append({"started_at": session.metadata["lunch_started_at"], "ended_at": session.metadata.get("lunch_ended_at")})
         for meal in windows:
+            if session.metadata.get("slack_clock_legacy_unresolved") and not meal.get("ended_at"):
+                continue
             if meal.get("paid_pending_review"):
                 continue
             start = timestamp(meal.get("started_at"))
@@ -128,7 +132,8 @@ class SlackTimekeeping:
         )]
 
     def _current(self, sessions: list[SessionState], user: UserProfile, now: datetime) -> SessionState:
-        active = [s for s in sessions if s.clocked_in_at and (not s.clocked_out_at or s.metadata.get("slack_clock_meal_started_at"))]
+        active = [s for s in sessions if not s.metadata.get("slack_clock_legacy_unresolved")
+                  and s.clocked_in_at and (not s.clocked_out_at or s.metadata.get("slack_clock_meal_started_at"))]
         if len(active) > 1:
             raise ValueError("More than one open shift needs reconciliation. Slack Erik your actual hours; do not create another clock.")
         if active:
@@ -181,6 +186,18 @@ class SlackTimekeeping:
         day = now.astimezone(self.zone).replace(hour=0, minute=0, second=0, microsecond=0)
         week = day - timedelta(days=day.weekday())
         return paid_seconds(sessions, now, day), paid_seconds(sessions, now, week)
+
+    def snapshot(self, user: UserProfile, now: datetime) -> str:
+        """Read current clock/totals without starting a session or saving receipts."""
+        with self.store._connect() as conn:
+            sessions = self._sessions(conn, user.user_key)
+            session = self._current(sessions, user, now)
+            daily, weekly = self.totals(sessions, now)
+            state = ("On lunch" if session.metadata.get("slack_clock_meal_started_at") else
+                     "On paid rest" if session.metadata.get("slack_clock_rest_started_at") and not session.clocked_out_at else
+                     "Clocked in" if session.clocked_in_at and not session.clocked_out_at else "Clocked out")
+            return (f"*{state}* · Today {daily / 3600:.2f} h · This week {weekly / 3600:.2f} h\n"
+                    f"Recorded work + paid rest · {self.zone.key} · Updated {now.astimezone(self.zone):%H:%M}")
 
     def _apply(self, conn: Any, user: UserProfile, session: SessionState,
                sessions: list[SessionState], command: str, detail: str, now: datetime) -> str:

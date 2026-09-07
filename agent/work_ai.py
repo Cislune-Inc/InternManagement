@@ -8,9 +8,10 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 
 from .slack_work_intake import PROJECTS
+from .ssl_compat import build_ssl_context
 
 
 _SCHEMA = {
@@ -36,6 +37,11 @@ normal: ask what changed, what was tried or what is blocked, not for word paddin
 Suggest at most five small next steps as OPTIONS, never assigned or approved work.
 ClickUp is an imperfect reference, not the controlling plan. If no signed scope or
 accepted plan is supplied, explicitly leave alignment unverified for Erik/George.
+Every work block needs a contract destination or an intentional IRAD/overhead
+category and purpose. George can help review alignment; Erik owns final remote
+and overtime authorization. A URL is only a reference unless retrieved source
+content was explicitly supplied. Encourage company accounts and a durable result
+in company Drive/GitHub/OnShape/server storage, not copying private chat history.
 Do not decide wages, hours, breaks, overtime, remote permission, discipline, worker
 classification or contract charging. Never coach a worker to invent compliant
 break times. No timestamps or clock commands in your answer. Never claim to have
@@ -62,7 +68,7 @@ class WorkAI:
         if self.client is None and not os.getenv("OPENAI_API_KEY"):
             return None
         note, context = note[:6000], context[:6000]
-        fingerprint = hashlib.sha256(json.dumps([self.model, actor_id, note, context, "work-coach-v1"]).encode()).hexdigest()
+        fingerprint = hashlib.sha256(json.dumps([self.model, actor_id, note, context, "work-coach-v2"]).encode()).hexdigest()
         day = datetime.now(timezone.utc).date().isoformat()
         with self.store._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -76,8 +82,10 @@ class WorkAI:
             # Reserve before the network request, including failed requests.
             conn.execute("INSERT INTO work_ai_budget VALUES (?,?,1) ON CONFLICT(day,actor_id) DO UPDATE SET calls=calls+1", (day, actor_id))
         owned = self.client is None
-        client = self.client or AsyncOpenAI(timeout=8, max_retries=0)
+        client = self.client
         try:
+            client = client or AsyncOpenAI(timeout=8, max_retries=0,
+                                          http_client=DefaultAsyncHttpxClient(verify=build_ssl_context()))
             response = await asyncio.wait_for(client.responses.create(
                 model=self.model, store=False, instructions=_INSTRUCTIONS,
                 input=json.dumps({"worker_note": note, "provided_reference_context": context,
@@ -105,7 +113,7 @@ class WorkAI:
             # succeeded and must never depend on this optional response.
             return None
         finally:
-            if owned:
+            if owned and client is not None:
                 try:
                     await asyncio.wait_for(client.close(), timeout=2)
                 except Exception:

@@ -14,15 +14,20 @@ from agent.config import parse_agent_config, parse_roster_bytes
 from ops.enable_slack_clock_beta import prepare
 
 
-def inspect(config_path: Path, db_path: Path, credentials: dict, user_keys: list[str] | None = None) -> dict:
+def inspect(config_path: Path, db_path: Path, credentials: dict, user_keys: list[str] | None = None,
+            *, primary_admin_only: bool = False) -> dict:
     result = {"blocks": [], "warnings": [], "checks": {}, "live_verification_required": True}
+    selected_keys = None
     try:
         payload = json.loads(config_path.read_text())
         config = parse_agent_config(payload, "America/Los_Angeles")
         raw = (config_path.parent / config.roster_file_name).read_bytes()
-        candidate, excluded = prepare(payload, raw, user_keys)
+        candidate, excluded = prepare(payload, raw, user_keys, primary_admin_only=primary_admin_only)
         roster = [u for u in parse_roster_bytes(config.roster_file_name, raw) if u.active]
-        selected = [u for u in roster if not user_keys or u.user_key in user_keys]
+        cohort = candidate["slack"]["work_intake_beta_slack_user_ids"]
+        selected = [u for u in roster if u.slack_user_id in cohort]
+        from agent.worker_portal import _actor_user_key
+        selected_keys = {u.user_key for u in selected} | {_actor_user_key(a) for a in config.admins if a.slack_user_id in cohort}
         result["checks"]["candidate_slack_identities"] = len(candidate["slack"]["work_intake_beta_slack_user_ids"])
         result["checks"]["excluded_active_workers"] = len(excluded)
         result["checks"]["company_timezone"] = config.timezone
@@ -60,12 +65,14 @@ def inspect(config_path: Path, db_path: Path, credentials: dict, user_keys: list
             for user_key, day, raw in conn.execute("SELECT user_key,session_date,payload FROM sessions"):
                 state = json.loads(raw)
                 meta = state.get("metadata") or {}
-                if state.get("clocked_in_at") and (not state.get("clocked_out_at") or meta.get("slack_clock_meal_started_at")):
+                if not meta.get("slack_clock_legacy_unresolved") and state.get("clocked_in_at") and (not state.get("clocked_out_at") or meta.get("slack_clock_meal_started_at")):
                     active.append((user_key, day))
             result["checks"]["open_shift_records"] = len(active)
             if active:
                 result["warnings"].append("Open shifts exist: reconcile handover and any external ClickUp timers; never silently close or discard them.")
-            if any(count > 1 for count in Counter(user for user, _ in active).values()):
+            selected_active = [(user, day) for user, day in active if selected_keys is None or user in selected_keys]
+            result["checks"]["selected_open_shift_records"] = len(selected_active)
+            if any(count > 1 for count in Counter(user for user, _ in selected_active).values()):
                 result["blocks"].append("A worker has multiple open shifts; reconcile before enabling that worker.")
             result["checks"]["database_quick_check"] = "ok"
     except (OSError, sqlite3.Error, ValueError, TypeError, AttributeError):
@@ -80,9 +87,10 @@ def main() -> int:
     parser.add_argument("--state-db", type=Path, required=True, help="Use the actual state_db_path from local bootstrap configuration.")
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--user-key", action="append")
+    parser.add_argument("--primary-admin-only", action="store_true")
     args = parser.parse_args()
     values = {**dotenv_values(args.env_file), **os.environ}
-    result = inspect(args.config, args.state_db, values, args.user_key)
+    result = inspect(args.config, args.state_db, values, args.user_key, primary_admin_only=args.primary_admin_only)
     print(json.dumps(result, indent=2, sort_keys=True))
     return 2 if result["blocks"] else 0
 

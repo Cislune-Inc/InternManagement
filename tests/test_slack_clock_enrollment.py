@@ -5,6 +5,29 @@ import pytest
 from ops.enable_slack_clock_beta import prepare
 
 
+def test_primary_admin_only_never_enrolls_secondary_admin_or_legacy_workers():
+    config = payload()
+    config["admins"] = [{"name": "Erik", "discord_user_id": 1, "slack_user_id": "ERIK"},
+                        {"name": "George", "discord_user_id": 2, "slack_user_id": "GEORGE"}]
+    updated, excluded = prepare(config, roster({"user_key": "old", "slack_user_id": "OLD"}), None,
+                                primary_admin_only=True)
+    assert updated["slack"]["work_intake_beta_slack_user_ids"] == ["ERIK"]
+    assert excluded == ["old"]
+
+
+def test_primary_authorization_owner_changed_only_to_existing_verified_admin():
+    config = payload()
+    config["admin_discord_user_id"] = 2
+    config["admins"] = [{"name": "Erik", "discord_user_id": 1, "slack_user_id": "ERIK"},
+                        {"name": "George", "discord_user_id": 2, "slack_user_id": "GEORGE"}]
+    updated, _ = prepare(config, roster(), None, primary_admin_only=True, primary_admin_slack_id="ERIK")
+    assert config["admin_discord_user_id"] == 2
+    assert updated["admin_discord_user_id"] == 1
+    assert updated["slack"]["work_intake_beta_slack_user_ids"] == ["ERIK"]
+    with pytest.raises(ValueError, match="verified admin"):
+        prepare(config, roster(), None, primary_admin_slack_id="STRANGER")
+
+
 def payload():
     return {"admin_discord_user_id": "1", "admin_slack_user_id": "ERIK", "roster_file_name": "roster.json", "clickup": {"workspace_id": "unused"}}
 

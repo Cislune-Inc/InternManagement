@@ -9,6 +9,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 
 CONTROL_VALUES: dict[str, dict[str, Any]] = {
@@ -33,8 +34,6 @@ CONTROL_VALUES: dict[str, dict[str, Any]] = {
         "operational_digest_interval_minutes": 1440,
         "operational_digest_hour": 8,
         "operational_digest_timezone": "America/Los_Angeles",
-        "manager_queue_url": "http://192.168.4.87:8765/exceptions",
-        "worker_portal_beta_slack_user_ids": ["U01SWQKDTBM", "U095NMY2U4R"],
         "practice_channel_id": None,
         "quarantine_uncertain_routes": True,
         "thread_daily_updates": True,
@@ -68,7 +67,15 @@ def _apply_admin_slack_user_ids(payload: dict[str, Any], changed: list[str]) -> 
         changed.append("admin_slack_user_id")
 
 
-def apply_controls(payload: dict[str, Any]) -> list[str]:
+def apply_controls(payload: dict[str, Any], *, base_url: str | None = None) -> list[str]:
+    canonical = None
+    if base_url is not None:
+        parsed = urlsplit(base_url)
+        if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+                or parsed.username or parsed.password or parsed.query or parsed.fragment
+                or parsed.path not in {"", "/"}):
+            raise ValueError("Base URL must be an explicit http(s) origin without credentials, path, query or fragment.")
+        canonical = urlunsplit((parsed.scheme, parsed.netloc, "/exceptions", "", ""))
     changed: list[str] = []
     for section_name, values in CONTROL_VALUES.items():
         section = payload.setdefault(section_name, {})
@@ -80,6 +87,9 @@ def apply_controls(payload: dict[str, Any]) -> list[str]:
             section[key] = value
             changed.append(f"{section_name}.{key}")
     _apply_admin_slack_user_ids(payload, changed)
+    if canonical is not None and payload["slack"].get("manager_queue_url") != canonical:
+        payload["slack"]["manager_queue_url"] = canonical
+        changed.append("slack.manager_queue_url")
     return changed
 
 
@@ -93,13 +103,14 @@ def main() -> int:
         default=Path("config/agent.config.json"),
     )
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--base-url", help="Verified internal dashboard origin; omitted preserves the live URL.")
     args = parser.parse_args()
 
     config_path = args.config.resolve()
     payload = json.loads(config_path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise ValueError("Agent config must be a JSON object.")
-    changed = apply_controls(payload)
+    changed = apply_controls(payload, base_url=args.base_url)
     if not changed:
         print("Production controls already match the reviewed values.")
         return 0

@@ -162,6 +162,22 @@ async def tick(runtime: Any, user: Any, now: datetime) -> None:
         service.notice_delivered(notice["id"], datetime.now(timezone.utc))
 
 
+async def flush_work_notices(runtime: Any) -> None:
+    from .slack_work_intake import SlackWorkIntake
+    if not runtime.slack:
+        return
+    intake = SlackWorkIntake(runtime.state_store)
+    for notice in intake.pending_notices():
+        if not enabled(runtime, notice["owner_id"]) or clock_user(runtime, notice["owner_id"]) is None:
+            continue
+        try:
+            await runtime.slack.post_message(notice["owner_id"], notice["text"])
+        except Exception:
+            logger.warning("Work decision notification pending retry; no decision was lost.")
+            continue
+        intake.notice_delivered(notice["id"])
+
+
 async def run_slack_only(runtime: Any) -> None:
     import os
     from .slack_receiver import SlackSocketReceiver

@@ -77,6 +77,10 @@ class SlackSocketReceiver:
         async def handle_clock_button(ack: Any, body: dict[str, Any]) -> None:
             await ack()
             await handle_clock_action(self.runtime, self.discord_client, body)
+            try:
+                await publish_app_home(self.runtime, web_client, str((body.get("user") or {}).get("id") or ""))
+            except Exception:
+                logger.warning("Clock action handled; App Home refresh failed.")
 
         @app.event("message")
         async def handle_message(event: dict[str, Any]) -> None:

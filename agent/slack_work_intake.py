@@ -26,6 +26,7 @@ PROJECTS = {
     "people": "Hiring, onboarding and training",
     "operations": "Company administration and operations",
     "dp": "Don Pollo and company software",
+    "irad": "IRAD — intentional internal research and development; approval required",
     "exploration": "Exploration: Gweike, eufyMake, BrightDrop or another proposed idea",
 }
 _BOUNDARY = (
@@ -38,7 +39,7 @@ _HELP = (
     "Then use `work detail <why / next result / rough estimate>`, "
     "`work update <what changed or what is blocked>`, or `work status`.\n"
     "Projects: 1 GRASP · 2 CISORT · 3 CITA · 4 Bagworm · 5 CLASP. "
-    "Also: shop, meetings, proposals, sales, finance, people, operations, dp, exploration.\n"
+    "Also: shop, meetings, proposals, sales, finance, people, operations, dp, irad, exploration.\n"
     "`work project <name or 1–5>` labels the current proposal. "
     "`work options` shows up to five of your previously approved plans.\n" + _BOUNDARY
 )
@@ -89,6 +90,16 @@ class SlackWorkIntake:
                 );
                 CREATE INDEX IF NOT EXISTS work_intake_actor_activity
                     ON work_intake_events(actor_id, created_at);
+                CREATE TABLE IF NOT EXISTS work_evidence (
+                    item_id TEXT NOT NULL, source TEXT NOT NULL, url TEXT NOT NULL,
+                    source_id TEXT NOT NULL, actor_id TEXT NOT NULL, captured_at TEXT NOT NULL,
+                    retrieval_status TEXT NOT NULL DEFAULT 'not_verified',
+                    PRIMARY KEY(item_id,url)
+                );
+                CREATE TABLE IF NOT EXISTS work_decision_notices (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id TEXT NOT NULL,
+                    text TEXT NOT NULL, delivered_at TEXT
+                );
             """)
 
     def handle(self, *, actor_id: str, actor_name: str, is_manager: bool,
@@ -115,7 +126,8 @@ class SlackWorkIntake:
         command = command.lower()
         content = content.strip()
         if not body or command == "help":
-            return _HELP
+            from .work_evidence import COMPANY_HANDOFF
+            return _HELP + "\n`work evidence` lists source links; `work handoff` prepares a reusable summary; `work edit <correction>` preserves the original.\n" + COMPANY_HANDOFF
         if len(body) > 6000:
             return "Please keep this note under 6,000 characters and link longer evidence. Nothing was replaced."
         if command in {"queue", "review", "approve", "redirect"}:
@@ -137,11 +149,16 @@ class SlackWorkIntake:
                 f"{i}. {_safe(PROJECTS.get(row['project_key'], 'Project unconfirmed'))} — `{row['id']}`: "
                 + _safe(self._events(conn, row['id'])[0]['text'][:180]) for i, row in enumerate(rows, 1)
             )
-        if command in {"status", "detail", "update", "project"}:
+        if command in {"status", "detail", "update", "project", "edit", "evidence", "handoff"}:
             if not item:
                 return "No proposal yet. " + _HELP
             if command == "status":
                 return self._describe(conn, item) + "\n" + _BOUNDARY
+            if command in {"evidence", "handoff"}:
+                from .work_evidence import COMPANY_HANDOFF
+                rows = conn.execute("SELECT source,url,retrieval_status FROM work_evidence WHERE item_id=? ORDER BY captured_at LIMIT 5", (item["id"],)).fetchall()
+                links = "\n".join(f"{row['source']}: {_safe(row['url'])} — access/content not verified" for row in rows)
+                return ((self._describe(conn, item) + "\n") if command == "handoff" else "") + (links or "No source links recorded for this work yet.") + "\n" + COMPANY_HANDOFF
             if not content:
                 return f"Add your actual note after `work {command}`. Nothing was replaced."
             project = item["project_key"]
@@ -154,7 +171,7 @@ class SlackWorkIntake:
             self._append(conn, item["id"], actor, command, content, now)
             # A changed plan or label invalidates approval; a progress update
             # remains an observation, not authorization for new scope.
-            status = "pending" if command in {"detail", "project"} else item["status"]
+            status = "pending" if command in {"detail", "project", "edit"} else item["status"]
             conn.execute("UPDATE work_intake_items SET project_key=?, status=?, revision=revision+1, updated_at=? WHERE id=?",
                          (project, status, now, item["id"]))
             question = follow_up(content, previous)
@@ -177,6 +194,11 @@ class SlackWorkIntake:
     def _append(conn: Any, item: str, actor: str, kind: str, text: str, now: str) -> None:
         conn.execute("INSERT INTO work_intake_events(item_id,actor_id,kind,text,created_at) VALUES (?,?,?,?,?)",
                      (item, actor, kind, text, now))
+        if kind in {"proposal", "detail", "update", "edit"}:
+            from .work_evidence import source_references
+            for ref in source_references(text):
+                conn.execute("INSERT OR IGNORE INTO work_evidence(item_id,source,url,source_id,actor_id,captured_at,retrieval_status) VALUES (?,?,?,?,?,?,?)",
+                             (item, ref["source"], ref["url"], ref["source_id"], actor, now, ref["retrieval_status"]))
 
     @staticmethod
     def _events(conn: Any, item: str) -> list[dict[str, Any]]:
@@ -207,11 +229,22 @@ class SlackWorkIntake:
         if int(parts[1]) != item["revision"]:
             return "This proposal changed since you reviewed it. Use `work review " + item_id + "` before deciding."
         if command == "approve" and not item["project_key"]:
-            return "Confirm the project or overhead label with the worker before approval."
+            return "Confirm the contract, intentional IRAD or overhead destination with the worker before approval."
         status = "approved" if command == "approve" else "redirected"
         self._append(conn, item_id, actor, status, parts[2], now)
         conn.execute("UPDATE work_intake_items SET status=?, revision=revision+1, updated_at=? WHERE id=?", (status, now, item_id))
-        return f"Recorded {status} for `{item_id}`. The worker can see your note with `work status`. No outbound notice, time edit, or payroll change was made."
+        conn.execute("INSERT INTO work_decision_notices(owner_id,text) VALUES (?,?)",
+                     (item["owner_id"], f"Work alignment update for `{item_id}`: {status}.\n{_safe(parts[2])}\nThis decision does not change recorded hours or authorize overtime, remote work or contract charging."))
+        return f"Recorded {status} for `{item_id}`. A worker notification is queued; your note is also in `work status`. No time or payroll change was made."
+
+    def pending_notices(self) -> list[dict[str, Any]]:
+        with self.store._connect() as conn:
+            return [dict(row) for row in conn.execute("SELECT * FROM work_decision_notices WHERE delivered_at IS NULL ORDER BY id LIMIT 50")]
+
+    def notice_delivered(self, notice_id: int) -> None:
+        with self.store._connect() as conn:
+            conn.execute("UPDATE work_decision_notices SET delivered_at=? WHERE id=?",
+                         (datetime.now(timezone.utc).isoformat(), notice_id))
 
     def pending_exceptions(self) -> list[dict[str, Any]]:
         with self.store._connect() as conn:
@@ -230,7 +263,7 @@ class SlackWorkIntake:
         with self.store._connect() as conn:
             row = conn.execute(
                 "SELECT MAX(created_at) FROM work_intake_events WHERE actor_id=? "
-                "AND kind IN ('proposal','detail','update','project')", (actor_id,)
+            "AND kind IN ('proposal','detail','update','project','edit')", (actor_id,)
             ).fetchone()
             return row[0] if row else None
 
