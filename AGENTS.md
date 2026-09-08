@@ -16,6 +16,9 @@
   actions and accepted clock notices are separate from assistant announcements.
 - Onsite clock-in and meal return require confirmation at the Mini's loopback-only
   kiosk, not a Slack self-attestation, GPS claim, QR link or VPN source address.
+  Use name + personal PIN, not temporary Slack codes. PINs are salted/scrypt-hashed;
+  never put them in chat, clock events, logs, browser storage or URLs. Setup/reset
+  requires the worker's authenticated Slack identity or a verified local operator.
   Keep the owner company-management remote exception visible; staff remote work
   still requires Erik's time-bounded advance approval. Remote desktop/SSH access
   to the kiosk must remain limited to trusted administrators.

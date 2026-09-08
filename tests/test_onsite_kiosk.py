@@ -1,41 +1,88 @@
 import asyncio
 import re
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 import pytest
+from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
-from agent.onsite_kiosk import KioskCodes, ORIGIN, create_app
+from agent.kiosk_pins import KioskPins
+from agent.onsite_kiosk import ORIGIN, create_app
 from agent.slack_beta import ledger
-from test_slack_beta import runtime  # shared isolated fake transport fixture
+from test_slack_beta import runtime, event
+
+PIN = "839271"  # Synthetic credential, never deployed.
 
 
-def test_code_is_one_time_expiring_and_new_request_invalidates_old(runtime):
-    codes = KioskCodes(runtime.state_store)
+def enroll(runtime, actor="WORKER"):
+    pins = KioskPins(runtime.state_store)
+    pins.allow_setup(actor, authorized_by="test")
+    pins.set_pin(actor, PIN, PIN)
+    return pins
+
+
+def test_setup_is_scoped_expiring_single_use_and_does_not_record_time(runtime):
+    pins = KioskPins(runtime.state_store)
     now = datetime.now(timezone.utc)
-    first = codes.issue("WORKER", "in", "onsite", now=now)
-    second = codes.issue("WORKER", "in", "onsite", now=now)
+    with pytest.raises(ValueError, match="not open"):
+        pins.set_pin("WORKER", PIN, PIN)
+    pins.allow_setup("WORKER", authorized_by="test", now=now)
     with pytest.raises(ValueError):
-        codes.consume(first, now=now)
-    assert codes.consume(second, now=now)["actor"] == "WORKER"
+        pins.set_pin("OTHER", PIN, PIN, now=now)
     with pytest.raises(ValueError):
-        codes.consume(second, now=now)
-    third = codes.issue("WORKER", "back", "", now=now)
+        pins.set_pin("WORKER", PIN, PIN, now=now + timedelta(minutes=10))
     with pytest.raises(ValueError):
-        codes.consume(third, now=now + timedelta(minutes=2))
+        pins.set_pin("WORKER", "123456", "123456", now=now)
+    pins.set_pin("WORKER", PIN, PIN, now=now)
+    assert not pins.setup_allowed("WORKER")
+    with pytest.raises(ValueError):
+        pins.set_pin("WORKER", "238197", "238197", now=now)
+    pins.verify("WORKER", PIN)
     with runtime.state_store._connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
-        assert not conn.execute("SELECT digest FROM kiosk_codes WHERE digest=?", (third,)).fetchone()
+        row = conn.execute("SELECT salt,digest FROM kiosk_pins").fetchone()
+        assert len(row[0]) == 16 and len(row[1]) == 32 and PIN.encode() not in row[1]
+
+
+def test_lockout_persists_across_restart_and_reset_preserves_old_pin_until_saved(runtime):
+    pins = enroll(runtime)
+    now = datetime.now(timezone.utc)
+    for _ in range(5):
+        with pytest.raises(ValueError):
+            pins.verify("WORKER", "111111", now=now)
+    with pytest.raises(ValueError, match="locked"):
+        KioskPins(runtime.state_store).verify("WORKER", PIN, now=now)
+    pins.verify("WORKER", PIN, now=now + timedelta(minutes=15))
+    pins.allow_setup("WORKER", authorized_by="test")
+    pins.verify("WORKER", PIN)
+    pins.set_pin("WORKER", "273819", "273819")
+    with pytest.raises(ValueError):
+        pins.verify("WORKER", PIN)
+    pins.verify("WORKER", "273819")
+
+
+def test_slack_setup_cannot_target_someone_else_or_start_time(runtime):
+    request = {**event("kiosk setup"), "ts": str(datetime.now(timezone.utc).timestamp())}
+    asyncio.run(runtime.handle_slack_direct_message(None, request))
+    pins = KioskPins(runtime.state_store)
+    assert pins.setup_allowed("WORKER") and not pins.setup_allowed("ERIK")
+    asyncio.run(runtime.handle_slack_direct_message(None, event("kiosk setup ERIK", 10)))
+    assert not pins.setup_allowed("ERIK")
+    # Delayed transport retries cannot open a fresh ten-minute window.
+    old = {**event("kiosk setup"), "ts": str((datetime.now(timezone.utc) - timedelta(hours=1)).timestamp())}
+    asyncio.run(runtime.handle_slack_direct_message(None, old))
+    assert not pins.setup_allowed("WORKER")
+    with runtime.state_store._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
 
 
 def test_kiosk_clock_and_meal_return_require_presence_but_out_does_not(runtime):
     clock, user = ledger(runtime), runtime.roster_by_key["worker"]
     now = datetime.fromisoformat("2026-09-07T09:00:00-07:00")
-
     def act(command, hours=0, detail="", verified=False):
         return clock.handle(user, command, detail, event_id=f"{command}:{hours}:{verified}",
                             now=now + timedelta(hours=hours), kiosk_verified=verified)
-
     assert "KIOSK_REQUIRED" in act("in", detail="onsite")[0]
     assert "advance approval" in act("in", detail="remote", hours=.01)[0]
     assert "Clocked in" in act("in", detail="onsite", verified=True, hours=.02)[0]
@@ -45,49 +92,60 @@ def test_kiosk_clock_and_meal_return_require_presence_but_out_does_not(runtime):
     assert "Clocked out" in act("out", 4)[0]
 
 
-def test_http_boundary_and_real_confirmation_without_slack_sends(runtime):
+async def headers(client):
+    host = {"Host": "127.0.0.1:8766"}
+    page = await client.get("/", headers=host)
+    text = await page.text()
+    token = re.search(r'csrf="([^"]+)"', text)[1]
+    assert "Choose your name" in text and 'type="password"' in text
+    assert "Today " not in text and PIN not in text
+    return {**host, "Origin": ORIGIN, "X-Kiosk-CSRF": token}
+
+
+def test_http_setup_and_real_clock_cycle_retry_without_sends(runtime):
     async def exercise():
         async with TestClient(TestServer(create_app(runtime))) as client:
-            host = {"Host": "127.0.0.1:8766"}
-            assert (await client.get("/", headers={"Host": "evil.example"})).status == 403
-            page = await client.get("/", headers=host)
-            text = await page.text()
-            token = re.search(r"'X-Kiosk-CSRF':\"([^\"]+)\"", text)[1]
-            code = KioskCodes(runtime.state_store).issue("WORKER", "in", "onsite")
-            assert (await client.post("/confirm", headers=host, json={"code": code})).status == 403
-            headers = {**host, "Origin": ORIGIN, "X-Kiosk-CSRF": token}
-            response = await client.post("/confirm", headers=headers, json={"code": code})
-            assert response.status == 200, await response.text()
-            assert "Clocked in" in (await response.json())["message"]
-            assert (await client.post("/confirm", headers=headers, json={"code": code})).status == 400
+            h = await headers(client)
+            payload = {"actor": "WORKER", "pin": PIN, "confirmation": PIN, "action": "start", "request_id": str(uuid4())}
+            assert (await client.post("/confirm", headers={"Host": "127.0.0.1:8766"}, json=payload)).status == 403
+            assert (await client.post("/pin/setup", headers=h, json=payload)).status == 400
+            KioskPins(runtime.state_store).allow_setup("WORKER", authorized_by="test")
+            assert (await client.post("/pin/setup", headers=h, json=payload)).status == 200
+            response = await client.post("/confirm", headers=h, json=payload)
+            assert response.status == 200 and "Clocked in" in (await response.json())["message"]
+            stopped = await client.post("/confirm", headers=h, json={**payload, "action": "out", "request_id": str(uuid4())})
+            assert "Clocked out" in (await stopped.json())["message"]
+            # A delayed retry must not reopen after a subsequent stop.
+            assert (await client.post("/confirm", headers=h, json=payload)).status == 200
+            with runtime.state_store._connect() as conn:
+                session = ledger(runtime)._sessions(conn, "worker")[0]
+                assert session.clocked_out_at
+                assert PIN not in str(session.metadata)
             assert runtime.test_sent == []
-            assert runtime.test_archives
     asyncio.run(exercise())
 
 
-def test_lan_and_forwarded_addresses_cannot_pass_boundary(runtime):
+def test_offboarded_and_wrong_pin_cannot_start_and_http_limits_apply(runtime):
+    enroll(runtime)
+    async def exercise():
+        async with TestClient(TestServer(create_app(runtime))) as client:
+            h = await headers(client)
+            payload = {"actor": "WORKER", "pin": "111111", "action": "start", "request_id": str(uuid4())}
+            assert (await client.post("/confirm", headers=h, json=payload)).status == 400
+            runtime.roster_by_key["worker"].active = False
+            for _ in range(19):
+                assert (await client.post("/confirm", headers=h, json={**payload, "pin": PIN})).status == 400
+            assert (await client.post("/confirm", headers=h, json=payload)).status == 429
+            assert not runtime.test_archives
+    asyncio.run(exercise())
+
+
+def test_foreign_host_and_forwarded_address_are_rejected(runtime):
     async def exercise():
         app = create_app(runtime)
         request = make_mocked_request("GET", "/", headers={"Host": "127.0.0.1:8766", "X-Forwarded-For": "127.0.0.1"})
-        # The mocked request has no trusted loopback peer.
-        from aiohttp import web
         with pytest.raises(web.HTTPForbidden):
             await app.middlewares[0](request, lambda request: None)
-    asyncio.run(exercise())
-
-
-def test_offboarded_identity_and_excess_attempts_cannot_start(runtime):
-    async def exercise():
-        async with TestClient(TestServer(create_app(runtime))) as client:
-            host = {"Host": "127.0.0.1:8766"}
-            page = await client.get("/", headers=host)
-            token = re.search(r"'X-Kiosk-CSRF':\"([^\"]+)\"", await page.text())[1]
-            headers = {**host, "Origin": ORIGIN, "X-Kiosk-CSRF": token}
-            code = KioskCodes(runtime.state_store).issue("WORKER", "in", "onsite")
-            runtime.roster_by_key["worker"].active = False
-            assert (await client.post("/confirm", headers=headers, json={"code": code})).status == 400
-            for _ in range(11):
-                assert (await client.post("/confirm", headers=headers, json={"code": "00000000"})).status == 400
-            assert (await client.post("/confirm", headers=headers, json={"code": "00000000"})).status == 429
-            assert not runtime.test_archives
+        async with TestClient(TestServer(app)) as client:
+            assert (await client.get("/", headers={"Host": "evil.example"})).status == 403
     asyncio.run(exercise())

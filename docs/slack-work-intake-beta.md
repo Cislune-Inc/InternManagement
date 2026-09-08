@@ -16,8 +16,9 @@ The Messages tab accepts deterministic commands:
 
 | Command | Result |
 |---|---|
-| `clock in onsite` | Request a two-minute code; confirm at the Mini to record the actual start |
-| `clock in onsite GRASP: compare wheel-slip runs` | Preserve the plan with the kiosk-confirmed start; use `work` for alignment review |
+| Mini: select name + PIN | Record the actual onsite start/return, without a phone or task/prose gate |
+| `clock in onsite` | Directions to the Mini; a Slack message alone cannot start onsite time |
+| `kiosk setup` | Open a ten-minute setup window for your own identity; enter the PIN only on the Mini |
 | `clock out` | Stop immediately without a required summary |
 | `lunch` / `back` | Actual meal start/return; return after 30 minutes, with kiosk confirmation for onsite shifts |
 | `break` / `back` | Paid rest and actual return |
@@ -63,10 +64,10 @@ data-handling policy. A real model/key roundtrip remains unverified.
 
 ## Enforcement and truthful reconciliation
 
-- Onsite starts and meal returns require a single-use code entered on the Mini's
+- Onsite starts and meal returns require a personal six-digit PIN entered on the Mini's
   loopback-only kiosk at http://127.0.0.1:8766. Requests alone add no attendance.
   A QR code or VPN address is not presence evidence. Do not proxy/tunnel the kiosk.
-  Code sharing and administrator remote desktop access remain known limitations.
+  PIN sharing and administrator remote desktop access remain known limitations.
   Staff remote work requires advance approval. Owner company-management remote
   mode remains an explicit existing exception, not a payroll classification.
 - Before staff enrollment, isolate the kiosk account from manager pages/files,

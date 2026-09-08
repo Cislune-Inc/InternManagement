@@ -1529,7 +1529,7 @@ class InternManagementRuntime:
                     "Describe your work in Messages and I will help clarify it. "
                     "Use `work update` for results and `work next` for the next step or blocker. "
                     "Preview update creates a private draft; confirmation saves a handoff, never a channel post.\n"
-                    "Shop check-in code gives you a two-minute code to enter at the Mini. "
+                    "At the Mini, choose your name and enter your PIN. One-time setup: send `kiosk setup` here. "
                     "Onsite meal returns also need the Mini; approved remote workers use `clock in remote`. "
                     "For a correction, DM `report hours` with the actual date, times and breaks. "
                     "If DP is unavailable, Slack Erik your actual hours—not Gusto Kiosk.\n\n" + COMPANY_HANDOFF

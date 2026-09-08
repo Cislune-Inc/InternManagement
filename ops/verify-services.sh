@@ -15,6 +15,8 @@ stdout_log="${repo_root}/data/launchd.stdout.log"
 slack_only="$("${repo_root}/.venv/bin/python" -c 'import json,sys; print("yes" if json.load(open(sys.argv[1])).get("slack",{}).get("work_intake_beta_slack_user_ids") else "no")' "${repo_root}/config/agent.config.json")"
 if [[ "${slack_only}" != "yes" ]]; then
   grep -q "Logged in as DonPollo" "${stdout_log}"
+else
+  curl --fail --silent --show-error --max-time 5 --output /dev/null "http://127.0.0.1:8766/"
 fi
 if [[ "${slack_only}" == "yes" ]] || grep -q '^SLACK_APP_TOKEN=xapp-' "${repo_root}/.env"; then
   lock_pid="$(

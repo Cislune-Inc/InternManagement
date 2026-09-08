@@ -105,6 +105,14 @@ async def handle_message(runtime: Any, event: dict[str, Any]) -> bool:
         return True
     admin = runtime.admin_profile_by_slack_user_id(slack_id)
     from .work_sharing import handle as handle_work_sharing
+    if text.lower() == "kiosk setup":
+        from .kiosk_pins import KioskPins
+        KioskPins(runtime.state_store).allow_setup(slack_id, authorized_by="slack:" + slack_id, now=now)
+        await runtime.slack.post_message(slack_id, "PIN setup is open for your identity for ten minutes. At the Mini, choose your name, tap Set / reset PIN and enter a six-digit PIN twice. Never send your PIN in chat. This is one-time setup; daily check-in needs only the Mini.")
+        return True
+    if text.lower().startswith("kiosk "):
+        await runtime.slack.post_message(slack_id, "Use `kiosk setup` with no name or PIN to open setup for your own identity. Enter PINs only on the Mini screen, never in chat.")
+        return True
     if await handle_work_sharing(runtime, slack_id, text):
         return True
     if text.lower().startswith(("hours add ", "hours resolve ", "hours reports")):
@@ -134,10 +142,8 @@ async def handle_message(runtime: Any, event: dict[str, Any]) -> bool:
             try:
                 response, session = ledger(runtime).handle(user, *command, event_id=event_id, now=now)
                 if response.startswith("KIOSK_REQUIRED"):
-                    from .onsite_kiosk import KioskCodes
-                    code = KioskCodes(runtime.state_store).issue(slack_id, *command)
-                    response = (f"At the shop Mini, enter code `{code}` within two minutes to confirm your {('return' if command[0] == 'back' else 'clock-in')}. "
-                                "The clock changes only when you confirm there. Do not share your code. "
+                    response = ("At the shop Mini, choose your name and enter your PIN to start or return to work. No phone or temporary code needed. "
+                                "For first-time setup, send `kiosk setup` here, then set your PIN on the Mini. "
                                 "Offsite work needs Erik's advance approval; use `clock in remote` if approved. " + FALLBACK)
             except ValueError as exc:
                 response, session = str(exc), None

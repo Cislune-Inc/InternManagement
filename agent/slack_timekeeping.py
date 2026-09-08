@@ -18,7 +18,7 @@ from .models import SessionState, UserProfile
 HELP = (
     "*Don Pollo time clock*\n"
     "`clock in onsite` · `clock out` · `lunch` · `back` · `break` · `hours`\n"
-    "Onsite start and meal return use a short-lived code confirmed at the shop Mini. "
+    "Onsite start and meal return use your name and PIN at the shop Mini. "
     "You can add what you are doing after clock-in; task selection is not required. "
     "`report hours <date, actual start/end, breaks and what needs correcting>` saves an exception. "
     "If DP fails, Slack Erik your actual hours. Do not use Gusto Kiosk."
@@ -235,7 +235,7 @@ class SlackTimekeeping:
                 return "Remote work needs Erik's advance approval. No new work is authorized here. " + FALLBACK
             if not remote and not re.match(r"onsite\b", detail, re.I):
                 if self.require_kiosk:
-                    return "Use `clock in onsite` for a shop kiosk code, or `clock in remote` within your approved window. " + FALLBACK
+                    return "Use your name and PIN at the shop Mini, or `clock in remote` within your approved window. " + FALLBACK
                 return "Reply `clock in onsite` to confirm you are at the shop. This is an attestation, not a location check. " + FALLBACK
             if not remote and self.require_kiosk and not kiosk_verified:
                 return "KIOSK_REQUIRED: confirm at the shop Mini."
