@@ -18,7 +18,8 @@ from .models import SessionState, UserProfile
 
 HELP = (
     "*Don Pollo time clock*\n"
-    "`clock in onsite` · `clock out` · `lunch` · `back` · `break` · `hours`\n"
+    "`clock in onsite` · `clock out` · `lunch` · `back` · `break` · `pause` · `hours`\n"
+    "`break` checks your recorded rests; `pause` is an extra paid pause with no minimum. `required rest` starts a full 10-minute rest. "
     "Start shifts at the shop Mini with your name and PIN. Lunch, paid rest and return are available here. "
     "You can add what you are doing after clock-in; task selection is not required. "
     "`report hours <date, actual start/end, breaks and what needs correcting>` saves an exception. "
@@ -43,11 +44,14 @@ def timestamp(value: str | None) -> datetime | None:
 
 def clock_command(text: str) -> tuple[str, str] | None:
     text = text.strip()
+    if text.lower() == "required rest":
+        return "rest", "required"
     for pattern, command in [
         (r"(?:clock[ -]?in|start work)(?:\s+(.*))?", "in"),
         (r"(?:clock[ -]?out|stop work|done for (?:the )?day)", "out"),
         (r"(?:lunch|start lunch)", "lunch"),
         (r"(?:break|short break|start break)", "rest"),
+        (r"(?:pause|extra pause|extra break)", "pause"),
         (r"(?:back|back from (?:lunch|break)|resume)", "back"),
         (r"(?:hours|my hours|time|status)", "hours"),
         (r"(?:clock help|help|clock)", "help"),
@@ -232,6 +236,7 @@ class SlackTimekeeping:
 
     def snapshot(self, user: UserProfile, now: datetime) -> str:
         """Read current clock/totals without starting a session or saving receipts."""
+        from .break_guidance import summary
         with self.store._connect() as conn:
             sessions = self._sessions(conn, user.user_key)
             session = self._current(sessions, user, now)
@@ -245,6 +250,7 @@ class SlackTimekeeping:
                     + f"*{state}* · Today {daily / 3600:.2f} h · This week {weekly / 3600:.2f} h\n"
                     f"Recorded work + paid rest · {self.zone.key} · Updated {now.astimezone(self.zone):%H:%M}"
                     + lunch_summary(session, self.zone)
+                    + summary(session, user, now, self.zone, meal_due=self._meal_due(session, now))
                     + ("\n" + self.return_message(waiting) if waiting else ""))
 
     def return_countdown(self, sessions: list[SessionState], now: datetime) -> dict[str, Any] | None:
@@ -254,6 +260,8 @@ class SlackTimekeeping:
             meta = session.metadata
             for field, kind, seconds in (("slack_clock_meal_started_at", "Lunch", 1800),
                                          ("slack_clock_rest_started_at", "Paid rest", 600)):
+                if field == "slack_clock_rest_started_at" and meta.get("slack_clock_rest_kind") == "extra":
+                    continue
                 if began := timestamp(meta.get(field)):
                     candidates.append((began + timedelta(seconds=seconds), kind))
             until = timestamp(meta.get("slack_clock_return_not_before"))
@@ -286,9 +294,10 @@ class SlackTimekeeping:
             daily >= self.daily_limit or weekly >= self.weekly_limit or self._seventh_day(sessions, now)
         )
         if command == "hours":
+            from .break_guidance import summary
             state = "on lunch" if session.stage == "on_lunch_break" else "on paid rest" if running and session.metadata.get("slack_clock_rest_started_at") else "clocked in" if running else "clocked out"
             waiting = self.return_countdown(sessions, now)
-            return ("Handover pending · These DP totals exclude your Gusto records.\n" if user.user_key in self.handover_pending_user_keys else "") + f"You are {state}. Recorded work + paid rest: today {daily / 3600:.2f} h; this week {weekly / 3600:.2f} h ({self.zone.key})." + lunch_summary(session, self.zone) + ("\n" + self.return_message(waiting) if waiting else "")
+            return ("Handover pending · These DP totals exclude your Gusto records.\n" if user.user_key in self.handover_pending_user_keys else "") + f"You are {state}. Recorded work + paid rest: today {daily / 3600:.2f} h; this week {weekly / 3600:.2f} h ({self.zone.key})." + lunch_summary(session, self.zone) + summary(session, user, now, self.zone, meal_due=self._meal_due(session, now)) + ("\n" + self.return_message(waiting) if waiting else "")
         waiting = self.return_countdown(sessions, now)
         if command in {"in", "back"} and waiting and waiting["remaining_seconds"]:
             return self.return_message(waiting)
@@ -337,8 +346,7 @@ class SlackTimekeeping:
             return f"Clocked in at {now.astimezone(self.zone):%H:%M %Z}. Tell me what you are working on and the next result."
         if command == "out":
             self._finish_meal(session, now)
-            if rest := session.metadata.pop("slack_clock_rest_started_at", None):
-                session.metadata.setdefault("paid_rest_windows", []).append({"started_at": rest, "ended_at": now.isoformat(), "source": "worker_clock_out"})
+            self._finish_rest(session, now, "worker_clock_out")
             if not running:
                 session.stage = "clocked_out"
                 return "Already clocked out."
@@ -353,21 +361,34 @@ class SlackTimekeeping:
             session.metadata["slack_clock_meal_started_at"] = now.isoformat()
             session.metadata["slack_clock_return_not_before"] = (now + timedelta(minutes=30)).isoformat()
             session.metadata["slack_clock_return_kind"] = "Lunch"
-            rest = session.metadata.pop("slack_clock_rest_started_at", None)
-            if rest:
-                session.metadata.setdefault("paid_rest_windows", []).append({"started_at": rest, "ended_at": now.isoformat(), "source": "worker_switched_to_meal"})
+            self._finish_rest(session, now, "worker_switched_to_meal")
             session.metadata.setdefault("lunch_windows", []).append({"started_at": now.isoformat(), "ended_at": None, "source": "slack_worker_report"})
             session.stage = "on_lunch_break"
-            return "Lunch recorded starting now. Stop all work and take at least 30 duty-free minutes. " + self.return_message(self.return_countdown([session], now))
-        if command == "rest":
+            return "Unpaid lunch recorded starting now. Take at least 30 duty-free minutes; it stays unpaid until your actual return. " + self.return_message(self.return_countdown([session], now))
+        if command in {"rest", "pause"}:
+            from .break_guidance import completed_rests, next_rest_hours
             if not running or session.stage == "on_lunch_break":
                 return "Start paid rest from an active shift, not an unpaid meal."
             if session.metadata.get("slack_clock_rest_started_at"):
                 return "Your paid rest is already running. Reply `back` when you return."
+            extra = command == "pause" or (detail != "required" and completed_rests(session)
+                                           and paid_seconds([session], now) < next_rest_hours(session) * 3600)
             session.metadata["slack_clock_rest_started_at"] = now.isoformat()
+            session.metadata["slack_clock_rest_kind"] = "extra" if extra else "required"
+            session.metadata.pop("slack_clock_rest_long_notice_at", None)
+            if extra:
+                # Never erase a minimum from an interrupted earlier required rest.
+                prior = self.return_countdown(sessions, now)
+                if prior and prior["remaining_seconds"]:
+                    session.metadata.pop("slack_clock_rest_started_at", None)
+                    session.metadata.pop("slack_clock_rest_kind", None)
+                    return self.return_message(prior)
+                session.metadata.pop("slack_clock_return_not_before", None)
+                session.metadata.pop("slack_clock_return_kind", None)
+                return "Extra paid pause recorded. Reply `back` whenever ready; no minimum countdown. This does not replace a required 10-minute rest."
             session.metadata["slack_clock_return_not_before"] = (now + timedelta(minutes=10)).isoformat()
             session.metadata["slack_clock_return_kind"] = "Paid rest"
-            return "Take 10 duty-free minutes of paid rest. No work or replies are needed during the break. " + self.return_message(self.return_countdown([session], now))
+            return "Enjoy your 10-minute paid break. When it ends, return to work—or clock out if you need more personal time. " + self.return_message(self.return_countdown([session], now))
         if command == "back":
             if (session.metadata.get("slack_clock_meal_started_at") or session.metadata.get("slack_clock_rest_started_at")) and self.require_kiosk and not self.allow_slack_break_returns and not kiosk_verified and session.metadata.get("slack_clock_location") not in {"approved_remote", "company_management_remote"}:
                 return "KIOSK_REQUIRED: confirm your return at the shop Mini."
@@ -387,7 +408,9 @@ class SlackTimekeeping:
                 session.stage = "active"
                 return "Meal ended now; your work clock is running again."
             if rest := session.metadata.pop("slack_clock_rest_started_at", None):
-                session.metadata.setdefault("paid_rest_windows", []).append({"started_at": rest, "ended_at": now.isoformat(), "source": "worker_reported_return"})
+                session.metadata["slack_clock_rest_started_at"] = rest
+                kind = session.metadata.get("slack_clock_rest_kind", "required")
+                self._finish_rest(session, now, "worker_reported_return")
                 if over_limit:
                     self._stop(session, now, "hours_limit")
                     return "Rest ended; the hours limit is reached. Contact Erik for approval to continue."
@@ -408,9 +431,19 @@ class SlackTimekeeping:
                         return "Rest return recorded; your clock resumed now."
                     location = "remote" if session.metadata.get("slack_clock_location") in {"approved_remote", "company_management_remote"} else "onsite"
                     return f"Your rest return is recorded. Use `clock in {location}` to resume."
-                return "Welcome back. Paid rest is recorded; your work clock kept running."
+                return "Welcome back. " + ("Extra paid pause" if kind == "extra" else "Paid rest") + " recorded; your work clock kept running."
             return "No active break found. Use `hours` to check your clock or `report hours` to correct it."
         return HELP
+
+    @staticmethod
+    def _finish_rest(session: SessionState, now: datetime, source: str) -> None:
+        if start := session.metadata.pop("slack_clock_rest_started_at", None):
+            kind = session.metadata.pop("slack_clock_rest_kind", "required")
+            window = {"started_at": start, "ended_at": now.isoformat(), "source": source, "kind": kind}
+            if now - timestamp(start) > timedelta(minutes=20):
+                window["paid_pending_review"] = True
+                session.metadata.setdefault("compliance_events", []).append({"event_type": "extended_paid_pause_review", "recorded_at": now.isoformat(), "started_at": start})
+            session.metadata.setdefault("paid_rest_windows", []).append(window)
 
     @staticmethod
     def _finish_meal(session: SessionState, now: datetime) -> None:
@@ -441,6 +474,8 @@ class SlackTimekeeping:
     def _return_ready(self, session: SessionState, now: datetime) -> tuple[str, str, str] | None:
         for field, label, minutes in (("slack_clock_meal_started_at", "30-minute lunch minimum", 30),
                                       ("slack_clock_rest_started_at", "10-minute paid rest", 10)):
+            if field == "slack_clock_rest_started_at" and session.metadata.get("slack_clock_rest_kind") == "extra":
+                continue
             raw = session.metadata.get(field)
             started = timestamp(raw)
             identity = f"{field}:{raw}"
@@ -451,7 +486,8 @@ class SlackTimekeeping:
             instruction = ("Reply `back` when you return to work."
                            if remote or not self.require_kiosk or self.allow_slack_break_returns else
                            "When you actually return, select your name and enter your PIN at the shop Mini. No Slack reply needed.")
-            return (f"Your {label} is complete. {instruction}", field, raw)
+            extra = " If you need more personal time, clock out." if minutes == 10 else ""
+            return (f"Your {label} is complete. {instruction}{extra}", field, raw)
         return None
 
     def _save_notices(self, conn: Any, user: UserProfile, session: SessionState,
@@ -491,8 +527,6 @@ class SlackTimekeeping:
                 reason = "remote_approval_expired"
             elif user.meal_tracking_required and self._meal_due(session, now):
                 reason = "meal_due"
-            elif (rest := timestamp(session.metadata.get("slack_clock_rest_started_at"))) and now - rest >= timedelta(minutes=10):
-                reason = "rest_return_unconfirmed"
             if reason:
                 self._stop(session, now, reason)
                 if reason == "rest_return_unconfirmed" and ready:
@@ -500,6 +534,8 @@ class SlackTimekeeping:
                 else:
                     notices.append(f"Stop work now: {reason.replace('_', ' ')}. Your clock stopped at {now.astimezone(self.zone):%H:%M %Z}. " + ("Reply `lunch` as you begin your 30-minute off-duty meal. " if reason == "meal_due" else "") + (ready[0] if ready else ""))
             else:
+                if ready:
+                    notices.append(ready[0])  # Readiness is not an unpaid clock-out.
                 meal_warning_key = "slack_clock_meal_warning_at" if worked < 9.5 * 3600 else "slack_clock_second_meal_warning_at"
                 expected = 1 if worked < 9.5 * 3600 else 2
                 if user.meal_tracking_required and worked >= 4.5 * 3600 and self._meal_count(session, now) < expected and not session.metadata.get(meal_warning_key):
@@ -509,9 +545,12 @@ class SlackTimekeeping:
                 if user.worker_type != "admin" and min(self.daily_limit - daily, self.weekly_limit - weekly) <= 1800 and not session.metadata.get("slack_clock_hours_warning_at"):
                     notices.append("You are within 30 minutes of your daily or weekly hours limit. Wrap up and clock out; additional work needs Erik's authorization.")
                     session.metadata["slack_clock_hours_warning_at"] = now.isoformat()
-                if worked >= 2 * 3600 and not session.metadata.get("slack_clock_rest_reminder_at") and not session.metadata.get("slack_clock_rest_started_at"):
+                from .break_guidance import completed_rests, next_rest_hours
+                rest_number = len(completed_rests(session)) + 1
+                reminder_key = "slack_clock_rest_reminder_at" if rest_number == 1 else f"slack_clock_rest_reminder_{rest_number}_at"
+                if worked >= next_rest_hours(session) * 3600 and not session.metadata.get(reminder_key) and not session.metadata.get("slack_clock_rest_started_at"):
                     notices.append("At a safe stopping point, take your 10-minute duty-free paid rest. Reply `break` as it begins.")
-                    session.metadata["slack_clock_rest_reminder_at"] = now.isoformat()
+                    session.metadata[reminder_key] = now.isoformat()
                 last = timestamp(session.last_user_message_at) or timestamp(session.clocked_in_at)
                 if last and now - last >= timedelta(hours=4):
                     warning = timestamp(session.metadata.get("slack_clock_inactivity_warning_at"))

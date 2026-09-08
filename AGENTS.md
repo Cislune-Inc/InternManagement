@@ -42,6 +42,14 @@
   Suppress delayed readiness messages after return/clock-out. Keep actual-hours
   reports and clock-out available even while the return boundary is active.
 
+- September 8 evening: a required paid rest gets one readiness notice, not an
+  automatic ten-minute clock-out. Extra short pauses have no new minimum and do
+  not count as required rests. Preserve actual return windows and existing legacy
+  gaps. Use gentle return-or-clock-out wording; no blanket unpaid extension rule.
+  Extended completed pauses are reviewable, not automatic pay deductions. Routine
+  break-pattern monitoring is private to Erik and focuses on material weekly
+  patterns, not small variations or staff warnings.
+
 - The opt-in hours-first Slack beta (`docs/slack-work-intake-beta.md`) is the sole
   beta clock on the existing SQLite session ledger. Gusto Kiosk is not a fallback;
   workers can always report actual hours to Erik on Slack. Clocking must not depend

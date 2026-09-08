@@ -135,7 +135,8 @@ def test_slack_break_return_keeps_new_shift_kiosk_and_minimum_guards(clock, user
     assert not returned.metadata.get("slack_clock_meal_started_at")
     assert not returned.metadata.get("slack_clock_rest_started_at")
     if action == "rest":
-        assert returned.metadata["slack_clock_return_gaps"][0]["status"] == "actual_work_unknown"
+        assert not returned.metadata.get("slack_clock_return_gaps")
+        assert returned.metadata["paid_rest_windows"][0]["ended_at"]
     command(clock, user, "out", at(13))
     assert "No active break" in command(clock, user, "back", at(13, 1))[0]
     assert "KIOSK_REQUIRED" in command(clock, user, "in", at(13, 2), "onsite")[0]

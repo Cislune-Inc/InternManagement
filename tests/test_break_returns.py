@@ -57,9 +57,9 @@ def test_ready_once_per_break_survives_restart_and_does_not_resume(clock, user, 
     assert "No Slack reply needed" in notices[0]
     assert session.metadata.get("slack_clock_rest_started_at" if action == "rest" else "slack_clock_meal_started_at")
     if action == "rest":
-        assert session.clocked_out_at
-        assert "clock paused" in notices[0]
-        assert paid_seconds([session], due + timedelta(hours=1)) == 130 * 60
+        assert not session.clocked_out_at
+        assert "clock paused" not in notices[0]
+        assert paid_seconds([session], due + timedelta(minutes=6)) == 136 * 60
     else:
         assert session.stage == "on_lunch_break"
         assert session.metadata["lunch_windows"][0]["ended_at"] is None
@@ -89,7 +89,7 @@ def test_repeated_rest_gets_new_notice_and_old_one_is_suppressed(clock, user):
     clock.tick(user, at(10, 10))
     command(clock, user, "back", at(10, 11))
     command(clock, user, "in", at(10, 11), "onsite")
-    command(clock, user, "rest", at(11))
+    command(clock, user, "rest", at(11), "required")
     clock.tick(user, at(11, 10))
     assert len(clock.pending_notices(user.user_key)) == 1
     with clock.store._connect() as conn:
@@ -104,7 +104,7 @@ def test_legacy_rest_cross_midnight_retains_actual_return(clock, user):
     assert "remaining" in command(clock, user, "back", at(0, day=8))[0]
     clock.tick(user, at(0, 5, day=8))
     response, returned = command(clock, user, "back", at(0, 6, day=8))
-    assert "rest return is recorded" in response
+    assert "Paid rest recorded" in response
     assert returned.session_date == "2026-09-07"
 
 

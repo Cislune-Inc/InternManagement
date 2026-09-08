@@ -113,14 +113,14 @@ def test_remote_approval_expiring_during_meal_cannot_resume_work(clock, user):
     assert paid_seconds([session], at(13, day=8)) == 3 * 3600
 
 
-def test_paid_rest_timeout_preserves_elapsed_time_and_requires_return(clock, user):
+def test_paid_rest_readiness_preserves_elapsed_time_without_automatic_deduction(clock, user):
     command(clock, user, "in", at(9), "onsite")
     command(clock, user, "rest", at(11))
     _, session = clock.tick(user, at(11, 11))
-    assert paid_seconds([session], at(12)) == 131 * 60
-    assert "Reply `back`" in command(clock, user, "in", at(11, 12), "onsite")[0]
+    assert paid_seconds([session], at(12)) == 180 * 60
+    assert "already clocked in" in command(clock, user, "in", at(11, 12), "onsite")[0]
     command(clock, user, "back", at(11, 13))
-    assert "Clocked in" in command(clock, user, "in", at(11, 14), "onsite")[0]
+    assert "already clocked in" in command(clock, user, "in", at(11, 14), "onsite")[0]
 
 
 def test_daily_and_weekly_limits_preserve_overtime_already_worked(clock, user):
