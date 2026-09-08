@@ -25,11 +25,10 @@ HELP = (
     "For a completed lunch correction, use `fix lunch today 11:30am-12:15pm` with your actual times, then confirm the preview. "
     "If DP fails, Slack Erik your actual hours. Do not use Gusto Kiosk."
 )
-FALLBACK = "If you worked outside the recorded interval, use `report hours` or Slack Erik the actual times; all work must be recorded."
+FALLBACK = "For a time correction, use `report hours` with the date and times."
 HANDOVER_PENDING = (
     "Your PIN setup is available, but your Gusto-to-DP handover is not finished. "
-    "Ask Erik to preserve your actual earlier hours and breaks and confirm the switch. "
-    "No DP start or return was recorded. " + FALLBACK
+    "Finish PIN setup, then ask Erik to confirm your switch to DP."
 )
 
 
@@ -187,7 +186,7 @@ class SlackTimekeeping:
             if command == "report":
                 conn.execute("INSERT INTO slack_clock_reports(id,user_key,reported_at,text) VALUES (?,?,?,?)",
                              (key, user.user_key, now.isoformat(), detail))
-                response = "Your actual-hours report is saved for manager reconciliation. It has not been converted into guessed timestamps. " + FALLBACK
+                response = "Your time correction is saved for manager review. Hours will update when it is resolved."
                 conn.execute("INSERT INTO slack_clock_receipts VALUES (?,?,?,?)", (key, user.user_key, "", response))
                 return response, None
             if command in {"in", "back"} and user.user_key in self.handover_pending_user_keys:
@@ -266,8 +265,8 @@ class SlackTimekeeping:
         minutes, seconds = divmod(waiting["remaining_seconds"], 60)
         if waiting["remaining_seconds"]:
             return (f"{waiting['kind']}: {minutes:02d}:{seconds:02d} remaining. Return at {waiting['return_label']}. "
-                    "Stay off work until then. If you actually worked, report the real time; don't change it to look compliant.")
-        return "Minimum break time complete. Confirm your actual return; the timer does not restart work automatically."
+                    "Enjoy your break; reply `back` when you return.")
+        return "Break time complete. Reply `back` when you return to work."
 
     def _apply(self, conn: Any, user: UserProfile, session: SessionState,
                sessions: list[SessionState], command: str, detail: str, now: datetime,
@@ -283,7 +282,7 @@ class SlackTimekeeping:
         if command == "hours":
             state = "on lunch" if session.stage == "on_lunch_break" else "on paid rest" if running and session.metadata.get("slack_clock_rest_started_at") else "clocked in" if running else "clocked out"
             waiting = self.return_countdown(sessions, now)
-            return ("Handover pending · These DP totals exclude your Gusto records.\n" if user.user_key in self.handover_pending_user_keys else "") + f"You are {state}. Recorded work + paid rest: today {daily / 3600:.2f} h; this week {weekly / 3600:.2f} h ({self.zone.key})." + lunch_summary(session, self.zone) + "\n" + (self.return_message(waiting) + "\n" if waiting else "") + FALLBACK
+            return ("Handover pending · These DP totals exclude your Gusto records.\n" if user.user_key in self.handover_pending_user_keys else "") + f"You are {state}. Recorded work + paid rest: today {daily / 3600:.2f} h; this week {weekly / 3600:.2f} h ({self.zone.key})." + lunch_summary(session, self.zone) + ("\n" + self.return_message(waiting) if waiting else "")
         waiting = self.return_countdown(sessions, now)
         if command in {"in", "back"} and waiting and waiting["remaining_seconds"]:
             return self.return_message(waiting)
@@ -298,24 +297,24 @@ class SlackTimekeeping:
             session.metadata["slack_clock_beta"] = True
         if command == "in":
             if running:
-                return "You are already clocked in; no duplicate time was added. Use `hours` for totals or `back` after a break."
+                return "You are already clocked in. Use `hours` for totals or `back` after a break."
             remote = bool(re.match(r"remote\b", detail, re.I))
             if remote and user.worker_type != "admin" and not self._authorized(conn, user.user_key, "remote", now):
-                return "Remote work needs Erik's advance approval. No new work is authorized here. " + FALLBACK
+                return "Remote work needs Erik's advance approval. Ask Erik before starting offsite."
             if not remote and not re.match(r"onsite\b", detail, re.I):
                 if self.require_kiosk:
-                    return "Use your name and PIN at the shop Mini, or `clock in remote` within your approved window. " + FALLBACK
-                return "Reply `clock in onsite` to confirm you are at the shop. This is an attestation, not a location check. " + FALLBACK
+                    return "Use your name and PIN at the shop Mini, or `clock in remote` within your approved window."
+                return "Reply `clock in onsite` when you are at the shop."
             if not remote and self.require_kiosk and not kiosk_verified:
                 return "KIOSK_REQUIRED: confirm at the shop Mini."
             if over_limit:
-                return "The daily or weekly hours limit is reached. Stop work and contact Erik for authorization. " + FALLBACK
+                return "The daily or weekly hours limit is reached. Stop work and contact Erik for approval to continue."
             if session.metadata.get("slack_clock_meal_started_at"):
-                return "Reply `back` to record your actual meal return before restarting. " + FALLBACK
+                return "Reply `back` when you return from lunch."
             if session.metadata.get("slack_clock_rest_started_at"):
-                return "Reply `back` to record your actual return from rest, then clock in onsite. " + FALLBACK
+                return "Reply `back` when you return from rest, then follow the restart instructions."
             if user.meal_tracking_required and self._meal_due(session, now):
-                return "Take your meal break now: reply `lunch` when it actually starts. If the record is wrong, use `report hours`; do not invent a compliant time."
+                return "Take your meal break now. Reply `lunch` as you stop for your 30-minute off-duty meal."
             session.clocked_in_at = session.clocked_in_at or now.isoformat()
             session.clocked_out_at = None
             session.work_segments.append({"clocked_in_at": now.isoformat(), "clocked_out_at": None})
@@ -329,17 +328,17 @@ class SlackTimekeeping:
             session.metadata.pop("slack_clock_inactivity_warning_at", None)
             if len(detail.split(maxsplit=1)) == 2:
                 session.latest_plan = detail.split(maxsplit=1)[1]
-            return f"Clocked in at {now.astimezone(self.zone):%H:%M %Z}. Your hours are recording; no task selection is required. Tell me what you are doing when ready."
+            return f"Clocked in at {now.astimezone(self.zone):%H:%M %Z}. Tell me what you are working on and the next result."
         if command == "out":
             self._finish_meal(session, now)
             if rest := session.metadata.pop("slack_clock_rest_started_at", None):
                 session.metadata.setdefault("paid_rest_windows", []).append({"started_at": rest, "ended_at": now.isoformat(), "source": "worker_clock_out"})
             if not running:
                 session.stage = "clocked_out"
-                return "Already clocked out. No time was removed or duplicated. " + FALLBACK
+                return "Already clocked out."
             self._stop(session, now, "worker_clock_out")
             total = paid_seconds([session], now)
-            return f"Clocked out at {now.astimezone(self.zone):%H:%M %Z}. This shift-day records {total / 3600:.2f} hours of work + paid rest. No summary is required to stop the clock. " + FALLBACK
+            return f"Clocked out at {now.astimezone(self.zone):%H:%M %Z}. This shift-day records {total / 3600:.2f} hours of work + paid rest. Thanks for today's work."
         if command == "lunch":
             if session.stage == "on_lunch_break":
                 return "Your reported lunch is already running. Use `back` when it actually ends."
@@ -356,7 +355,7 @@ class SlackTimekeeping:
             return "Lunch recorded starting now. Stop all work and take at least 30 duty-free minutes. " + self.return_message(self.return_countdown([session], now))
         if command == "rest":
             if not running or session.stage == "on_lunch_break":
-                return "Start paid rest from an active shift, not an unpaid meal. " + FALLBACK
+                return "Start paid rest from an active shift, not an unpaid meal."
             if session.metadata.get("slack_clock_rest_started_at"):
                 return "Your paid rest is already running. Reply `back` when you return."
             session.metadata["slack_clock_rest_started_at"] = now.isoformat()
@@ -371,10 +370,10 @@ class SlackTimekeeping:
                 self._finish_meal(session, now)
                 if over_limit:
                     self._stop(session, now, "hours_limit")
-                    return "Meal ended; the hours limit prevents more authorized work. Contact Erik. " + FALLBACK
+                    return "Meal ended; the hours limit is reached. Contact Erik for approval to continue."
                 if session.metadata.get("slack_clock_location") == "approved_remote" and not self._authorized(conn, user.user_key, "remote", now):
                     self._stop(session, now, "remote_approval_expired")
-                    return "Meal ended; your remote authorization has expired. No further remote work is authorized. " + FALLBACK
+                    return "Meal ended; your remote authorization has expired. Contact Erik before continuing offsite."
                 if session.clocked_out_at:
                     session.clocked_out_at = None
                     session.work_segments.append({"clocked_in_at": now.isoformat(), "clocked_out_at": None})
@@ -385,10 +384,10 @@ class SlackTimekeeping:
                 session.metadata.setdefault("paid_rest_windows", []).append({"started_at": rest, "ended_at": now.isoformat(), "source": "worker_reported_return"})
                 if over_limit:
                     self._stop(session, now, "hours_limit")
-                    return "Rest ended; the hours limit prevents more authorized work. Contact Erik. " + FALLBACK
+                    return "Rest ended; the hours limit is reached. Contact Erik for approval to continue."
                 if session.metadata.get("slack_clock_location") == "approved_remote" and not self._authorized(conn, user.user_key, "remote", now):
                     self._stop(session, now, "remote_approval_expired")
-                    return "Rest ended; your remote authorization has expired. No further remote work is authorized. " + FALLBACK
+                    return "Rest ended; your remote authorization has expired. Contact Erik before continuing offsite."
                 if session.clocked_out_at:
                     if self.allow_slack_break_returns and session.metadata.get("slack_clock_stop_reason") == "rest_return_unconfirmed":
                         # Resume only this recorded break, never an unrelated ended
@@ -400,9 +399,9 @@ class SlackTimekeeping:
                         session.work_segments.append({"clocked_in_at": now.isoformat(), "clocked_out_at": None})
                         session.stage = "active"
                         session.metadata.pop("slack_clock_stop_reason", None)
-                        return "Rest return recorded; your clock resumed now. If you resumed work before this tap, report the actual return time so the gap can be corrected."
+                        return "Rest return recorded; your clock resumed now."
                     location = "remote" if session.metadata.get("slack_clock_location") in {"approved_remote", "company_management_remote"} else "onsite"
-                    return f"Your rest return is recorded, but the work clock stopped. Use `clock in {location}` to resume. " + FALLBACK
+                    return f"Your rest return is recorded. Use `clock in {location}` to resume."
                 return "Welcome back. Paid rest is recorded; your work clock kept running."
             return "No active break found. Use `hours` to check your clock or `report hours` to correct it."
         return HELP
@@ -443,10 +442,10 @@ class SlackTimekeeping:
                 continue
             session.metadata["slack_clock_return_ready_queued_for"] = identity
             remote = session.metadata.get("slack_clock_location") in {"approved_remote", "company_management_remote"}
-            instruction = ("Reply `back` when you actually return; any further remote work still needs valid approval."
+            instruction = ("Reply `back` when you return to work."
                            if remote or not self.require_kiosk or self.allow_slack_break_returns else
                            "When you actually return, select your name and enter your PIN at the shop Mini. No Slack reply needed.")
-            return (f"Your {label} is complete. {instruction} The minimum being complete does not restart work or override hours limits.", field, raw)
+            return (f"Your {label} is complete. {instruction}", field, raw)
         return None
 
     def _save_notices(self, conn: Any, user: UserProfile, session: SessionState,
@@ -491,9 +490,9 @@ class SlackTimekeeping:
             if reason:
                 self._stop(session, now, reason)
                 if reason == "rest_return_unconfirmed" and ready:
-                    notices.append(ready[0] + f" Your work clock paused at {now.astimezone(self.zone):%H:%M %Z} pending your return; time through then remains recorded. " + FALLBACK)
+                    notices.append(ready[0] + f" Your work clock paused at {now.astimezone(self.zone):%H:%M %Z} pending your return.")
                 else:
-                    notices.append(f"Stop work now: {reason.replace('_', ' ')}. Your clock stopped at {now.astimezone(self.zone):%H:%M %Z}; time through this notice remains recorded. " + ("Reply `lunch` when your meal actually begins. " if reason == "meal_due" else "") + (ready[0] + " " if ready else "") + FALLBACK)
+                    notices.append(f"Stop work now: {reason.replace('_', ' ')}. Your clock stopped at {now.astimezone(self.zone):%H:%M %Z}. " + ("Reply `lunch` as you begin your 30-minute off-duty meal. " if reason == "meal_due" else "") + (ready[0] if ready else ""))
             else:
                 meal_warning_key = "slack_clock_meal_warning_at" if worked < 9.5 * 3600 else "slack_clock_second_meal_warning_at"
                 expected = 1 if worked < 9.5 * 3600 else 2
@@ -511,11 +510,11 @@ class SlackTimekeeping:
                 if last and now - last >= timedelta(hours=4):
                     warning = timestamp(session.metadata.get("slack_clock_inactivity_warning_at"))
                     if not warning:
-                        notices.append("Still working? It has been four hours since your last message. Send a quick update; otherwise I will stop the clock in 15 minutes. " + FALLBACK)
+                        notices.append("Still working? It has been four hours since your last message. Send a quick update in the next 15 minutes to keep your clock running.")
                         session.metadata["slack_clock_inactivity_warning_at"] = now.isoformat()
                     elif now - warning >= timedelta(minutes=15):
                         self._stop(session, now, "inactivity_unconfirmed")
-                        notices.append("Stop work now: no response to the four-hour check. Your clock stopped now, not retroactively. " + FALLBACK)
+                        notices.append("Your clock stopped after the unanswered four-hour check. Stop work and check in again before continuing.")
             return self._save_notices(conn, user, session, notices, now, ready)
 
     def reports(self) -> list[dict[str, Any]]:

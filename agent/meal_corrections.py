@@ -11,10 +11,9 @@ from .models import SessionState
 from .slack_timekeeping import SlackTimekeeping, paid_seconds, timestamp, _union
 
 
-USAGE = ("To correct a completed lunch, send `fix lunch today 11:30am-12:15pm` "
-         "using your actual times, or replace today with YYYY-MM-DD. Times use the shop timezone. "
-         "I will show a preview before changing hours. For an interrupted/missed meal or uncertain times, "
-         "use `report hours` with what actually happened. Nothing has changed yet.")
+USAGE = ("Send `fix lunch today 11:30am-12:15pm` with your lunch times, or replace today "
+         "with YYYY-MM-DD. Times use the shop timezone. Review the preview, then confirm. "
+         "For a missed/interrupted meal or uncertain times, use `report hours`.")
 
 
 def parse_interval(text, now, zone):
@@ -79,7 +78,7 @@ class MealCorrections:
         for rest in meta.get("paid_rest_windows") or []:
             a, b = timestamp(rest.get("started_at")), timestamp(rest.get("ended_at"))
             if a and b and max(a, start) < min(b, end):
-                raise ValueError("That lunch overlaps recorded paid rest. Use report hours so paid rest is not silently deducted.")
+                raise ValueError("That lunch overlaps recorded paid rest. Use report hours for manager review.")
 
     def preview(self, user_key, start, end, *, now, source_report_id=None):
         day = start.astimezone(self.clock.zone).date().isoformat()
@@ -108,8 +107,8 @@ class MealCorrections:
             return (f"*Lunch correction preview — {day}*\n{description} with {start.astimezone(self.clock.zone):%I:%M %p}–{end.astimezone(self.clock.zone):%I:%M %p} ({self.clock.zone.key}), "
                     f"{(end-start).total_seconds()/60:g} minutes.\n"
                     f"Recorded shift-day work + paid rest: {before/3600:.2f} → {after/3600:.2f} h as of {now.astimezone(self.clock.zone):%H:%M}.\n"
-                    + ("Short meal: time remains paid pending review. " if short else "Confirm only if this was an off-duty meal with no work. ")
-                    + f"Reply `confirm lunch {token}` to apply, `cancel lunch` to cancel, or send corrected times. Preview expires in 30 minutes. Nothing has changed yet."), token
+                    + ("Short meal: time remains paid pending review. " if short else "Off-duty lunch. ")
+                    + f"Reply `confirm lunch {token}` to apply, `cancel lunch` to cancel, or send corrected times. Preview expires in 30 minutes."), token
 
     @staticmethod
     def _set_meal(session, start, end, token):
@@ -155,7 +154,7 @@ class MealCorrections:
                 conn.execute("UPDATE slack_clock_reports SET status='resolved' WHERE id=? AND user_key=?", (report_id, user_key))
             result = f"Lunch correction applied for {row['session_date']}: {start.astimezone(self.clock.zone):%I:%M %p}–{end.astimezone(self.clock.zone):%I:%M %p} ({self.clock.zone.key}). "
             result += ("Short meal remains paid pending review. " if end-start < timedelta(minutes=30) else "The off-duty meal is deducted once. ")
-            result += f"Recorded shift-day work + paid rest: {paid_seconds([session], now)/3600:.2f} h as of {now.astimezone(self.clock.zone):%H:%M}. Original record preserved. Your start/stop state is unchanged."
+            result += f"Recorded shift-day work + paid rest: {paid_seconds([session], now)/3600:.2f} h as of {now.astimezone(self.clock.zone):%H:%M}."
             conn.execute("UPDATE meal_correction_previews SET status='applied',result=? WHERE token=?", (result, token))
             return result, session
 

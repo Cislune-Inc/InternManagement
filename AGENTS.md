@@ -9,6 +9,12 @@
 
 ## Safety invariants
 
+- Worker-facing messages should be brief, friendly and directive: state the
+  action, timing and next step. Do not append repetitive legal disclaimers,
+  suggestions about fictional compliance, or actual-hours reporting boilerplate
+  to routine clock/break/work replies. Keep corrections easy to find in help and
+  relevant error/review flows; retain all underlying time and approval controls.
+
 - The coding assistant must not post to Slack or send email without Erik's explicit
   send instruction in the current request. Draft confirmation is not publication
   permission. Do not send general status noise. Hand off website, Drive or GitHub

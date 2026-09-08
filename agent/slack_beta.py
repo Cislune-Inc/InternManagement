@@ -161,7 +161,7 @@ async def handle_message(runtime: Any, event: dict[str, Any]) -> bool:
                 raise ValueError("Choose an active roster user_key; no approval was recorded.")
             reason = " ".join(parts[6:])
             ledger(runtime).authorize(target, kind, timestamp(start), timestamp(end), approver=slack_id, reason=reason, now=now)
-            response = "Advance authorization recorded for the specified worker, type and time window. Actual hours must still be recorded."
+            response = "Advance authorization recorded for the specified worker, type and time window."
         except (ValueError, TypeError) as exc:
             response = str(exc)
         await runtime.slack.post_message(slack_id, response)
@@ -174,7 +174,7 @@ async def handle_message(runtime: Any, event: dict[str, Any]) -> bool:
                 if response.startswith("KIOSK_REQUIRED"):
                     response = ("At the shop Mini, choose your name and enter your PIN to start a shift. Use `back` here for an existing lunch or rest. No phone or temporary code needed. "
                                 "For first-time setup, send `kiosk setup` here, then set your PIN on the Mini. "
-                                "Offsite work needs Erik's advance approval; use `clock in remote` if approved. " + FALLBACK)
+                                "Offsite work needs Erik's advance approval; use `clock in remote` if approved.")
             except ValueError as exc:
                 response, session = str(exc), None
             await runtime.slack.post_message(slack_id, response)

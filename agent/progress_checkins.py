@@ -67,8 +67,7 @@ class ProgressCheckins:
         return (f"Quick check-in on {project}, when you reach a stopping point: "
                 "what changed, what is blocked, or what will you finish next? One concrete sentence is enough; "
                 "include a company file/link if useful. You can type normally here. "
-                "Reply `snooze` for an hour of focus time. This progress prompt does not stop your clock "
-                "or change break, hours-limit, or inactivity rules. Nothing is posted to a channel without your preview and share action.")
+                "Reply `snooze` for an hour of focus time.")
 
 
 async def tick(runtime: Any, user: Any, session: Any, now: datetime) -> None:
