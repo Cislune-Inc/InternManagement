@@ -19,9 +19,10 @@ from .models import SessionState, UserProfile
 HELP = (
     "*Don Pollo time clock*\n"
     "`clock in onsite` · `clock out` · `lunch` · `back` · `break` · `hours`\n"
-    "Onsite start and meal return use your name and PIN at the shop Mini. "
+    "Start shifts at the shop Mini with your name and PIN. Lunch, paid rest and return are available here. "
     "You can add what you are doing after clock-in; task selection is not required. "
     "`report hours <date, actual start/end, breaks and what needs correcting>` saves an exception. "
+    "For a completed lunch correction, use `fix lunch today 11:30am-12:15pm` with your actual times, then confirm the preview. "
     "If DP fails, Slack Erik your actual hours. Do not use Gusto Kiosk."
 )
 FALLBACK = "If you worked outside the recorded interval, use `report hours` or Slack Erik the actual times; all work must be recorded."
@@ -71,6 +72,19 @@ def _union(bounds: list[tuple[datetime, datetime]]) -> list[tuple[datetime, date
     return merged
 
 
+def lunch_summary(session: SessionState, zone: ZoneInfo) -> str:
+    windows = session.metadata.get("lunch_windows") or []
+    details = []
+    for window in windows:
+        start, end = timestamp(window.get("started_at")), timestamp(window.get("ended_at"))
+        if start:
+            label = f"{start.astimezone(zone):%I:%M %p}–" + (f"{end.astimezone(zone):%I:%M %p}" if end else "in progress")
+            if window.get("paid_pending_review"):
+                label += " (paid pending review)"
+            details.append(label)
+    return f"\nLunch ({session.session_date}): " + ("; ".join(details) if details else "not recorded") + "."
+
+
 def paid_seconds(sessions: list[SessionState], now: datetime,
                  window_start: datetime | None = None, window_end: datetime | None = None) -> int:
     now = now.astimezone(timezone.utc)
@@ -109,9 +123,11 @@ class SlackTimekeeping:
     def __init__(self, state_store: Any, *, timezone_name: str = "America/Los_Angeles",
                  daily_limit_hours: float = 8, weekly_limit_hours: float = 40,
                  require_kiosk: bool = False,
+                 allow_slack_break_returns: bool = False,
                  handover_pending_user_keys: tuple[str, ...] = ()) -> None:
         self.store = state_store
         self.require_kiosk = require_kiosk
+        self.allow_slack_break_returns = allow_slack_break_returns
         self.handover_pending_user_keys = frozenset(handover_pending_user_keys)
         self.zone = ZoneInfo(timezone_name)
         self.daily_limit = daily_limit_hours * 3600
@@ -223,6 +239,7 @@ class SlackTimekeeping:
                      if user.user_key in self.handover_pending_user_keys else "")
                     + f"*{state}* · Today {daily / 3600:.2f} h · This week {weekly / 3600:.2f} h\n"
                     f"Recorded work + paid rest · {self.zone.key} · Updated {now.astimezone(self.zone):%H:%M}"
+                    + lunch_summary(session, self.zone)
                     + ("\n" + self.return_message(waiting) if waiting else ""))
 
     def return_countdown(self, sessions: list[SessionState], now: datetime) -> dict[str, Any] | None:
@@ -264,9 +281,9 @@ class SlackTimekeeping:
             daily >= self.daily_limit or weekly >= self.weekly_limit or self._seventh_day(sessions, now)
         )
         if command == "hours":
-            state = "on lunch" if session.stage == "on_lunch_break" else "clocked in" if running else "clocked out"
+            state = "on lunch" if session.stage == "on_lunch_break" else "on paid rest" if running and session.metadata.get("slack_clock_rest_started_at") else "clocked in" if running else "clocked out"
             waiting = self.return_countdown(sessions, now)
-            return ("Handover pending · These DP totals exclude your Gusto records.\n" if user.user_key in self.handover_pending_user_keys else "") + f"You are {state}. Recorded work + paid rest: today {daily / 3600:.2f} h; this week {weekly / 3600:.2f} h ({self.zone.key}).\n" + (self.return_message(waiting) + "\n" if waiting else "") + FALLBACK
+            return ("Handover pending · These DP totals exclude your Gusto records.\n" if user.user_key in self.handover_pending_user_keys else "") + f"You are {state}. Recorded work + paid rest: today {daily / 3600:.2f} h; this week {weekly / 3600:.2f} h ({self.zone.key})." + lunch_summary(session, self.zone) + "\n" + (self.return_message(waiting) + "\n" if waiting else "") + FALLBACK
         waiting = self.return_countdown(sessions, now)
         if command in {"in", "back"} and waiting and waiting["remaining_seconds"]:
             return self.return_message(waiting)
@@ -347,7 +364,7 @@ class SlackTimekeeping:
             session.metadata["slack_clock_return_kind"] = "Paid rest"
             return "Take 10 duty-free minutes of paid rest. No work or replies are needed during the break. " + self.return_message(self.return_countdown([session], now))
         if command == "back":
-            if (session.metadata.get("slack_clock_meal_started_at") or session.metadata.get("slack_clock_rest_started_at")) and self.require_kiosk and not kiosk_verified and session.metadata.get("slack_clock_location") not in {"approved_remote", "company_management_remote"}:
+            if (session.metadata.get("slack_clock_meal_started_at") or session.metadata.get("slack_clock_rest_started_at")) and self.require_kiosk and not self.allow_slack_break_returns and not kiosk_verified and session.metadata.get("slack_clock_location") not in {"approved_remote", "company_management_remote"}:
                 return "KIOSK_REQUIRED: confirm your return at the shop Mini."
             meal_start = timestamp(session.metadata.get("slack_clock_meal_started_at"))
             if meal_start:
@@ -373,6 +390,17 @@ class SlackTimekeeping:
                     self._stop(session, now, "remote_approval_expired")
                     return "Rest ended; your remote authorization has expired. No further remote work is authorized. " + FALLBACK
                 if session.clocked_out_at:
+                    if self.allow_slack_break_returns and session.metadata.get("slack_clock_stop_reason") == "rest_return_unconfirmed":
+                        # Resume only this recorded break, never an unrelated ended
+                        # shift. The unconfirmed gap stays reviewable, not invented.
+                        session.metadata.setdefault("slack_clock_return_gaps", []).append({
+                            "started_at": session.clocked_out_at, "ended_at": now.isoformat(),
+                            "status": "actual_work_unknown", "source": "rest_return"})
+                        session.clocked_out_at = None
+                        session.work_segments.append({"clocked_in_at": now.isoformat(), "clocked_out_at": None})
+                        session.stage = "active"
+                        session.metadata.pop("slack_clock_stop_reason", None)
+                        return "Rest return recorded; your clock resumed now. If you resumed work before this tap, report the actual return time so the gap can be corrected."
                     location = "remote" if session.metadata.get("slack_clock_location") in {"approved_remote", "company_management_remote"} else "onsite"
                     return f"Your rest return is recorded, but the work clock stopped. Use `clock in {location}` to resume. " + FALLBACK
                 return "Welcome back. Paid rest is recorded; your work clock kept running."
@@ -416,13 +444,15 @@ class SlackTimekeeping:
             session.metadata["slack_clock_return_ready_queued_for"] = identity
             remote = session.metadata.get("slack_clock_location") in {"approved_remote", "company_management_remote"}
             instruction = ("Reply `back` when you actually return; any further remote work still needs valid approval."
-                           if remote or not self.require_kiosk else
+                           if remote or not self.require_kiosk or self.allow_slack_break_returns else
                            "When you actually return, select your name and enter your PIN at the shop Mini. No Slack reply needed.")
             return (f"Your {label} is complete. {instruction} The minimum being complete does not restart work or override hours limits.", field, raw)
         return None
 
     def _save_notices(self, conn: Any, user: UserProfile, session: SessionState,
                       notices: list[str], now: datetime, ready: tuple[str, str, str] | None = None) -> tuple[list[str], SessionState | None]:
+        if notices:
+            session.metadata["slack_clock_last_notice_at"] = now.isoformat()
         if not notices:
             return [], None
         session.metadata["slack_clock_last_event_at"] = now.isoformat()

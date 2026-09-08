@@ -1535,8 +1535,8 @@ class InternManagementRuntime:
                     "Reply `snooze` to defer progress prompts for an hour.\n"
                     "At the Mini, choose your name and type your 2–6 digit PIN using the keyboard. "
                     "One-time setup: select Set up / reset PIN above, then choose your PIN on the Mini within ten minutes. "
-                    "Onsite meal returns also need the Mini; approved remote workers use `clock in remote`. "
-                    "For a correction, DM `report hours` with the actual date, times and breaks. "
+                    "Use `lunch`, `break` and `back` here for breaks within your shift; approved remote workers use `clock in remote`. "
+                    "To fix a completed lunch, DM `fix lunch today 11:30am-12:15pm` with your actual times, then confirm the preview. Other corrections use `report hours`. "
                     "If DP is unavailable, Slack Erik your actual hours—not Gusto Kiosk.\n\n" + COMPANY_HANDOFF
                 )}},
             ]}

@@ -66,7 +66,7 @@ def ledger(runtime: Any) -> SlackTimekeeping:
                     if (user := clock_user(runtime, actor)) is not None)
     return SlackTimekeeping(runtime.state_store, timezone_name=runtime.config.timezone,
                            daily_limit_hours=runtime.config.labor.overtime_limit_hours,
-                           require_kiosk=True, handover_pending_user_keys=pending)
+                           require_kiosk=True, allow_slack_break_returns=True, handover_pending_user_keys=pending)
 
 
 async def archive(runtime: Any, user: Any, session: Any, now: datetime) -> None:
@@ -120,6 +120,29 @@ async def handle_message(runtime: Any, event: dict[str, Any]) -> bool:
     if text.lower().startswith("kiosk "):
         await runtime.slack.post_message(slack_id, "Use `kiosk setup` with no name or PIN to open setup for your own identity. Enter PINs only on the Mini screen, never in chat.")
         return True
+    if re.match(r"^(?:fix lunch\b|confirm lunch\b|cancel lunch\b)", text, re.I):
+        from .meal_corrections import MealCorrections, parse_interval
+        async with runtime._user_session_lock(user.user_key):
+            service = ledger(runtime)
+            corrections = MealCorrections(service)
+            session = None
+            try:
+                if text.lower() == "cancel lunch":
+                    response = corrections.cancel(user.user_key)
+                elif match := re.fullmatch(r"confirm lunch ([0-9a-f]{8})", text, re.I):
+                    response, session = corrections.confirm(user.user_key, match[1].lower(), now=now)
+                else:
+                    start, end = parse_interval(text, now, service.zone)
+                    response, _ = corrections.preview(user.user_key, start, end, now=now)
+            except ValueError as exc:
+                response = str(exc)
+            await archive(runtime, user, session, now)
+            await runtime.slack.post_message(slack_id, response)
+        return True
+    if re.match(r"^(?:on lunch\b|(?:my )?lunch (?:was|since|from|at)\b|(?:i )?forgot (?:to (?:record|log) )?(?:my )?lunch\b)", text, re.I):
+        from .meal_corrections import USAGE
+        await runtime.slack.post_message(slack_id, "This looks like a lunch-time report, not a project update. " + USAGE + " If your lunch is starting now, send `lunch`.")
+        return True
     if await handle_work_sharing(runtime, slack_id, text):
         return True
     if text.lower().startswith(("hours add ", "hours resolve ", "hours reports")):
@@ -149,7 +172,7 @@ async def handle_message(runtime: Any, event: dict[str, Any]) -> bool:
             try:
                 response, session = ledger(runtime).handle(user, *command, event_id=event_id, now=now)
                 if response.startswith("KIOSK_REQUIRED"):
-                    response = ("At the shop Mini, choose your name and enter your PIN to start or return to work. No phone or temporary code needed. "
+                    response = ("At the shop Mini, choose your name and enter your PIN to start a shift. Use `back` here for an existing lunch or rest. No phone or temporary code needed. "
                                 "For first-time setup, send `kiosk setup` here, then set your PIN on the Mini. "
                                 "Offsite work needs Erik's advance approval; use `clock in remote` if approved. " + FALLBACK)
             except ValueError as exc:

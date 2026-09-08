@@ -54,3 +54,12 @@ def test_meal_and_not_clocked_in_never_prompt(tmp_path):
     session.stage = "on_lunch_break"
     assert service.claim("WORKER", session, start + timedelta(hours=3)) is None
     assert service.claim("WORKER", None, start) is None
+
+
+def test_work_prompt_does_not_stack_on_clock_notice(tmp_path):
+    store, start, session = setup(tmp_path)
+    service = ProgressCheckins(store)
+    session.metadata["slack_clock_last_notice_at"] = (start + timedelta(hours=2)).isoformat()
+    assert service.claim("WORKER", session, start + timedelta(hours=2)) is None
+    assert service.claim("WORKER", session, start + timedelta(hours=2, minutes=29)) is None
+    assert service.claim("WORKER", session, start + timedelta(hours=2, minutes=30))

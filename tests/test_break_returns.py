@@ -141,5 +141,5 @@ def test_runtime_notice_is_private_retryable_and_not_an_admin_alert(runtime):
     asyncio.run(tick(runtime, user, at(11, 32)))
     assert len(runtime.test_sent) == 1
     assert runtime.test_sent[0][0] == "WORKER"
-    assert "shop Mini" in runtime.test_sent[0][1]
+    assert "Reply `back`" in runtime.test_sent[0][1]
     assert service.pending_notices(user.user_key) == []

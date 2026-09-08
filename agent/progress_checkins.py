@@ -33,6 +33,9 @@ class ProgressCheckins:
                 or session.metadata.get("slack_clock_meal_started_at")):
             return None
         now = now.astimezone(timezone.utc)
+        clock_notice = timestamp(session.metadata.get("slack_clock_last_notice_at"))
+        if clock_notice and now - clock_notice < timedelta(minutes=30):
+            return None  # Do not stack a work prompt on a break/attendance notice.
         anchors = [timestamp(session.clocked_in_at)]
         for segment in session.work_segments:
             if not segment.get("clocked_out_at"):

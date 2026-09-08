@@ -113,7 +113,7 @@ def test_slack_setup_cannot_target_someone_else_or_start_time(runtime):
         assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
 
 
-def test_kiosk_clock_and_meal_return_require_presence_but_out_does_not(runtime):
+def test_kiosk_start_required_but_existing_meal_return_and_out_allow_slack(runtime):
     clock, user = ledger(runtime), runtime.roster_by_key["worker"]
     now = datetime.fromisoformat("2026-09-07T09:00:00-07:00")
     def act(command, hours=0, detail="", verified=False):
@@ -123,8 +123,9 @@ def test_kiosk_clock_and_meal_return_require_presence_but_out_does_not(runtime):
     assert "advance approval" in act("in", detail="remote", hours=.01)[0]
     assert "Clocked in" in act("in", detail="onsite", verified=True, hours=.02)[0]
     act("lunch", 3)
-    assert "KIOSK_REQUIRED" in act("back", 3.5)[0]
-    assert "running again" in act("back", 3.5, verified=True)[0]
+    assert "remaining" in act("back", 3.4)[0]
+    assert "running again" in act("back", 3.5)[0]
+    assert "No active break" in act("back", 3.5, verified=True)[0]
     assert "Clocked out" in act("out", 4)[0]
 
 

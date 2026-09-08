@@ -14,7 +14,7 @@
   permission. Do not send general status noise. Hand off website, Drive or GitHub
   links rather than local Markdown/text files. Runtime private replies to worker
   actions and accepted clock notices are separate from assistant announcements.
-- Onsite clock-in, meal return and paid-rest return require confirmation at the Mini's loopback-only
+- Onsite clock-in requires confirmation at the Mini's loopback-only
   kiosk, not a Slack self-attestation, GPS claim, QR link or VPN source address.
   Use name + personal PIN, not temporary Slack codes. PINs are salted/scrypt-hashed;
   accept 2–6 digits with four or more recommended and keyboard entry, no onscreen
@@ -24,6 +24,12 @@
   Keep the owner company-management remote exception visible; staff remote work
   still requires Erik's time-bounded advance approval. Remote desktop/SSH access
   to the kiosk must remain limited to trusted administrators.
+  September 8 afternoon supersedes kiosk-only break returns: Slack lunch/rest/back
+  may resume an existing recorded break after minimum-time and authorization
+  checks. New shifts still require the kiosk or approved remote path. Preserve
+  clock-out and actual-hours reporting as safety fallbacks. Completed lunch edits
+  require actor-bound, expiring previews, explicit confirmation and original-record
+  audit; never infer an unpaid meal from an expected schedule or model output.
 - Block early return for 10-minute paid rest and 30-minute lunch only, not early
   scheduled shift starts. Queue one private Slack readiness notice per break;
   no reply is required during rest and no timer automatically resumes work.
