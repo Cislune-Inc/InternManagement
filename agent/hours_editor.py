@@ -241,12 +241,52 @@ def _coerce_segments(value: Any) -> list[dict[str, Any]]:
     return [item for item in value if isinstance(item, dict)]
 
 
-def build_request_handler(service: HoursEditorService) -> type[BaseHTTPRequestHandler]:
+def build_request_handler(service: HoursEditorService, *, manager_key: str | None = None) -> type[BaseHTTPRequestHandler]:
+    from .manager_auth import authorized, load_key
+    key = manager_key if manager_key is not None else load_key()
     class HoursEditorHandler(BaseHTTPRequestHandler):
         server_version = "InternManagementHoursEditor/1.0"
 
-        def do_GET(self) -> None:  # noqa: N802
+        def _access(self) -> bool:
             parsed = urlparse(self.path)
+            host = urlparse("http://" + self.headers.get("Host", ""))
+            if (self.client_address[0] != "127.0.0.1" or host.hostname not in {"127.0.0.1", "localhost"}
+                    or host.username or host.password or host.path or host.query or host.fragment):
+                self._respond_error(HTTPStatus.FORBIDDEN, "Use the local manager address through SSH.")
+                return False
+            if self.command == "GET" and parsed.path == "/livez" and not parsed.query:
+                return True  # Process readiness only; no operational/personnel data.
+            if parsed.path not in {"/portal", "/api/portal-data", "/api/portal/action"}:
+                if not authorized(self.headers.get("Authorization", ""), key):
+                    self.send_response(HTTPStatus.UNAUTHORIZED)
+                    self.send_header("WWW-Authenticate", 'Basic realm="Don Pollo manager", charset="UTF-8"')
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return False
+            if self.command == "POST":
+                origin = self.headers.get("Origin")
+                if origin is not None and origin != "http://" + self.headers.get("Host", ""):
+                    self._respond_error(HTTPStatus.FORBIDDEN, "Cross-origin changes are not allowed.")
+                    return False
+                if self.headers.get_content_type() != "application/json":
+                    self._respond_error(HTTPStatus.BAD_REQUEST, "Use application/json.")
+                    return False
+            return True
+
+        def end_headers(self) -> None:
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            super().end_headers()
+
+        def do_GET(self) -> None:  # noqa: N802
+            if not self._access():
+                return
+            parsed = urlparse(self.path)
+            if parsed.path == "/livez":
+                self._respond_json({"ready": True})
+                return
             query = parse_qs(parsed.query)
             token = str((query.get("token") or [""])[0])
             if parsed.path in {"/", "/time"}:
@@ -302,6 +342,8 @@ def build_request_handler(service: HoursEditorService) -> type[BaseHTTPRequestHa
             self._respond_error(HTTPStatus.NOT_FOUND, "Not found.")
 
         def do_POST(self) -> None:  # noqa: N802
+            if not self._access():
+                return
             parsed = urlparse(self.path)
             query = parse_qs(parsed.query)
             token = str((query.get("token") or [""])[0])
@@ -345,6 +387,8 @@ def build_request_handler(service: HoursEditorService) -> type[BaseHTTPRequestHa
 
         def _read_json_body(self) -> dict[str, Any]:
             length = int(self.headers.get("Content-Length") or "0")
+            if length < 0 or length > 65536 or self.headers.get("Transfer-Encoding"):
+                raise ValueError("Invalid request body size or encoding.")
             raw = self.rfile.read(length)
             try:
                 loaded = json.loads(raw.decode("utf-8") or "{}")
@@ -412,6 +456,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
+    if args.host not in {"127.0.0.1", "localhost"}:
+        raise SystemExit("Manager dashboard must bind to loopback; use an SSH tunnel for remote access.")
     load_dotenv()
     runtime = InternManagementRuntime()
     try:

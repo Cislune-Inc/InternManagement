@@ -6,7 +6,12 @@ import os
 import plistlib
 import re
 import subprocess
+import shutil
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 MODULES = {"bot": "agent.main", "time-tracking": "agent.hours_editor",
            "integration-health": "agent.integration_health"}
@@ -38,9 +43,30 @@ def restart(repo: Path, service: str, agents: Path, *, uid: int,
     # macOS variants print either the boolean `true` or the word `disabled`.
     is_disabled = bool(re.search(r'"' + re.escape(label) + r'"\s*=>\s*(?:true|disabled)\b', disabled.stdout))
     loaded = call("print", target).returncode == 0
+    if is_disabled and not enable_disabled:
+        raise ValueError("DP service is disabled; verify the candidate/cohort then explicitly use --enable-disabled.")
+    if service == "time-tracking":
+        args = list(payload["ProgramArguments"])
+        changed = False
+        if "--host" in args:
+            pos = args.index("--host") + 1
+            if pos >= len(args):
+                raise ValueError("Incomplete dashboard host argument")
+            changed = args[pos] != "127.0.0.1"
+            args[pos] = "127.0.0.1"
+        else:
+            args.extend(["--host", "127.0.0.1"])
+            changed = True
+        if changed:
+            from agent.persistence import atomic_write_text
+            backup = plist.with_name(plist.name + ".before-manager-guard-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"))
+            shutil.copy2(plist, backup)
+            payload["ProgramArguments"] = args
+            atomic_write_text(plist, plistlib.dumps(payload).decode())
+            if loaded:
+                require(call("bootout", target), "bootout")
+                loaded = False
     if is_disabled:
-        if not enable_disabled:
-            raise ValueError("DP service is disabled; verify the candidate/cohort then explicitly use --enable-disabled.")
         require(call("enable", target), "enable")
     if not loaded:
         require(call("bootstrap", domain, str(plist)), "bootstrap")

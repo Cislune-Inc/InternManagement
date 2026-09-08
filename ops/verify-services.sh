@@ -9,7 +9,7 @@ launchctl print "gui/${uid}/com.pm.internmanagement.bot" | grep -q "state = runn
 launchctl print "gui/${uid}/com.pm.internmanagement.time-tracking" | grep -q "state = running"
 launchctl print "gui/${uid}/com.pm.internmanagement.backup" >/dev/null
 launchctl print "gui/${uid}/com.pm.internmanagement.integration-health" >/dev/null
-curl --fail --silent --show-error --output /dev/null "http://127.0.0.1:8765/health"
+curl --fail --silent --show-error --output /dev/null "http://127.0.0.1:8765/livez"
 lock_path="${repo_root}/data/agent.lock"
 stdout_log="${repo_root}/data/launchd.stdout.log"
 slack_only="$("${repo_root}/.venv/bin/python" -c 'import json,sys; print("yes" if json.load(open(sys.argv[1])).get("slack",{}).get("work_intake_beta_slack_user_ids") else "no")' "${repo_root}/config/agent.config.json")"

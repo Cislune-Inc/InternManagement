@@ -113,6 +113,7 @@ else
 fi
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python -m compileall -q agent
+PYTHONPATH=. .venv/bin/python ops/protect_manager.py --apply
 .venv/bin/python ops/apply_production_controls.py --apply "${controls_args[@]}"
 if [[ "${primary_admin_only}" == "1" ]]; then
   PYTHONPATH=. .venv/bin/python ops/enable_slack_clock_beta.py --primary-admin-only --apply "${enrollment_args[@]}"

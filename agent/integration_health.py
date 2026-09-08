@@ -14,6 +14,7 @@ import requests
 from dotenv import load_dotenv
 
 from .persistence import atomic_write_json
+from .manager_auth import local_headers
 from .runtime import InternManagementRuntime
 
 _DEFAULT_DASHBOARD_URL = "http://127.0.0.1:8765/api/health"
@@ -40,6 +41,7 @@ async def run_integration_checks(
             "dashboard",
             "GET",
             dashboard_url,
+            headers=local_headers(dashboard_url),
             request=request,
         ),
         _http_check(

@@ -56,6 +56,14 @@
 
 ## Verification
 
+The manager editor is loopback-only and requires its private credential even from
+localhost. Access it remotely through trusted SSH, never expose Basic auth on the
+LAN. `/livez` is process readiness only; detailed `/health` and `/api/health` remain
+authenticated. Do not confuse a passing liveness check with bot/integration health.
+Keep config/data/storage/backups/secrets private to the service account. Standard
+kiosk users must not gain SSH/screen-sharing or manager access. Owner remote clock
+authorization remains independent of these manager-web controls.
+
 Run from the repository root:
 
 ```bash
@@ -67,7 +75,7 @@ For production verification on the Mac mini:
 
 ```bash
 ops/verify-services.sh
-curl --fail --silent http://127.0.0.1:8765/health
+PYTHONPATH=. .venv/bin/python ops/print-health-summary.py
 ```
 
 The Mini was verified at `192.168.40.177` on September 7. Revalidate its saved SSH

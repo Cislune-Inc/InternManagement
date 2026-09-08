@@ -48,7 +48,7 @@ PY
     && { [[ -z "${old_pid}" ]] || [[ "${lock_pid}" != "${old_pid}" ]]; } \
     && kill -0 "${lock_pid}" 2>/dev/null \
     && ps -p "${lock_pid}" -o command= | grep -q -- "agent.main" \
-    && curl --fail --silent --output /dev/null "http://127.0.0.1:8765/health"; then
+    && curl --fail --silent --output /dev/null "http://127.0.0.1:8765/livez"; then
     ready=true
     break
   fi
