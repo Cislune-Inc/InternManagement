@@ -73,3 +73,18 @@ def test_manager_host_migration_preserves_disabled_gate(tmp_path, disabled):
         restart(tmp_path, "time-tracking", tmp_path, uid=501, run=run)
         assert plistlib.loads(path.read_bytes())["ProgramArguments"][-1] == "127.0.0.1"
         assert calls[-3:] == ["bootout", "bootstrap", "kickstart"]
+
+
+def test_bootstrap_eio_retries_are_bounded(tmp_path):
+    setup(tmp_path)
+    attempts = []
+    pauses = []
+    def run(args, **kwargs):
+        operation = args[1]
+        if operation == "bootstrap":
+            attempts.append(operation)
+        return SimpleNamespace(returncode=5 if operation == "bootstrap" else 1 if operation == "print" else 0,
+                               stdout="", stderr="not printed")
+    with pytest.raises(RuntimeError, match="bootstrap failed"):
+        restart(tmp_path, "bot", tmp_path, uid=501, run=run, sleep=pauses.append)
+    assert len(attempts) == 3 and pauses == [2, 2]

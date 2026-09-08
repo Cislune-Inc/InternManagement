@@ -8,6 +8,7 @@ import re
 import subprocess
 import shutil
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,7 +19,7 @@ MODULES = {"bot": "agent.main", "time-tracking": "agent.hours_editor",
 
 
 def restart(repo: Path, service: str, agents: Path, *, uid: int,
-            enable_disabled: bool = False, run=subprocess.run) -> None:
+            enable_disabled: bool = False, run=subprocess.run, sleep=time.sleep) -> None:
     if service not in MODULES:
         raise ValueError("Unknown DP service; no launchd changes made.")
     label = "com.pm.internmanagement." + service
@@ -69,7 +70,14 @@ def restart(repo: Path, service: str, agents: Path, *, uid: int,
     if is_disabled:
         require(call("enable", target), "enable")
     if not loaded:
-        require(call("bootstrap", domain, str(plist)), "bootstrap")
+        # launchd can return EIO while a just-booted-out job is still unloading.
+        # Retry only that transient code, bounded; never hide final failure.
+        for attempt in range(3):
+            result = call("bootstrap", domain, str(plist))
+            if result.returncode != 5 or attempt == 2:
+                require(result, "bootstrap")
+                break
+            sleep(2)
     # bootstrap can launch RunAtLoad jobs; kickstart provides a definite current
     # restart before the caller's process/socket verification.
     require(call("kickstart", "-k", target), "kickstart")
