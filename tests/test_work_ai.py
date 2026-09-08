@@ -26,6 +26,8 @@ def test_openai_request_is_structured_bounded_and_cached(tmp_path):
     assert len(calls) == 1
     assert calls[0]["store"] is False
     assert calls[0]["text"]["format"]["strict"] is True
+    assert calls[0]["reasoning"] == {"effort": "low"}
+    assert calls[0]["max_output_tokens"] == 2048
     assert "tools" not in calls[0]
     with store._connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
@@ -37,6 +39,7 @@ def test_api_failure_and_refusal_leave_clock_usable(tmp_path):
 
     ai = WorkAI(StateStore(tmp_path / "state.sqlite3"), SimpleNamespace(responses=SimpleNamespace(create=create)))
     assert asyncio.run(ai.coach("W", "test wheel")) is None
+    assert ai.last_outcome == "timeout"
 
 
 def test_unknown_model_fields_cannot_become_clock_or_approval_actions(tmp_path):
@@ -58,3 +61,16 @@ def test_budget_is_reserved_even_on_failure(tmp_path):
     for index in range(21):
         asyncio.run(ai.coach("W", f"unique {index}"))
     assert len(calls) == 20
+    assert ai.last_outcome == "budget_limited"
+
+
+def test_incomplete_is_distinguishable_without_logging_note(tmp_path, caplog):
+    async def create(**kwargs):
+        return SimpleNamespace(status="incomplete", output_text="")
+
+    ai = WorkAI(StateStore(tmp_path / "state.sqlite3"), SimpleNamespace(responses=SimpleNamespace(create=create)))
+    with caplog.at_level("INFO", logger="agent.work_ai"):
+        assert asyncio.run(ai.coach("W", "private worker text")) is None
+    assert ai.last_outcome == "incomplete"
+    assert "outcome=incomplete" in caplog.text
+    assert "private worker text" not in caplog.text

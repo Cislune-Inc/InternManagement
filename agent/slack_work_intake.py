@@ -28,6 +28,8 @@ PROJECTS = {
     "dp": "Don Pollo and company software",
     "irad": "IRAD — intentional internal research and development; approval required",
     "exploration": "Exploration: Gweike, eufyMake, BrightDrop or another proposed idea",
+    "mars_to_table": "Mars to Table competition",
+    "lunarecycle": "LunaRecycle closeout",
 }
 _BOUNDARY = (
     "Your work description does not start or stop your clock. Use `clock in onsite`, `clock out`, or `hours` here in Slack. "
@@ -53,7 +55,20 @@ def _safe(text: Any) -> str:
 
 
 def project_candidates(text: str) -> list[str]:
-    return [key for key in PROJECTS if re.search(rf"\b{key}\b", text, re.I)]
+    aliases = {"dp": r"don\s+pollo|clickup\s+replacement", "mars_to_table": r"mars\s+to\s+table",
+               "lunarecycle": r"luna\s*recycle"}
+    return [key for key in PROJECTS if re.search(rf"\b(?:{key}|{aliases.get(key, key)})\b", text, re.I)]
+
+
+def switch_target(text: str) -> str | None:
+    """Only explicit current self-reported switches, not options or future plans."""
+    if re.search(r"\b(if|might|could|should|considering|tomorrow|later)\b|\?", text, re.I):
+        return None
+    match = re.search(
+        r"(?:^|\b(?:i(?:['’]m| am)?|am)\s+)(?:now\s+)?"
+        r"(?:switching|shifting|moving)(?:\s+now)?\s+to\s+(?:work(?:ing)?\s+on\s+)?(.+)$",
+        text.strip(), re.I)
+    return match[1].strip() if match else None
 
 
 def follow_up(text: str, previous: str = "") -> str:
@@ -140,6 +155,12 @@ class SlackWorkIntake:
             "SELECT * FROM work_intake_items WHERE owner_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
             (actor,),
         ).fetchone()
+        # A reported change of focus is a new pending work record, not another
+        # observation silently appended to a previously approved project.
+        target = switch_target(content if command == "update" else body)
+        if target and command not in {"approve", "redirect", "project", "edit", "detail", "next"}:
+            body = content if command == "update" else body
+            command = "proposal"
         if command == "options":
             rows = conn.execute(
                 "SELECT * FROM work_intake_items WHERE owner_id=? AND status='approved' ORDER BY updated_at DESC LIMIT 5",
@@ -184,7 +205,7 @@ class SlackWorkIntake:
             elif len(content.split()) >= 5 and "wording is unchanged" not in question:
                 question = "Update me when the result changes, you need help, or you want to change direction."
             return f"Saved to `{item['id']}`; original wording preserved.\n{question}"
-        project_matches = project_candidates(body)
+        project_matches = project_candidates(target if target else body)
         project = project_matches[0] if len(project_matches) == 1 else ""
         item_id = "DP-" + hashlib.sha256(key.encode()).hexdigest()[:12]
         conn.execute("INSERT INTO work_intake_items VALUES (?, ?, ?, ?, 'pending', 1, ?, ?)",
@@ -192,6 +213,8 @@ class SlackWorkIntake:
         self._append(conn, item_id, actor, "proposal", body, now)
         question = follow_up(body) if project else "Which project or overhead area is this for? Use `work project <name or 1–5>`; your description is saved."
         label = PROJECTS.get(project, "Project needs confirmation")
+        if target and project:
+            question = f"What do you want to have ready next for {_safe(label)}?"
         return f"Saved `{item_id}` under {_safe(label)} for alignment review.\n{question}\n{_BOUNDARY}"
 
     @staticmethod
@@ -274,6 +297,46 @@ class SlackWorkIntake:
     def has_item(self, actor_id: str) -> bool:
         with self.store._connect() as conn:
             return conn.execute("SELECT 1 FROM work_intake_items WHERE owner_id=? LIMIT 1", (actor_id,)).fetchone() is not None
+
+    def coaching_context(self, actor_id: str, item_id: str) -> dict[str, Any]:
+        """Bounded current work only; never another person's notes or clock data."""
+        with self.store._connect() as conn:
+            item = conn.execute("SELECT * FROM work_intake_items WHERE owner_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1", (actor_id,)).fetchone()
+            if not item or item["id"] != item_id:
+                return {}
+            rows = conn.execute("SELECT kind,text FROM work_intake_events WHERE item_id=? AND actor_id=? AND kind IN ('proposal','detail','update','edit','next') ORDER BY id DESC LIMIT 5",
+                                (item_id, actor_id)).fetchall()
+            return {"project": PROJECTS.get(item["project_key"], "Project unconfirmed"),
+                    "status": item["status"], "revision": item["revision"],
+                    "recent_notes": [{"kind": row["kind"], "text": row["text"][:700]} for row in reversed(rows)]}
+
+    def repair_latest_switch(self, actor_id: str, source_event_id: str) -> str:
+        """Operator repair of one verified old switch; no sends or clock access."""
+        source_time = datetime.fromtimestamp(float(source_event_id), timezone.utc).isoformat()
+        key = f"{actor_id}:focus-repair:{source_event_id}"
+        with self.store._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            done = conn.execute("SELECT response FROM work_intake_receipts WHERE event_key=?", (key,)).fetchone()
+            if done:
+                return done[0]
+            source = conn.execute("SELECT 1 FROM work_intake_receipts WHERE event_key=?", (f"{actor_id}:{source_event_id}",)).fetchone()
+            event = conn.execute("SELECT * FROM work_intake_events WHERE actor_id=? ORDER BY id DESC LIMIT 1", (actor_id,)).fetchone()
+            item = conn.execute("SELECT * FROM work_intake_items WHERE owner_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1", (actor_id,)).fetchone()
+            if (not source or not event or not item or event["kind"] != "update"
+                    or event["created_at"] != source_time or event["item_id"] != item["id"]
+                    or datetime.fromisoformat(item["created_at"]) > datetime.fromisoformat(source_time)):
+                raise ValueError("Source is not the latest recorded work update; review without rewriting newer work.")
+            target = switch_target(event["text"])
+            if not target or len(project_candidates(target)) != 1:
+                raise ValueError("Source does not establish one explicit current destination.")
+            response = self._dispatch(conn, actor_id, item["owner_name"], False, "work " + event["text"], key, source_time)
+            new_id = "DP-" + hashlib.sha256(key.encode()).hexdigest()[:12]
+            self._append(conn, new_id, "operator_repair", "focus_repair",
+                         json.dumps({"source_item": item["id"], "source_event_id": source_event_id,
+                                     "source_row": event["id"], "reason": "explicit switch previously appended to old focus"}),
+                         datetime.now(timezone.utc).isoformat())
+            conn.execute("INSERT INTO work_intake_receipts VALUES (?,?)", (key, response))
+            return response
 
     def attach_ai_draft(self, item_id: str, actor_id: str, result: dict[str, Any]) -> None:
         text = json.dumps(result, sort_keys=True)

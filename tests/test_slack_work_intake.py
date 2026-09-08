@@ -56,6 +56,68 @@ def test_short_specific_work_does_not_need_word_padding():
     assert project_candidates("I am clasping this fixture") == []
 
 
+def test_explicit_switch_creates_new_pending_focus_preserving_approved_work(intake):
+    old = item_id(send(intake, "work dp: improve the internal dashboard"))
+    send(intake, f"work approve {old} 1 agreed scope", event="approve", manager=True)
+    text = "I'm working on internal software, but am shifting now to work on Mars to Table"
+    reply = send(intake, "work update " + text, event="switch")
+    new = item_id(reply)
+    assert new != old
+    assert "What do you want to have ready" in reply
+    assert send(intake, "work update " + text, event="switch") == reply
+    with intake.store._connect() as conn:
+        assert conn.execute("SELECT status FROM work_intake_items WHERE id=?", (old,)).fetchone()[0] == "approved"
+        row = conn.execute("SELECT project_key,status FROM work_intake_items WHERE id=?", (new,)).fetchone()
+        assert tuple(row) == ("mars_to_table", "pending")
+        assert conn.execute("SELECT text FROM work_intake_events WHERE item_id=?", (new,)).fetchone()[0] == text
+        assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
+    send(intake, "work update Finish the judges presentation outline", event="followup")
+    context = intake.coaching_context("WORKER", new)
+    assert len(context["recent_notes"]) == 2
+    assert context["recent_notes"][-1]["text"] == "Finish the judges presentation outline"
+    assert intake.coaching_context("OTHER", new) == {}
+    assert intake.coaching_context("WORKER", old) == {}
+
+
+@pytest.mark.parametrize("text", ["Could I switch to CISORT?", "I might be switching to CISORT", "Tomorrow I am switching to CISORT", "I am not switching to CISORT", "If I am switching to CISORT I need approval"])
+def test_possible_or_negated_switch_does_not_select_new_focus(intake, text):
+    old = item_id(send(intake, "work dp: improve the dashboard"))
+    assert item_id(send(intake, "work update " + text, event="update")) == old
+
+
+def test_current_switch_alias_and_unknown_destination(intake):
+    assert project_candidates("Don Pollo") == ["dp"]
+    assert project_candidates("LunaRecycle") == ["lunarecycle"]
+    send(intake, "work dp: improve the dashboard")
+    reply = send(intake, "work update Switching to a new unnamed effort", event="switch")
+    assert "Which project" in reply
+    assert intake.coaching_context("WORKER", item_id(reply))["project"] == "Project unconfirmed"
+
+
+def test_repair_old_switch_is_source_checked_audited_idempotent_and_no_hours(intake):
+    from datetime import timezone
+    old = item_id(intake.handle(actor_id="WORKER", actor_name="Worker", is_manager=False,
+        text="work dp: improve the dashboard", event_id="old",
+        now=datetime.fromisoformat("2026-09-08T15:00:00+00:00")))
+    source = "1788900000.123456"
+    moment = datetime.fromtimestamp(float(source), timezone.utc).isoformat()
+    # Reproduce the pre-fix record without passing through today's switch parser.
+    with intake.store._connect() as conn:
+        conn.execute("INSERT INTO work_intake_receipts VALUES (?,?)", ("WORKER:" + source, "Saved to old work"))
+        intake._append(conn, old, "WORKER", "update", "I am shifting now to work on Mars to Table", moment)
+    reply = intake.repair_latest_switch("WORKER", source)
+    assert intake.repair_latest_switch("WORKER", source) == reply
+    with intake.store._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM work_intake_items").fetchone()[0] == 2
+        assert conn.execute("SELECT COUNT(*) FROM work_intake_events WHERE kind='focus_repair'").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
+    assert intake.coaching_context("WORKER", item_id(reply))["project"] == "Mars to Table competition"
+    with pytest.raises(ValueError):
+        intake.repair_latest_switch("OTHER", source)
+    with pytest.raises(ValueError):
+        intake.repair_latest_switch("WORKER", "1788900001.123456")
+
+
 def test_approvals_require_manager_revision_and_reason(intake):
     ident = item_id(send(intake, "work shop: label the tool drawers"))
     assert "Only configured" in send(intake, f"work approve {ident} 1 yes", event="2")

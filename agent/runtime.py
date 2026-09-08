@@ -1475,8 +1475,13 @@ class InternManagementRuntime:
 
                 # Acknowledge the durable original before any optional network
                 # request. If enrichment fails, the worker already has a receipt.
-                await self.slack.post_message(slack_user_id, response.split("\n", 1)[0])
+                match = re.search(r"DP-[0-9a-f]{12}", response)
+                work_context = intake.coaching_context(slack_user_id, match[0]) if match else {}
+                receipt = ("Saved your update for " + _safe(work_context["project"]) + "."
+                           if work_context and work_context["project"] != "Project unconfirmed" else "Saved your update.")
+                await self.slack.post_message(slack_user_id, receipt)
                 context = "No controlling contract/accepted plan supplied. Alignment remains unverified."
+                context += "\nCurrent worker-owned work record: " + json.dumps(work_context)
                 if worker and getattr(self, "clickup", None):
                     try:
                         tasks = await asyncio.wait_for(self.clickup.list_assigned_tasks(worker, limit=5), timeout=3)
@@ -1487,19 +1492,22 @@ class InternManagementRuntime:
                     except Exception:
                         context += "\nClickUp unavailable; hours and original note were saved independently."
                 draft = await WorkAI(self.state_store).coach(slack_user_id, text, context=context)
+                if match and intake.coaching_context(slack_user_id, match[0]) != work_context:
+                    return True  # A newer note/switch supersedes this delayed reply.
                 if not draft:
-                    await self.slack.post_message(slack_user_id, "AI assistance is unavailable for this note; your original is saved.\n" + response.partition("\n")[2])
+                    from .slack_work_intake import _BOUNDARY
+                    fallback = response.partition("\n")[2].replace("\n" + _BOUNDARY, "")
+                    if fallback:
+                        await self.slack.post_message(slack_user_id, fallback)
                     return True
                 if draft:
-                    match = re.search(r"DP-[0-9a-f]{12}", response)
                     if match:
                         intake.attach_ai_draft(match[0], slack_user_id, draft)
-                    response = (f"`{match[0]}` " if match else "") + "*AI draft—not work approval:* " + _safe(draft["summary"])
+                    response = _safe(draft["summary"])
                     if draft["follow_up_question"]:
                         response += "\n" + _safe(draft["follow_up_question"])
                     if draft["suggested_next_steps"]:
-                        response += "\nPossible next steps:\n" + "\n".join(f"{i}. {_safe(step)}" for i, step in enumerate(draft["suggested_next_steps"], 1))
-                    response += "\nYour clock is unchanged; use `hours` to check it."
+                        response += "\nPossible next steps:\n" + "\n".join(f"{i}. {_safe(step)}" for i, step in enumerate(draft["suggested_next_steps"][:3], 1))
         await self.slack.post_message(slack_user_id, response)
         return True
 
