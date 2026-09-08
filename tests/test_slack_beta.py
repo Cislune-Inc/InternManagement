@@ -1,6 +1,6 @@
 import asyncio
 from contextlib import nullcontext
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -44,6 +44,55 @@ def runtime(tmp_path, monkeypatch):
 
 def event(text, hour=9, user="WORKER"):
     return {"user": user, "text": text, "ts": str(datetime.fromisoformat(f"2026-09-07T{hour:02d}:00:00-07:00").timestamp())}
+
+
+def test_quiet_clock_tick_delivers_work_checkin_after_notice_cooldown(runtime):
+    from agent.slack_beta import ledger, tick
+
+    runtime.config.slack.progress_checkins_enabled = True
+    user = runtime.roster_by_key["worker"]
+    start = datetime.fromisoformat("2026-09-08T08:00:00-07:00")
+    ledger(runtime).handle(user, "in", "onsite", event_id="start", now=start, kiosk_verified=True)
+    asyncio.run(tick(runtime, user, start + timedelta(hours=2)))
+    assert len(runtime.test_sent) == 1
+    assert "paid rest" in runtime.test_sent[0][1]
+    before = runtime.state_store.get_session(user.user_key, "2026-09-08")
+    archives = list(runtime.test_archives)
+    asyncio.run(tick(runtime, user, start + timedelta(hours=2, minutes=29)))
+    assert len(runtime.test_sent) == 1
+    # No new clock notice: this was previously never evaluated for progress.
+    asyncio.run(tick(runtime, user, start + timedelta(hours=2, minutes=30)))
+    assert len(runtime.test_sent) == 2
+    assert runtime.test_sent[-1][0] == user.slack_user_id
+    assert "Quick check-in" in runtime.test_sent[-1][1]
+    asyncio.run(tick(runtime, user, start + timedelta(hours=2, minutes=31)))
+    assert len(runtime.test_sent) == 2
+    assert runtime.state_store.get_session(user.user_key, "2026-09-08") == before
+    assert runtime.test_archives == archives
+
+
+@pytest.mark.parametrize("mode", ["not_started", "disabled", "handover", "clocked_out"])
+def test_quiet_work_checkin_respects_clock_and_rollout_state(runtime, mode):
+    from agent.slack_beta import ledger, tick
+
+    runtime.config.slack.progress_checkins_enabled = mode != "disabled"
+    user = runtime.roster_by_key["worker"]
+    start = datetime.fromisoformat("2026-09-08T08:00:00-07:00")
+    if mode != "not_started":
+        ledger(runtime).handle(user, "in", "onsite", event_id="start", now=start, kiosk_verified=True)
+        ledger(runtime).tick(user, start + timedelta(hours=2))
+        for notice in ledger(runtime).pending_notices(user.user_key):
+            ledger(runtime).notice_delivered(notice["id"], start + timedelta(hours=2))
+        if mode == "clocked_out":
+            ledger(runtime).handle(user, "out", "", event_id="out", now=start + timedelta(hours=2))
+    if mode == "handover":
+        runtime.config.slack.clock_handover_pending_slack_user_ids = [user.slack_user_id]
+    with runtime.state_store._connect() as conn:
+        before = list(conn.execute("SELECT payload FROM sessions"))
+    asyncio.run(tick(runtime, user, start + timedelta(hours=2, minutes=30)))
+    assert not runtime.test_sent
+    with runtime.state_store._connect() as conn:
+        assert list(conn.execute("SELECT payload FROM sessions")) == before
 
 
 def test_actual_slack_path_clocks_without_clickup_or_openai(runtime):

@@ -172,6 +172,12 @@ class SlackTimekeeping:
         today = now.astimezone(self.zone).date().isoformat()
         return next((s for s in sessions if s.session_date == today), SessionState(user_key=user.user_key, session_date=today))
 
+    def current_session(self, user: UserProfile, now: datetime) -> SessionState | None:
+        """Read existing clock context without creating or changing attendance."""
+        with self.store._connect() as conn:
+            session = self._current(self._sessions(conn, user.user_key), user, now)
+            return session if session.clocked_in_at else None
+
     def handle(self, user: UserProfile, command: str, detail: str, *, event_id: str,
                now: datetime, kiosk_verified: bool = False) -> tuple[str, SessionState | None]:
         now = now.astimezone(timezone.utc)

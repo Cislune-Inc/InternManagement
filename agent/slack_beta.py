@@ -207,7 +207,12 @@ async def tick(runtime: Any, user: Any, now: datetime) -> None:
         await runtime.slack.post_message(user.slack_user_id, notice["text"])
         service.notice_delivered(notice["id"], datetime.now(timezone.utc))
     from .progress_checkins import tick as progress_tick
-    await progress_tick(runtime, user, session, now)
+    # Clock tick returns only changed sessions. Quiet ticks still need the
+    # current clock context for independent, bounded work check-ins; do not
+    # archive or rewrite attendance just to evaluate a work prompt.
+    if (getattr(runtime.config.slack, "progress_checkins_enabled", False)
+            and user.slack_user_id not in runtime.config.slack.clock_handover_pending_slack_user_ids):
+        await progress_tick(runtime, user, service.current_session(user, now), now)
 
 
 async def flush_work_notices(runtime: Any) -> None:
