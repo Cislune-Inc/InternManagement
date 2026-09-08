@@ -42,7 +42,8 @@ def create_app(runtime: Any) -> web.Application:
         for actor in dict.fromkeys(runtime.config.slack.work_intake_beta_slack_user_ids):
             user = clock_user(runtime, actor)
             if user:
-                people.append({"id": actor, "name": user.display_name})
+                pending = actor in runtime.config.slack.clock_handover_pending_slack_user_ids
+                people.append({"id": actor, "name": user.display_name + (" — setup ready; handover pending" if pending else "")})
         encoded = json.dumps(sorted(people, key=lambda p: p["name"].casefold())).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
         html = PAGE.replace("__NONCE__", nonce).replace("__CSRF__", json.dumps(csrf)).replace("__PEOPLE__", encoded)
         return web.Response(text=html, content_type="text/html")
@@ -71,6 +72,8 @@ def create_app(runtime: Any) -> web.Application:
                     if not isinstance(confirmation, str):
                         raise ValueError("Enter your new PIN twice.")
                     await asyncio.to_thread(pins.set_pin, actor, pin, confirmation)
+                    if actor in runtime.config.slack.clock_handover_pending_slack_user_ids:
+                        return web.json_response({"message": "PIN saved. Your clock has not changed. Erik still needs to confirm your Gusto-to-DP handover before your first DP start."})
                     return web.json_response({"message": "PIN saved. Choose your name and enter it to start work. Your clock has not changed."})
                 await asyncio.to_thread(pins.verify, actor, pin)
                 action, ident = payload.get("action"), payload.get("request_id")

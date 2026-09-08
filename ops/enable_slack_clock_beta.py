@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -11,8 +12,25 @@ from agent.config import parse_agent_config, parse_roster_bytes
 from agent.persistence import atomic_write_json
 
 
+def check_setup_only_sessions(state_db: Path, user_keys: list[str]) -> None:
+    """Read-only preflight: setup staging must never hold a running DP shift."""
+    if not state_db.is_file():
+        raise ValueError("An existing --state-db is required for setup-only enrollment.")
+    with sqlite3.connect(state_db.resolve().as_uri() + "?mode=ro", uri=True) as conn:
+        for key in user_keys:
+            for row in conn.execute("SELECT payload FROM sessions WHERE user_key=?", (key,)):
+                session = json.loads(row[0])
+                meta = session.get("metadata", {})
+                if meta.get("slack_clock_legacy_unresolved"):
+                    continue
+                if session.get("clocked_in_at") and (not session.get("clocked_out_at") or
+                        meta.get("slack_clock_meal_started_at") or meta.get("slack_clock_rest_started_at")):
+                    raise ValueError("Cannot stage setup with an open DP shift or break: " + key)
+
+
 def prepare(payload: dict, roster_bytes: bytes, user_keys: list[str] | None,
-            *, primary_admin_only: bool = False, primary_admin_slack_id: str | None = None) -> tuple[dict, list[str]]:
+            *, primary_admin_only: bool = False, primary_admin_slack_id: str | None = None,
+            setup_only: bool = False) -> tuple[dict, list[str]]:
     payload = json.loads(json.dumps(payload))
     config = parse_agent_config(payload, "America/Los_Angeles")
     if primary_admin_slack_id:
@@ -36,6 +54,8 @@ def prepare(payload: dict, roster_bytes: bytes, user_keys: list[str] | None,
     if not primary_admin_only and not user_keys:
         raise ValueError("Choose explicit --user-key entries; the historical all-active roster is never a safe default.")
     chosen = set() if primary_admin_only else set(user_keys)
+    if setup_only and primary_admin_only:
+        raise ValueError("Setup-only needs explicit workers, not the primary-admin-only mode.")
     if chosen - set(known):
         raise ValueError("Unknown/inactive roster user_key: " + ", ".join(sorted(chosen - set(known))))
     missing = [key for key in chosen if not known[key].slack_user_id]
@@ -51,6 +71,11 @@ def prepare(payload: dict, roster_bytes: bytes, user_keys: list[str] | None,
         "enabled": True, "work_intake_beta_slack_user_ids": sorted(set(ids)),
         "daily_updates_enabled": False, "weekly_recaps_enabled": False,
     })
+    if setup_only:
+        # Never clear an earlier hold as a side effect of enrolling someone else.
+        pending = set(updated["slack"].get("clock_handover_pending_slack_user_ids", []))
+        pending.update(known[key].slack_user_id for key in chosen)
+        updated["slack"]["clock_handover_pending_slack_user_ids"] = sorted(pending)
     parse_agent_config(updated, "America/Los_Angeles")
     return updated, sorted(set(known) - chosen)
 
@@ -60,6 +85,8 @@ def main() -> None:
     parser.add_argument("--config", type=Path, default=Path("config/agent.config.json"))
     parser.add_argument("--user-key", action="append", help="Explicit current worker; repeat for the reviewed cohort. Only the primary admin is added automatically.")
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--setup-only", action="store_true", help="Show selected names and allow PIN setup, but hold starts/returns until actual earlier time and handover are reconciled. Never use for an active DP shift.")
+    parser.add_argument("--state-db", type=Path, help="Existing production ledger for setup-only open-shift safety check.")
     parser.add_argument("--primary-admin-only", action="store_true", help="Explicit isolated dogfood cohort; no old worker or secondary-admin enrollment.")
     parser.add_argument("--primary-admin-slack-id", help="Explicitly select an already configured manager as primary authorization owner.")
     args = parser.parse_args()
@@ -69,7 +96,13 @@ def main() -> None:
     roster_path = config_path.parent / config.roster_file_name
     updated, excluded = prepare(payload, roster_path.read_bytes(), args.user_key,
                                 primary_admin_only=args.primary_admin_only,
-                                primary_admin_slack_id=args.primary_admin_slack_id)
+                                primary_admin_slack_id=args.primary_admin_slack_id,
+                                setup_only=args.setup_only)
+    if args.setup_only:
+        if args.state_db is None:
+            raise ValueError("Setup-only requires --state-db for the open-shift safety check.")
+        check_setup_only_sessions(args.state_db, args.user_key)
+        print("Setup-only: selected workers cannot start/return yet. PIN setup does not change attendance.")
     print("Slack will be the sole beta clock; Gusto Kiosk and Discord are not fallback clocks.")
     print("Selected Slack identities:", len(updated["slack"]["work_intake_beta_slack_user_ids"]))
     print("Excluded active workers (must Slack Erik actual hours):", ", ".join(excluded) or "none")

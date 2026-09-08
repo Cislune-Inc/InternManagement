@@ -9,7 +9,7 @@ from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
 from agent.kiosk_pins import KioskPins
 from agent.onsite_kiosk import ORIGIN, create_app
-from agent.slack_beta import ledger
+from agent.slack_beta import ledger, clock_user
 from test_slack_beta import runtime, event
 
 PIN = "839271"  # Synthetic credential, never deployed.
@@ -191,4 +191,25 @@ def test_foreign_host_and_forwarded_address_are_rejected(runtime):
             await app.middlewares[0](request, lambda request: None)
         async with TestClient(TestServer(app)) as client:
             assert (await client.get("/", headers={"Host": "evil.example"})).status == 403
+    asyncio.run(exercise())
+
+
+def test_setup_pending_worker_can_save_pin_but_not_start_or_mutate_clock(runtime):
+    runtime.config.slack.clock_handover_pending_slack_user_ids = ["WORKER"]
+    async def exercise():
+        async with TestClient(TestServer(create_app(runtime))) as client:
+            h = await headers(client)
+            page = await client.get("/", headers={"Host": "127.0.0.1:8766"})
+            assert "setup ready; handover pending" in await page.text()
+            payload = {"actor": "WORKER", "pin": PIN, "confirmation": PIN, "action": "start", "request_id": str(uuid4())}
+            KioskPins(runtime.state_store).allow_setup("WORKER", authorized_by="test")
+            response = await client.post("/pin/setup", headers=h, json=payload)
+            assert "PIN saved" in (await response.json())["message"]
+            response = await client.post("/confirm", headers=h, json=payload)
+            assert "handover is not finished" in (await response.json())["message"]
+            assert runtime.test_archives == [] and runtime.test_sent == []
+            with runtime.state_store._connect() as conn:
+                assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
+            owner = clock_user(runtime, "ERIK")
+            assert owner.user_key not in ledger(runtime).handover_pending_user_keys
     asyncio.run(exercise())

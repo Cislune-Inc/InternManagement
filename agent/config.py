@@ -416,6 +416,9 @@ def _parse_slack_config(raw_slack: Any) -> SlackConfig:
         work_intake_beta_slack_user_ids=_clean_string_list(
             raw_slack.get("work_intake_beta_slack_user_ids")
         ),
+        clock_handover_pending_slack_user_ids=_clean_string_list(
+            raw_slack.get("clock_handover_pending_slack_user_ids")
+        ),
         progress_checkins_enabled=bool(raw_slack.get("progress_checkins_enabled", False)),
         work_summary_channels=_parse_work_summary_channels(raw_slack.get("work_summary_channels", {})),
         quarantine_uncertain_routes=bool(

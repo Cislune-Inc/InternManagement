@@ -2,7 +2,19 @@ import json
 
 import pytest
 
-from ops.enable_slack_clock_beta import prepare
+from ops.enable_slack_clock_beta import prepare, check_setup_only_sessions
+
+
+def test_setup_only_enrollment_preserves_holds_and_never_holds_owner():
+    config = payload()
+    config.setdefault("slack", {})["clock_handover_pending_slack_user_ids"] = ["PRIOR"]
+    data = roster({"user_key": "w", "slack_user_id": "WORKER"})
+    updated, _ = prepare(config, data, ["w"], setup_only=True)
+    assert updated["slack"]["clock_handover_pending_slack_user_ids"] == ["PRIOR", "WORKER"]
+    assert "WORKER" in updated["slack"]["work_intake_beta_slack_user_ids"]
+    assert config["slack"]["clock_handover_pending_slack_user_ids"] == ["PRIOR"]
+    again, _ = prepare(updated, data, ["w"])
+    assert again["slack"]["clock_handover_pending_slack_user_ids"] == ["PRIOR", "WORKER"]
 
 
 def test_primary_admin_only_never_enrolls_secondary_admin_or_legacy_workers():
@@ -34,6 +46,20 @@ def payload():
 
 def roster(*rows):
     return json.dumps(rows).encode()
+
+
+def test_setup_only_rejects_existing_open_shift_and_never_creates_database(tmp_path):
+    from agent.models import SessionState
+    from agent.state_store import StateStore
+    path = tmp_path / "state.sqlite3"
+    with pytest.raises(ValueError, match="existing"):
+        check_setup_only_sessions(path, ["w"])
+    assert not path.exists()
+    store = StateStore(path)
+    check_setup_only_sessions(path, ["w"])
+    store.save_session(SessionState(user_key="w", session_date="2026-09-08", clocked_in_at="2026-09-08T08:30:00-07:00"))
+    with pytest.raises(ValueError, match="open DP"):
+        check_setup_only_sessions(path, ["w"])
 
 
 def test_prepare_is_nonmutating_and_sets_one_slack_clock():

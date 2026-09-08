@@ -25,6 +25,11 @@ HELP = (
     "If DP fails, Slack Erik your actual hours. Do not use Gusto Kiosk."
 )
 FALLBACK = "If you worked outside the recorded interval, use `report hours` or Slack Erik the actual times; all work must be recorded."
+HANDOVER_PENDING = (
+    "Your PIN setup is available, but your Gusto-to-DP handover is not finished. "
+    "Ask Erik to preserve your actual earlier hours and breaks and confirm the switch. "
+    "No DP start or return was recorded. " + FALLBACK
+)
 
 
 def timestamp(value: str | None) -> datetime | None:
@@ -103,9 +108,11 @@ def paid_seconds(sessions: list[SessionState], now: datetime,
 class SlackTimekeeping:
     def __init__(self, state_store: Any, *, timezone_name: str = "America/Los_Angeles",
                  daily_limit_hours: float = 8, weekly_limit_hours: float = 40,
-                 require_kiosk: bool = False) -> None:
+                 require_kiosk: bool = False,
+                 handover_pending_user_keys: tuple[str, ...] = ()) -> None:
         self.store = state_store
         self.require_kiosk = require_kiosk
+        self.handover_pending_user_keys = frozenset(handover_pending_user_keys)
         self.zone = ZoneInfo(timezone_name)
         self.daily_limit = daily_limit_hours * 3600
         self.weekly_limit = weekly_limit_hours * 3600
@@ -167,6 +174,10 @@ class SlackTimekeeping:
                 response = "Your actual-hours report is saved for manager reconciliation. It has not been converted into guessed timestamps. " + FALLBACK
                 conn.execute("INSERT INTO slack_clock_receipts VALUES (?,?,?,?)", (key, user.user_key, "", response))
                 return response, None
+            if command in {"in", "back"} and user.user_key in self.handover_pending_user_keys:
+                # Setup is not attendance. Do not save a failed start as activity,
+                # consume its idempotency key, or alter historical clock records.
+                return HANDOVER_PENDING, None
             sessions = self._sessions(conn, user.user_key)
             session = self._current(sessions, user, now)
             if not any(s.session_date == session.session_date for s in sessions):
@@ -208,7 +219,9 @@ class SlackTimekeeping:
                      "On paid rest" if session.metadata.get("slack_clock_rest_started_at") and not session.clocked_out_at else
                      "Clocked in" if session.clocked_in_at and not session.clocked_out_at else "Clocked out")
             waiting = self.return_countdown(sessions, now)
-            return (f"*{state}* · Today {daily / 3600:.2f} h · This week {weekly / 3600:.2f} h\n"
+            return (("Handover pending · These DP totals exclude your Gusto records.\n"
+                     if user.user_key in self.handover_pending_user_keys else "")
+                    + f"*{state}* · Today {daily / 3600:.2f} h · This week {weekly / 3600:.2f} h\n"
                     f"Recorded work + paid rest · {self.zone.key} · Updated {now.astimezone(self.zone):%H:%M}"
                     + ("\n" + self.return_message(waiting) if waiting else ""))
 
@@ -253,7 +266,7 @@ class SlackTimekeeping:
         if command == "hours":
             state = "on lunch" if session.stage == "on_lunch_break" else "clocked in" if running else "clocked out"
             waiting = self.return_countdown(sessions, now)
-            return f"You are {state}. Recorded work + paid rest: today {daily / 3600:.2f} h; this week {weekly / 3600:.2f} h ({self.zone.key}).\n" + (self.return_message(waiting) + "\n" if waiting else "") + FALLBACK
+            return ("Handover pending · These DP totals exclude your Gusto records.\n" if user.user_key in self.handover_pending_user_keys else "") + f"You are {state}. Recorded work + paid rest: today {daily / 3600:.2f} h; this week {weekly / 3600:.2f} h ({self.zone.key}).\n" + (self.return_message(waiting) + "\n" if waiting else "") + FALLBACK
         waiting = self.return_countdown(sessions, now)
         if command in {"in", "back"} and waiting and waiting["remaining_seconds"]:
             return self.return_message(waiting)

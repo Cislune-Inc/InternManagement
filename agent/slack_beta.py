@@ -62,9 +62,11 @@ async def manager_hours(runtime: Any, admin: Any, slack_id: str, text: str, even
 
 
 def ledger(runtime: Any) -> SlackTimekeeping:
+    pending = tuple(user.user_key for actor in runtime.config.slack.clock_handover_pending_slack_user_ids
+                    if (user := clock_user(runtime, actor)) is not None)
     return SlackTimekeeping(runtime.state_store, timezone_name=runtime.config.timezone,
                            daily_limit_hours=runtime.config.labor.overtime_limit_hours,
-                           require_kiosk=True)
+                           require_kiosk=True, handover_pending_user_keys=pending)
 
 
 async def archive(runtime: Any, user: Any, session: Any, now: datetime) -> None:

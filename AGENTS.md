@@ -56,6 +56,14 @@
 
 ## Verification
 
+September 8 latest owner correction: use the currently logged-in Mac account;
+do not create or require a separate macOS kiosk user. Keep the protected manager
+HTTP boundary, PIN hashes and trusted-admin remote-access rules. This shared
+administrator session is not OS-level isolation; do not claim otherwise.
+Setup-only cohort enrollment may show verified names and permit PIN setup while
+actual Gusto handover remains pending. It must not start time or silently clear
+a handover hold; preserve prior work/break continuity before enabling starts.
+
 The manager editor is loopback-only and requires its private credential even from
 localhost. Access it remotely through trusted SSH, never expose Basic auth on the
 LAN. `/livez` is process readiness only; detailed `/health` and `/api/health` remain

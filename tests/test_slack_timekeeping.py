@@ -25,6 +25,22 @@ def command(clock, user, name, now, detail="", event=None):
     return clock.handle(user, name, detail, event_id=event or now.isoformat() + name, now=now)
 
 
+def test_handover_hold_prevents_new_time_not_actual_hours_reports(clock, user):
+    pending = SlackTimekeeping(clock.store, handover_pending_user_keys=(user.user_key,))
+    for cmd, detail in [("in", "onsite"), ("in", "remote"), ("back", "")]:
+        response, session = command(pending, user, cmd, at(9), detail)
+        assert "handover is not finished" in response and session is None
+    with clock.store._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM slack_clock_receipts").fetchone()[0] == 0
+    assert "exclude your Gusto" in pending.snapshot(user, at(9))
+    assert "saved" in command(pending, user, "report", at(9), "Actual earlier work needs review")[0]
+    assert len(pending.reports()) == 1
+    assert "Clocked in" in command(clock, user, "in", at(9), "onsite")[0]
+    assert "Clocked out" in command(pending, user, "out", at(10))[0]
+    assert paid_seconds([clock.store.get_session(user.user_key, "2026-09-07")], at(10)) == 3600
+
+
 def test_clock_records_hours_without_task_or_quality_gate(clock, user):
     response, _ = command(clock, user, "in", at(9), "onsite stuff")
     assert "Clocked in" in response
