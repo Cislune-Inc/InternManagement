@@ -49,7 +49,7 @@ def test_duplicate_start_and_delayed_retry_never_reopen(clock, user):
 def test_self_reported_meal_is_deducted_once(clock, user):
     command(clock, user, "in", at(9), "onsite")
     command(clock, user, "lunch", at(12))
-    assert "minutes remaining" in command(clock, user, "back", at(12, 10))[0]
+    assert "20:00 remaining" in command(clock, user, "back", at(12, 10))[0]
     command(clock, user, "back", at(12, 30))
     _, session = command(clock, user, "out", at(17))
     assert paid_seconds([session], at(17)) == int(7.5 * 3600)

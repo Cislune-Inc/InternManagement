@@ -14,7 +14,7 @@
   permission. Do not send general status noise. Hand off website, Drive or GitHub
   links rather than local Markdown/text files. Runtime private replies to worker
   actions and accepted clock notices are separate from assistant announcements.
-- Onsite clock-in and meal return require confirmation at the Mini's loopback-only
+- Onsite clock-in, meal return and paid-rest return require confirmation at the Mini's loopback-only
   kiosk, not a Slack self-attestation, GPS claim, QR link or VPN source address.
   Use name + personal PIN, not temporary Slack codes. PINs are salted/scrypt-hashed;
   never put them in chat, clock events, logs, browser storage or URLs. Setup/reset
@@ -22,6 +22,11 @@
   Keep the owner company-management remote exception visible; staff remote work
   still requires Erik's time-bounded advance approval. Remote desktop/SSH access
   to the kiosk must remain limited to trusted administrators.
+- Block early return for 10-minute paid rest and 30-minute lunch only, not early
+  scheduled shift starts. Queue one private Slack readiness notice per break;
+  no reply is required during rest and no timer automatically resumes work.
+  Suppress delayed readiness messages after return/clock-out. Keep actual-hours
+  reports and clock-out available even while the return boundary is active.
 
 - The opt-in hours-first Slack beta (`docs/slack-work-intake-beta.md`) is the sole
   beta clock on the existing SQLite session ledger. Gusto Kiosk is not a fallback;

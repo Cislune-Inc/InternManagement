@@ -21,7 +21,7 @@ The Messages tab accepts deterministic commands:
 | `kiosk setup` | Open a ten-minute setup window for your own identity; enter the PIN only on the Mini |
 | `clock out` | Stop immediately without a required summary |
 | `lunch` / `back` | Actual meal start/return; return after 30 minutes, with kiosk confirmation for onsite shifts |
-| `break` / `back` | Paid rest and actual return |
+| `break` / `back` | Ten-minute paid rest; onsite return requires the kiosk |
 | `hours` | Current state, day and week totals |
 | `report hours <actual dates, times, breaks, correction>` | Preserve a claim for reconciliation, including a missing shift |
 
@@ -64,7 +64,7 @@ data-handling policy. A real model/key roundtrip remains unverified.
 
 ## Enforcement and truthful reconciliation
 
-- Onsite starts and meal returns require a personal six-digit PIN entered on the Mini's
+- Onsite starts, meal returns and paid-rest returns require a personal six-digit PIN entered on the Mini's
   loopback-only kiosk at http://127.0.0.1:8766. Requests alone add no attendance.
   A QR code or VPN address is not presence evidence. Do not proxy/tunnel the kiosk.
   PIN sharing and administrator remote desktop access remain known limitations.
@@ -86,6 +86,21 @@ data-handling policy. A real model/key roundtrip remains unverified.
 - Paid rest stays paid. After ten minutes without return acknowledgement the clock
   stops at the actual scheduler tick, never backdated. Actual return is required
   before restarting. Unconfirmed work after automatic stops needs reconciliation.
+- One private Slack message is queued when the 10-minute paid-rest or 30-minute
+  lunch minimum completes. Onsite workers return using name + PIN at the Mini;
+  no Slack acknowledgement or persistent countdown screen is required. The
+  scheduler checks about every 30 seconds, so a message may arrive slightly later
+  than the minimum; the server allows a valid return at the exact boundary even
+  if Slack is unavailable. Existing approval/hour limits still apply.
+- Early returns show the remaining wait and exact local return time. Clock-out,
+  reporting actual hours, and corrections remain available. Clock-out/restart or
+  midnight cannot bypass the same break's minimum. No scheduled-start gate was
+  added. Notifications do not end lunch or resume work automatically.
+- Readiness is queued once per actual break and survives restart; stale messages
+  are suppressed after return, clock-out or switching breaks. The outbox is
+  at-least-once delivery: a crash between Slack accepting a message and storing
+  its receipt can still duplicate a delivery. No manager or channel announcement
+  is generated for a normal return-ready event.
 - Inactivity check is after four hours plus a 15-minute warning window. Scheduler
   delay never retroactively deletes hours. Worker messages count as activity;
   silence or weak prose does not establish nonwork.
