@@ -17,7 +17,7 @@ def inputs(tmp_path):
 def test_preflight_redacts_credentials_and_never_changes_config_or_database(tmp_path):
     config, db, credentials = inputs(tmp_path)
     before = (config.read_bytes(), db.read_bytes())
-    report = inspect(config, db, credentials)
+    report = inspect(config, db, credentials, ["worker"])
     assert report["blocks"] == []
     assert report["live_verification_required"] is True
     assert report["warnings"]
@@ -28,7 +28,7 @@ def test_preflight_redacts_credentials_and_never_changes_config_or_database(tmp_
 def test_missing_database_is_not_created_and_missing_slack_blocks(tmp_path):
     config, _, _ = inputs(tmp_path)
     missing = tmp_path / "missing.sqlite3"
-    report = inspect(config, missing, {})
+    report = inspect(config, missing, {}, ["worker"])
     assert not missing.exists()
     assert any("database" in message for message in report["blocks"])
     assert any("SLACK_BOT_TOKEN" in message for message in report["blocks"])
@@ -40,6 +40,6 @@ def test_duplicate_open_shifts_require_reconciliation_without_modifying_them(tmp
     with sqlite3.connect(db) as conn:
         for day in (6, 7):
             conn.execute("INSERT INTO sessions VALUES (?,?,?)", ("worker", f"2026-09-{day:02d}", json.dumps({"clocked_in_at": f"2026-09-{day:02d}T09:00:00-07:00"})))
-    report = inspect(config, db, credentials)
+    report = inspect(config, db, credentials, ["worker"])
     assert report["checks"]["open_shift_records"] == 2
     assert any("multiple open shifts" in message for message in report["blocks"])

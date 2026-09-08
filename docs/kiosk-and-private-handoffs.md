@@ -40,7 +40,7 @@ editor access controls and a no-proxy rule are required before staff rollout.
 The existing network manager editor must not be exposed as a worker hours page.
 Do not disable administrator remote recovery as an unreviewed deployment step.
 
-## Useful updates, without publication
+## Useful updates, with explicit reviewed sharing
 
 Use `work <project>: <plan>`, then `work update <actual result>` and optionally
 `work next <next step or blocker>`. Preview update / `work draft` displays only
@@ -49,7 +49,10 @@ approval. `work confirm SH-id` saves the exact revision for private owner review
 `work handoffs` shows the owner's review queue (other workers see only their own).
 Changed revisions invalidate older handoffs; originals stay preserved.
 
-Confirmation never authorizes a channel post. Channel publication is disabled.
+Confirmation never authorizes a channel post. With an explicit approved route,
+the preview shows its project channel and `work share SH-id` sends that exact
+version. No private chat, manager notes, time records or AI claims are forwarded.
+See the team-checkins rollout packet for limits and uncertain-delivery handling.
 Erik must explicitly request any assistant Slack/email send. Worker updates and
 kiosk actions never depend on prose quality or an AI response to record hours.
 

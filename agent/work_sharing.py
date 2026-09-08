@@ -1,7 +1,7 @@
-"""Explicit, private work-update previews. Never publishes to channels or email.
+"""Versioned previews and explicit worker shares to owner-allowlisted channels.
 
-Worker confirmation creates a versioned handoff for owner review, not permission
-to publish. Original work events and the attendance ledger remain independent.
+Confirmation alone remains private. No arbitrary destinations, DM forwarding,
+AI claims, clock data, or automatic publication. Attendance is independent.
 """
 from __future__ import annotations
 
@@ -23,6 +23,9 @@ class WorkSharing:
                 created_at TEXT NOT NULL, confirmed_at TEXT,
                 UNIQUE(item_id,revision)
             )""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS work_share_delivery (
+                draft_id TEXT PRIMARY KEY, channel TEXT NOT NULL,
+                status TEXT NOT NULL, attempted_at TEXT, message_ts TEXT)""")
 
     @staticmethod
     def _render(row: Any) -> str:
@@ -35,7 +38,7 @@ class WorkSharing:
             lines.append("Reference (not verified): " + _safe(url))
         return "\n".join(lines)
 
-    def preview(self, actor: str) -> str:
+    def preview(self, actor: str, channels: dict[str, str] | None = None) -> str:
         with self.store._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             item = conn.execute("SELECT * FROM work_intake_items WHERE owner_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1", (actor,)).fetchone()
@@ -64,9 +67,56 @@ class WorkSharing:
             conn.execute("INSERT OR IGNORE INTO work_share_drafts(id,item_id,owner_id,revision,payload,created_at) VALUES (?,?,?,?,?,?)",
                          (ident, item["id"], actor, item["revision"], json.dumps(payload), datetime.now(timezone.utc).isoformat()))
             row = conn.execute("SELECT * FROM work_share_drafts WHERE id=?", (ident,)).fetchone()
+            destination = (channels or {}).get(item["project_key"])
+            share_note = ""
+            if destination:
+                conn.execute("""INSERT INTO work_share_delivery(draft_id,channel,status) VALUES (?,?,'preview')
+                    ON CONFLICT(draft_id) DO UPDATE SET channel=excluded.channel WHERE status='preview'""", (ident, destination))
+                share_note = (f"\nShare this exact version to <#{destination}>: `work share {ident}`. "
+                              "Check the destination and remove confidential/personal content first. Sharing also confirms accuracy.")
             return (f"*Private draft `{ident}` — not sent*\n" + self._render(row)
                     + f"\n\nConfirm accuracy: `work confirm {ident}`. This saves a Codex/owner handoff; it does not post to a channel."
-                    + "\nCorrect it with `work update <corrected result>` or add `work next <next step / blocker>`, then request `work draft` again.")
+                    + "\nCorrect it with `work update <corrected result>` or add `work next <next step / blocker>`, then request `work draft` again."
+                    + share_note)
+
+    async def share(self, actor: str, ident: str, channels: dict[str, str], slack: Any) -> str:
+        now = datetime.now(timezone.utc)
+        with self.store._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM work_share_drafts WHERE id=? AND owner_id=?", (ident, actor)).fetchone()
+            delivery = conn.execute("SELECT * FROM work_share_delivery WHERE draft_id=?", (ident,)).fetchone()
+            if not row or not delivery:
+                return "Use `work draft` to preview your result and its destination before sharing. Nothing was sent."
+            payload = json.loads(row["payload"])
+            destination = channels.get(payload["project_key"])
+            if not destination or delivery["channel"] != destination:
+                return "The approved destination changed or is unavailable. Request `work draft` again. Nothing was sent."
+            item = conn.execute("SELECT revision FROM work_intake_items WHERE id=?", (row["item_id"],)).fetchone()
+            if not item or item[0] != row["revision"]:
+                return "Your work changed after this preview. Use `work draft` for the current version. Nothing was sent."
+            if delivery["status"] == "sent":
+                return f"This version was already shared to <#{destination}>. No duplicate was sent."
+            if delivery["status"] != "preview":
+                return "A previous share attempt needs manager verification in the project channel. I will not retry and risk a duplicate. Your private report is preserved."
+            if len(payload["result"].split()) < 5 or not payload["next"].strip():
+                return "Before sharing, add one concrete result/blocker and `work next <next step or help needed>`, then preview again. Your time is unaffected."
+            previous = conn.execute("""SELECT MAX(s.attempted_at) FROM work_share_delivery s
+                JOIN work_share_drafts d ON d.id=s.draft_id WHERE d.owner_id=? AND s.channel=?""", (actor, destination)).fetchone()[0]
+            if previous and (now - datetime.fromisoformat(previous)).total_seconds() < 1800:
+                return "Keep refining your private update; another channel summary can be shared after 30 minutes. If urgent, contact your manager directly. Nothing was sent."
+            conn.execute("UPDATE work_share_drafts SET confirmed_at=COALESCE(confirmed_at,?) WHERE id=?", (now.isoformat(), ident))
+            conn.execute("UPDATE work_share_delivery SET status='attempting',attempted_at=? WHERE draft_id=?", (now.isoformat(), ident))
+            message = self._render(row)
+        try:
+            result = await slack.post_message(destination, message)
+            if not isinstance(result, dict) or not result.get("ts"):
+                raise RuntimeError("Delivery not confirmed")
+        except Exception:
+            # Transport may have succeeded before timing out. Never retry blind.
+            return "I could not confirm delivery. Your report is saved; ask a manager to check the destination before retrying. No time records changed."
+        with self.store._connect() as conn:
+            conn.execute("UPDATE work_share_delivery SET status='sent',message_ts=? WHERE draft_id=?", (result["ts"], ident))
+        return f"Shared your reviewed update to <#{destination}>. Original work notes and hours are unchanged."
 
     def confirm(self, actor: str, ident: str) -> str:
         with self.store._connect() as conn:
@@ -78,7 +128,7 @@ class WorkSharing:
             if not item or item["revision"] != row["revision"]:
                 return "Your work changed after this draft. Use `work draft` and confirm the updated version. Nothing was sent."
             conn.execute("UPDATE work_share_drafts SET confirmed_at=COALESCE(confirmed_at,?) WHERE id=?", (datetime.now(timezone.utc).isoformat(), ident))
-            return f"Confirmed `{ident}` for the owner/Codex handoff. Nothing was posted to a channel or emailed. Only Erik can explicitly request publication."
+            return f"Confirmed `{ident}` for the owner/Codex handoff. Nothing was posted to a channel or emailed. Use `work draft` to see whether an approved project destination is available for explicit sharing."
 
     def confirmed(self, *, actor: str | None = None) -> list[dict[str, Any]]:
         with self.store._connect() as conn:
@@ -89,22 +139,25 @@ class WorkSharing:
 
     def queue(self, *, actor: str | None = None) -> str:
         rows = self.confirmed(actor=actor)
-        return ("Confirmed handoffs (private, nothing sent):\n" + "\n\n".join(
+        return ("Confirmed handoffs (confirmation alone is private; explicit shares are recorded separately):\n" + "\n\n".join(
             f"`{r['id']}` · source `{r['item_id']}` revision {r['revision']}\n" + self._render(r) for r in rows)
             if rows else "No current confirmed handoffs yet. Use `work update`, `work draft`, then `work confirm SH-id`.")
 
 
 async def handle(runtime: Any, slack_id: str, text: str) -> bool:
     normalized = text.strip().lower()
-    if not (normalized in {"work draft", "work drafts", "work handoffs"} or normalized.startswith(("work confirm ", "work publish ", "work send "))):
+    if not (normalized in {"work draft", "work drafts", "work handoffs"} or normalized.startswith(("work confirm ", "work share ", "work publish ", "work send "))):
         return False
     from .slack_work_intake import SlackWorkIntake
     SlackWorkIntake(runtime.state_store)
     service = WorkSharing(runtime.state_store)
     admin = runtime.admin_profile_by_slack_user_id(slack_id)
     owner = bool(admin and admin.discord_user_id == runtime.config.admin_discord_user_id)
+    channels = getattr(getattr(runtime.config, "slack", None), "work_summary_channels", {})
     if normalized == "work draft":
-        response = service.preview(slack_id)
+        response = service.preview(slack_id, channels)
+    elif normalized.startswith("work share "):
+        response = await service.share(slack_id, text.strip().split(maxsplit=2)[2].strip(), channels, runtime.slack)
     elif normalized.startswith("work confirm "):
         response = service.confirm(slack_id, text.strip().split(maxsplit=2)[2].strip())
     elif normalized in {"work drafts", "work handoffs"}:

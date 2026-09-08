@@ -105,6 +105,11 @@ async def handle_message(runtime: Any, event: dict[str, Any]) -> bool:
         return True
     admin = runtime.admin_profile_by_slack_user_id(slack_id)
     from .work_sharing import handle as handle_work_sharing
+    if text.lower() in {"snooze", "work snooze"}:
+        from .progress_checkins import ProgressCheckins
+        ProgressCheckins(runtime.state_store).snooze(slack_id, now.astimezone(ledger(runtime).zone).date().isoformat(), now)
+        await runtime.slack.post_message(slack_id, "Progress prompts snoozed for one hour. Your clock and break/hours rules are unchanged. Send a result or blocker whenever you are ready.")
+        return True
     if text.lower() == "kiosk setup":
         from .kiosk_pins import KioskPins
         KioskPins(runtime.state_store).allow_setup(slack_id, authorized_by="slack:" + slack_id, now=now)
@@ -176,6 +181,8 @@ async def tick(runtime: Any, user: Any, now: datetime) -> None:
     for notice in service.pending_notices(user.user_key):
         await runtime.slack.post_message(user.slack_user_id, notice["text"])
         service.notice_delivered(notice["id"], datetime.now(timezone.utc))
+    from .progress_checkins import tick as progress_tick
+    await progress_tick(runtime, user, session, now)
 
 
 async def flush_work_notices(runtime: Any) -> None:

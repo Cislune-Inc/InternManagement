@@ -33,7 +33,9 @@ def prepare(payload: dict, roster_bytes: bytes, user_keys: list[str] | None,
     known = {u.user_key: u for u in roster if u.active}
     if primary_admin_only and user_keys:
         raise ValueError("Choose either primary-admin-only or a worker cohort.")
-    chosen = set() if primary_admin_only else (set(user_keys) if user_keys else set(known))
+    if not primary_admin_only and not user_keys:
+        raise ValueError("Choose explicit --user-key entries; the historical all-active roster is never a safe default.")
+    chosen = set() if primary_admin_only else set(user_keys)
     if chosen - set(known):
         raise ValueError("Unknown/inactive roster user_key: " + ", ".join(sorted(chosen - set(known))))
     missing = [key for key in chosen if not known[key].slack_user_id]
@@ -41,7 +43,7 @@ def prepare(payload: dict, roster_bytes: bytes, user_keys: list[str] | None,
         raise ValueError("Map these active workers to verified Slack identities before cutover: " + ", ".join(sorted(missing)))
     ids = [known[key].slack_user_id for key in sorted(chosen)]
     ids.extend(admin.slack_user_id for admin in config.admins if admin.slack_user_id
-               and (not primary_admin_only or admin.discord_user_id == config.admin_discord_user_id))
+               and admin.discord_user_id == config.admin_discord_user_id)
     if not ids or not any(admin.discord_user_id == config.admin_discord_user_id and admin.slack_user_id for admin in config.admins):
         raise ValueError("A verified primary-admin Slack mapping and a nonempty cohort are required.")
     updated = json.loads(json.dumps(payload))
@@ -56,7 +58,7 @@ def prepare(payload: dict, roster_bytes: bytes, user_keys: list[str] | None,
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("config/agent.config.json"))
-    parser.add_argument("--user-key", action="append", help="Limit the cohort; omitted means every active roster worker plus mapped admins.")
+    parser.add_argument("--user-key", action="append", help="Explicit current worker; repeat for the reviewed cohort. Only the primary admin is added automatically.")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--primary-admin-only", action="store_true", help="Explicit isolated dogfood cohort; no old worker or secondary-admin enrollment.")
     parser.add_argument("--primary-admin-slack-id", help="Explicitly select an already configured manager as primary authorization owner.")

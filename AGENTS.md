@@ -43,6 +43,13 @@
 - Inactivity warnings must remain stateful and resilient to scheduler delays; do not rely on a one-minute scheduling window.
 - New ClickUp project, overhead, blocker, and unblocker tasks require management approval when `clickup.new_task_approval_required` is enabled. Notify the configured approvers (normally Erik and George) before creation.
 - Legacy public project updates require an active ClickUp task and a confident project-channel route. The new beta captures freeform work privately and disables legacy daily/weekly posts; do not let stale ClickUp routes publish unreviewed beta notes.
+- September 8 accepted interaction: bounded private two-hour check-ins and explicit
+  worker sharing of a versioned preview to owner-approved project channels. Private
+  confirmation alone is not sharing. Keep routes explicit, suppress duplicates,
+  preserve uncertain delivery for review, and never forward arbitrary DMs or time data.
+  Team onboarding send is authorized only after current cohort and access readiness.
+  Enrollment must name each worker; never default to all active legacy rows or
+  enroll a secondary manager merely because they have an admin profile.
 - Preserve vague or repeated beta statements, asking one useful question where needed; never reject time records for prose quality. Original legacy task/photo posting rules do not gate the beta clock.
 - Automatic stop instructions are not proof that work stopped. Keep unconfirmed gaps reviewable and actual-hours reports visible in payroll exports, even without a recorded shift. Ordinary worker clock-outs are not manager exceptions.
 - Routine operational warnings belong in the digest. Send immediate Slack alerts only for errors and critical failures.
