@@ -12,35 +12,33 @@ input,select,button{box-sizing:border-box;font:inherit;font-size:1.125rem;border
 input,select{width:100%;border:2px solid #527187;margin:8px 0 16px}input{letter-spacing:.4em}
 button{border:1px solid #527187;background:#e8f0f7;color:#102b41;cursor:pointer;font-weight:650;min-height:48px}
 #start{background:#075e90;color:white;width:100%;margin-top:16px}button:disabled{opacity:.6}
-:focus-visible{outline:3px solid #bd6200;outline-offset:3px}.keypad{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+:focus-visible{outline:3px solid #bd6200;outline-offset:3px}
 .secondary{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}.secondary button{flex:1}
 #result{white-space:pre-wrap;font-size:1.125rem;line-height:1.5}small{display:block;font-size:1rem;line-height:1.5;color:#3c5364}
 [hidden]{display:none!important}
 </style><main><header>CISLUNE / DON POLLO</header><h1>Shop time clock</h1>
 <section><form id="clock" autocomplete="off"><label for="person">Your name</label>
 <select id="person" required><option value="">Choose your name</option></select>
-<label id="pinlabel" for="pin">Your six-digit PIN</label>
-<input id="pin" type="password" inputmode="numeric" pattern="[0-9]{6}" minlength="6" maxlength="6" autocomplete="off" required>
+<label id="pinlabel" for="pin">Your PIN (2–6 digits)</label>
+<input id="pin" type="password" inputmode="numeric" pattern="[0-9]{2,6}" minlength="2" maxlength="6" autocomplete="off" required>
 <div id="repeat" hidden><label for="confirmPin">Enter your new PIN again</label>
-<input id="confirmPin" type="password" inputmode="numeric" pattern="[0-9]{6}" minlength="6" maxlength="6" autocomplete="off"></div>
-<div class="keypad" aria-label="PIN keypad"></div>
+<input id="confirmPin" type="password" inputmode="numeric" pattern="[0-9]{2,6}" minlength="2" maxlength="6" autocomplete="off"></div>
 <button id="start" type="submit">Start / return to work</button>
 <div class="secondary" id="actions"><button type="button" data-action="out">Clock out</button><button type="button" data-action="lunch">Lunch</button><button type="button" data-action="rest">Paid rest</button></div>
 </form><div class="secondary"><button type="button" id="setup">Set / reset PIN</button><button type="button" id="cancel">Clear screen</button></div>
 <p id="result" role="status" aria-live="polite"></p>
-<small>No phone needed after PIN setup. Use Slack for work updates, your hours and corrections. Do not share your PIN.</small></section>
+<small>Type your PIN with the keyboard; Enter starts or returns to work. Four or more digits recommended. No phone needed after setup. Use Slack for work updates, your hours and corrections. Do not share your PIN.</small></section>
 <p>Offsite work needs Erik’s advance approval. If DP is unavailable, send Erik your actual hours.</p></main>
 <script nonce="__NONCE__">
 const people=__PEOPLE__,csrf=__CSRF__,person=document.querySelector('#person'),pin=document.querySelector('#pin'),confirmPin=document.querySelector('#confirmPin'),result=document.querySelector('#result'),form=document.querySelector('#clock'),start=document.querySelector('#start');
-let setup=false,active=pin,timer,busy=false,pending=null;
+let setup=false,timer,busy=false,pending=null;
 for(const p of people){const o=document.createElement('option');o.value=p.id;o.textContent=p.name;person.append(o);}
-function mode(value){setup=value;document.querySelector('#repeat').hidden=!value;confirmPin.required=value;document.querySelector('#actions').hidden=value;start.textContent=value?'Save my PIN':'Start / return to work';document.querySelector('#pinlabel').textContent=value?'Choose a six-digit PIN':'Your six-digit PIN';pin.value='';confirmPin.value='';active=pin;pending=null;}
+function mode(value){setup=value;document.querySelector('#repeat').hidden=!value;confirmPin.required=value;document.querySelector('#actions').hidden=value;start.textContent=value?'Save my PIN':'Start / return to work';document.querySelector('#pinlabel').textContent=value?'Choose a PIN (2–6 digits)':'Your PIN (2–6 digits)';pin.value='';confirmPin.value='';pending=null;}
 function clear(){if(busy)return;mode(false);person.value='';result.textContent='';clearTimeout(timer);}
 function touch(){clearTimeout(timer);timer=setTimeout(clear,30000);}
 person.addEventListener('change',()=>{mode(false);result.textContent='';touch();pin.focus();});
-for(const field of [pin,confirmPin]){field.addEventListener('focus',()=>{active=field;touch();});field.addEventListener('input',touch);}
-for(const value of ['1','2','3','4','5','6','7','8','9','Clear','0','⌫']){const b=document.createElement('button');b.type='button';b.textContent=value;b.setAttribute('aria-label',value==='⌫'?'Delete digit':value);b.onclick=()=>{if(busy)return;active.value=value==='Clear'?'':value==='⌫'?active.value.slice(0,-1):(active.value+value).slice(0,6);active.focus();touch();};document.querySelector('.keypad').append(b);}
-document.querySelector('#setup').onclick=()=>{mode(!setup);result.textContent=setup?'One-time setup must be opened by Erik or by sending “kiosk setup” to DP in your own Slack. Enter your PIN here, never in chat.':'';touch();};
+for(const field of [pin,confirmPin]){field.addEventListener('focus',touch);field.addEventListener('input',touch);}
+document.querySelector('#setup').onclick=()=>{mode(!setup);result.textContent=setup?'One-time setup must be opened by Erik or by sending “kiosk setup” to DP in your own Slack. Choose 2–6 digits; four or more recommended. Enter your PIN here, never in chat.':'';touch();pin.focus();};
 document.querySelector('#cancel').onclick=clear;
 async function submit(action){if(busy||!form.reportValidity())return;const actor=person.value;const id=pending&&pending.actor===actor&&pending.action===action?pending.id:crypto.randomUUID();pending={actor,action,id};
 const payload={actor,pin:pin.value,confirmation:confirmPin.value,action,request_id:id};busy=true;clearTimeout(timer);document.querySelectorAll('button,input,select').forEach(el=>el.disabled=true);result.textContent='Checking…';

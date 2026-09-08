@@ -41,9 +41,9 @@ class KioskPins:
 
     def set_pin(self, actor: str, pin: str, confirmation: str, *, now: datetime | None = None) -> None:
         now = now or datetime.now(timezone.utc)
-        if not re.fullmatch(r"[0-9]{6}", pin) or pin != confirmation:
-            raise ValueError("Enter the same six-digit PIN twice.")
-        if len(set(pin)) == 1 or pin in {"123456", "654321", "012345", "543210"}:
+        if not re.fullmatch(r"[0-9]{2,6}", pin) or pin != confirmation:
+            raise ValueError("Enter the same 2–6 digit PIN twice. Four or more digits recommended.")
+        if len(set(pin)) == 1 or pin in "0123456789" or pin in "9876543210":
             raise ValueError("Choose a less obvious PIN, not repeated or sequential digits.")
         salt = secrets.token_bytes(16)
         digest = self._digest(pin, salt)
@@ -66,7 +66,7 @@ class KioskPins:
                 error = "Your PIN needs one-time setup. Ask Erik, or send `kiosk setup` to DP from your own Slack account."
             elif row["locked_until"] and datetime.fromisoformat(row["locked_until"]) > now:
                 error = "PIN temporarily locked. Wait 15 minutes or verify a reset with Erik. Actual hours can still be reported in Slack."
-            elif not re.fullmatch(r"[0-9]{6}", pin) or not secrets.compare_digest(self._digest(pin, row["salt"]), row["digest"]):
+            elif not re.fullmatch(r"[0-9]{2,6}", pin) or not secrets.compare_digest(self._digest(pin, row["salt"]), row["digest"]):
                 failures = (0 if row["locked_until"] else row["failures"]) + 1
                 until = (now + timedelta(minutes=15)).isoformat() if failures >= 5 else None
                 conn.execute("UPDATE kiosk_pins SET failures=?,locked_until=? WHERE actor=?", (failures, until, actor))

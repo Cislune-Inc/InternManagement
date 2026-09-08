@@ -1520,16 +1520,19 @@ class InternManagementRuntime:
                        for key, (label, _) in CLOCK_ACTIONS.items()]
             buttons[0]["style"] = "primary"
             return {"type": "home", "blocks": [
-                {"type": "header", "text": {"type": "plain_text", "text": "Don Pollo · Time clock"}},
+                {"type": "header", "text": {"type": "plain_text", "text": "Don Pollo · Hours & work"}},
                 {"type": "actions", "elements": buttons[:5]},
                 {"type": "section", "text": {"type": "mrkdwn", "text": clock_status}},
                 {"type": "actions", "elements": buttons[5:]},
                 {"type": "section", "text": {"type": "mrkdwn", "text": (
-                    "DP is your beta time clock. No ClickUp task or detailed plan is needed to record hours. "
+                    "This is Don Pollo Project Updates, connected to the shop Mini time clock. "
+                    "Already set up? Use My hours to check your recorded time. "
+                    "No ClickUp task or detailed plan is needed to record hours. "
                     "Describe your work in Messages and I will help clarify it. "
                     "Use `work update` for results and `work next` for the next step or blocker. "
                     "Preview update creates a private draft; confirmation saves a handoff, never a channel post.\n"
-                    "At the Mini, choose your name and enter your PIN. One-time setup: send `kiosk setup` here. "
+                    "At the Mini, choose your name and type your 2–6 digit PIN using the keyboard. "
+                    "One-time setup: select Set up / reset PIN above, then choose your PIN on the Mini within ten minutes. "
                     "Onsite meal returns also need the Mini; approved remote workers use `clock in remote`. "
                     "For a correction, DM `report hours` with the actual date, times and breaks. "
                     "If DP is unavailable, Slack Erik your actual hours—not Gusto Kiosk.\n\n" + COMPANY_HANDOFF

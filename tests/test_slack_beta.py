@@ -98,6 +98,10 @@ def test_legacy_portal_reads_cannot_enforce_or_mutate_during_cutover(runtime, mo
 def test_home_status_does_not_create_a_shift(runtime):
     view = runtime.build_slack_app_home_view("WORKER")
     assert "Clocked out" in view["blocks"][2]["text"]["text"]
+    assert view["blocks"][0]["text"]["text"] == "Don Pollo · Hours & work"
+    action_ids = [e["action_id"] for b in view["blocks"] if b["type"] == "actions" for e in b["elements"]]
+    assert "dp_clock_pin_setup" in action_ids
+    assert "Don Pollo Project Updates" in view["blocks"][4]["text"]["text"]
     with runtime.state_store._connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
 

@@ -12,7 +12,7 @@ from .ssl_compat import build_ssl_context
 logger = logging.getLogger(__name__)
 
 CLOCK_ACTIONS = {
-    "dp_clock_in": ("Shop check-in", "clock in onsite"),
+    "dp_clock_in": ("Kiosk instructions", "clock in onsite"),
     "dp_clock_out": ("Clock out", "clock out"),
     "dp_clock_hours": ("My hours", "hours"),
     "dp_clock_lunch": ("Lunch", "lunch"),
@@ -21,6 +21,7 @@ CLOCK_ACTIONS = {
     "dp_clock_work_status": ("Current work", "work status"),
     "dp_clock_work_draft": ("Preview update", "work draft"),
     "dp_clock_handoffs": ("Confirmed handoffs", "work handoffs"),
+    "dp_clock_pin_setup": ("Set up / reset PIN", "kiosk setup"),
 }
 
 

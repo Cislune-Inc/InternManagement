@@ -108,7 +108,7 @@ async def handle_message(runtime: Any, event: dict[str, Any]) -> bool:
     if text.lower() == "kiosk setup":
         from .kiosk_pins import KioskPins
         KioskPins(runtime.state_store).allow_setup(slack_id, authorized_by="slack:" + slack_id, now=now)
-        await runtime.slack.post_message(slack_id, "PIN setup is open for your identity for ten minutes. At the Mini, choose your name, tap Set / reset PIN and enter a six-digit PIN twice. Never send your PIN in chat. This is one-time setup; daily check-in needs only the Mini.")
+        await runtime.slack.post_message(slack_id, "PIN setup is open for your identity for ten minutes. At the Mini, choose your name, select Set / reset PIN and type the same 2–6 digit PIN twice using the keyboard. Four or more digits recommended. Never send your PIN in chat. This is one-time setup; daily check-in needs only the Mini.")
         return True
     if text.lower().startswith("kiosk "):
         await runtime.slack.post_message(slack_id, "Use `kiosk setup` with no name or PIN to open setup for your own identity. Enter PINs only on the Mini screen, never in chat.")

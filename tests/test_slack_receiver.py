@@ -37,3 +37,17 @@ def test_publish_app_home_refreshes_config_and_publishes_view() -> None:
 
     assert refreshed == [True]
     assert calls == [("UERIK", {"type": "home", "user": "UERIK"})]
+
+
+def test_pin_setup_button_uses_clicking_slack_identity() -> None:
+    calls = []
+
+    async def handle(client, event):
+        calls.append(event)
+
+    runtime = SimpleNamespace(handle_slack_direct_message=handle)
+    asyncio.run(slack_receiver.handle_clock_action(runtime, None, {
+        "user": {"id": "UACTOR"},
+        "actions": [{"action_id": "dp_clock_pin_setup", "action_ts": "123.456"}],
+    }))
+    assert calls == [{"user": "UACTOR", "text": "kiosk setup", "event_ts": "123.456"}]

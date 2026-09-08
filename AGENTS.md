@@ -17,6 +17,8 @@
 - Onsite clock-in, meal return and paid-rest return require confirmation at the Mini's loopback-only
   kiosk, not a Slack self-attestation, GPS claim, QR link or VPN source address.
   Use name + personal PIN, not temporary Slack codes. PINs are salted/scrypt-hashed;
+  accept 2–6 digits with four or more recommended and keyboard entry, no onscreen
+  keypad. Preserve existing PINs and durable lockouts when changing the UI.
   never put them in chat, clock events, logs, browser storage or URLs. Setup/reset
   requires the worker's authenticated Slack identity or a verified local operator.
   Keep the owner company-management remote exception visible; staff remote work
