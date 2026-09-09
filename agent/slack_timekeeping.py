@@ -43,16 +43,16 @@ def timestamp(value: str | None) -> datetime | None:
 
 
 def clock_command(text: str) -> tuple[str, str] | None:
-    text = text.strip()
+    text = text.strip().rstrip(".! ")
     if text.lower() == "required rest":
         return "rest", "required"
     for pattern, command in [
         (r"(?:clock[ -]?in|start work)(?:\s+(.*))?", "in"),
         (r"(?:clock[ -]?out|stop work|done for (?:the )?day)", "out"),
-        (r"(?:lunch|start lunch)", "lunch"),
-        (r"(?:break|short break|start break)", "rest"),
+        (r"(?:(?:i(?:['’]m| am)\s+)?(?:taking|starting)\s+(?:my\s+)?lunch|lunch|start lunch)(?:\s+now)?", "lunch"),
+        (r"(?:(?:i(?:['’]m| am)\s+)?(?:taking|starting)\s+(?:a\s+)?break|break|short break|start break)(?:\s+now)?", "rest"),
         (r"(?:pause|extra pause|extra break)", "pause"),
-        (r"(?:back|back from (?:lunch|break)|resume)", "back"),
+        (r"(?:(?:i(?:['’]m| am)\s+)?back(?: from (?:lunch|break))?|resume)(?:\s+now)?", "back"),
         (r"(?:hours|my hours|time|status)", "hours"),
         (r"(?:clock help|help|clock)", "help"),
         (r"report hours\s+(.+)", "report"),

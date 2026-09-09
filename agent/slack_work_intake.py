@@ -62,6 +62,9 @@ def project_candidates(text: str) -> list[str]:
 
 def switch_target(text: str) -> str | None:
     """Only explicit current self-reported switches, not options or future plans."""
+    # Evaluate the final sentence/clause independently: historical narrative
+    # before an explicit current switch must not keep the stale destination.
+    text = re.split(r"[.!;]\s+|\n+", text.strip())[-1]
     if re.search(r"\b(if|might|could|should|considering|tomorrow|later)\b|\?", text, re.I):
         return None
     match = re.search(

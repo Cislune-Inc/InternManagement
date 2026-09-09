@@ -185,6 +185,9 @@ async def handle_message(runtime: Any, event: dict[str, Any]) -> bool:
     if text.lower() in {"login", "portal", "website", "link"}:
         await runtime.slack.post_message(slack_id, HELP + "\nThe old task-gated portal is not the beta clock. Use Slack for hours.")
         return True
+    if re.search(r"\b(break|lunch)\b", text, re.I) and re.match(r"^(?:check again|when (?:can|should)|why|did (?:i|you)|am i)\b", text, re.I):
+        await runtime.slack.post_message(slack_id, ledger(runtime).snapshot(user, now) + "\nUse `break` or `lunch` to start now, or `back` when you return.")
+        return True
     # Preserve explicit legacy admin tools, but ordinary admin prose uses the
     # same work assistant as everyone else.
     if admin and text.lower().startswith(("run ", "admin ")):
