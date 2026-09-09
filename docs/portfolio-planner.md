@@ -68,3 +68,27 @@ node tests/test_portfolio_schedule.cjs
 
 Basis: [GAO Schedule Assessment Guide](https://www.gao.gov/products/gao-16-89g).
 Dependencies, resources and schedule risk matter more than manually drawn dates.
+
+## On-site technical preview service
+
+`python -m agent.portfolio_test_server` serves a reviewed technical snapshot from
+an isolated release directory on a specific office IPv4 interface. The caller
+supplies `--host`, `--network`, `--snapshot` and `--feedback-db`; default port 8876.
+It is an explicitly authorized LAN test audience, not the authenticated manager
+or future worker account portal. No production runtime, clock database or
+configuration is loaded. Unlisted snapshot fields are excluded, but the operator
+must also review the allowed-field text for its intended team audience.
+
+The service checks peer subnet and Host, exposes only the preview/liveness and
+feedback submission, and gives no directory browsing or feedback-reading API.
+Feedback requires same-origin POST and a page token, is bounded and idempotent,
+and goes into its own private SQLite file. Names are optional self-reports, not
+verified identity. Source plan edits remain browser-local. There is no Slack send.
+
+Use a dedicated per-user LaunchAgent with RunAtLoad/KeepAlive, referencing a
+versioned release and the existing Python interpreter. Keep logs and the feedback
+database outside the release. Replacing the preview never restarts Don Pollo.
+This pilot requires the service account's existing login session after reboot;
+it does not establish unattended boot recovery. A changed DHCP address requires
+rechecking and updating the explicit listener/allowlist. Stop the preview by
+booting out its single LaunchAgent; preserve its feedback database.
