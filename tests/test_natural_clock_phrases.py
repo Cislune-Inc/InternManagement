@@ -2,7 +2,7 @@ import pytest
 from agent.slack_timekeeping import clock_command
 from agent.slack_work_intake import switch_target
 
-@pytest.mark.parametrize('text,action', [('Break now','rest'),('Taking lunch','lunch'),("I'm taking a break now.",'rest'),('Starting lunch now!','lunch'),("I'm back",'back'),('back from lunch now','back')])
+@pytest.mark.parametrize('text,action', [('Break now','rest'),('Taking lunch','lunch'),("I'm taking a break now.",'rest'),('Starting lunch now!','lunch'),("I'm back",'back'),('back from lunch now','back'),('My break is now done.','back'),('Lunch is over','back')])
 def test_current_clock_phrases(text, action):
     assert clock_command(text) == (action, '')
 

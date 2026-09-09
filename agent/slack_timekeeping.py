@@ -53,6 +53,7 @@ def clock_command(text: str) -> tuple[str, str] | None:
         (r"(?:(?:i(?:['’]m| am)\s+)?(?:taking|starting)\s+(?:a\s+)?break|break|short break|start break)(?:\s+now)?", "rest"),
         (r"(?:pause|extra pause|extra break)", "pause"),
         (r"(?:(?:i(?:['’]m| am)\s+)?back(?: from (?:lunch|break))?|resume)(?:\s+now)?", "back"),
+        (r"(?:my\s+)?(?:break|lunch)\s+is\s+(?:now\s+)?(?:done|over|finished)", "back"),
         (r"(?:hours|my hours|time|status)", "hours"),
         (r"(?:clock help|help|clock)", "help"),
         (r"report hours\s+(.+)", "report"),

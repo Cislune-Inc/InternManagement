@@ -46,6 +46,14 @@ def event(text, hour=9, user="WORKER"):
     return {"user": user, "text": text, "ts": str(datetime.fromisoformat(f"2026-09-07T{hour:02d}:00:00-07:00").timestamp())}
 
 
+def test_mixed_return_and_work_note_clarifies_without_creating_punch(runtime):
+    from agent.slack_beta import handle_message
+    assert asyncio.run(handle_message(runtime, event('My break is now done. Planning to work on MTT again now')))
+    assert 'Send `back`' in runtime.test_sent[-1][1]
+    with runtime.state_store._connect() as conn:
+        assert conn.execute('SELECT COUNT(*) FROM sessions').fetchone()[0] == 0
+
+
 def test_quiet_clock_tick_delivers_work_checkin_after_notice_cooldown(runtime):
     from agent.slack_beta import ledger, tick
 

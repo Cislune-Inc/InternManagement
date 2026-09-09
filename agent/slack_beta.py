@@ -188,6 +188,9 @@ async def handle_message(runtime: Any, event: dict[str, Any]) -> bool:
     if re.search(r"\b(break|lunch)\b", text, re.I) and re.match(r"^(?:check again|when (?:can|should)|why|did (?:i|you)|am i)\b", text, re.I):
         await runtime.slack.post_message(slack_id, ledger(runtime).snapshot(user, now) + "\nUse `break` or `lunch` to start now, or `back` when you return.")
         return True
+    if re.search(r"\b(?:my\s+)?(?:break|lunch)\s+is\s+(?:now\s+)?(?:done|over|finished)\b", text, re.I):
+        await runtime.slack.post_message(slack_id, "I see a break return mixed with your work update. Send `back` to record your return, then send the work update separately.")
+        return True
     # Preserve explicit legacy admin tools, but ordinary admin prose uses the
     # same work assistant as everyone else.
     if admin and text.lower().startswith(("run ", "admin ")):
