@@ -370,6 +370,7 @@ def _dashboard_template() -> str:
       <div class="nav-row">
         <a class="nav-link" href="/time">Time Tracking</a>
         <a class="nav-link primary" href="/work">Work Dashboard</a>
+        <a class="nav-link" href="/portfolio">Project Planner</a>
         <a class="nav-link" href="/payroll">Payroll</a>
         <a class="nav-link" href="/exceptions">Manager Queue</a>
         <a class="nav-link" href="/health">System Health</a>
