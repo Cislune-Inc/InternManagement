@@ -42,7 +42,9 @@ document.querySelector('#setup').onclick=()=>{mode(!setup);result.textContent=se
 document.querySelector('#cancel').onclick=clear;
 async function submit(action){if(busy||!form.reportValidity())return;const actor=person.value;const id=pending&&pending.actor===actor&&pending.action===action?pending.id:crypto.randomUUID();pending={actor,action,id};
 const payload={actor,pin:pin.value,confirmation:confirmPin.value,action,request_id:id};busy=true;clearTimeout(timer);document.querySelectorAll('button,input,select').forEach(el=>el.disabled=true);result.textContent='Checking…';
-try{const response=await fetch(setup?'/pin/setup':'/confirm',{method:'POST',headers:{'Content-Type':'application/json','X-Kiosk-CSRF':csrf},body:JSON.stringify(payload)});const data=await response.json();result.textContent=data.message;
+try{const response=await fetch(setup?'/pin/setup':'/confirm',{method:'POST',headers:{'Content-Type':'application/json','X-Kiosk-CSRF':csrf},body:JSON.stringify(payload)});
+if(response.status===403){pin.value='';confirmPin.value='';pending=null;result.textContent='This kiosk page expired. Reloading—please enter your PIN again.';window.location.reload();return;}
+const data=await response.json();result.textContent=data.message;
 if(response.ok){pending=null;mode(false);person.value='';}else{pin.value='';confirmPin.value='';}}
 catch{pin.value='';confirmPin.value='';result.textContent='Connection interrupted. Check My hours in Slack before retrying. Report actual times to Erik if needed.';}
 finally{payload.pin='';payload.confirmation='';busy=false;document.querySelectorAll('button,input,select').forEach(el=>el.disabled=false);timer=setTimeout(clear,15000);}}

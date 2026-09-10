@@ -140,6 +140,8 @@ async def headers(client):
     assert "keypad" not in text and "six-digit" not in text
     assert "keyboard" in text and "Four or more digits recommended" in text
     assert "Today " not in text and PIN not in text
+    assert 'response.status===403' in text and 'window.location.reload()' in text
+    assert text.index('response.status===403') < text.index('await response.json()')
     return {**host, "Origin": ORIGIN, "X-Kiosk-CSRF": token}
 
 
