@@ -1,24 +1,30 @@
 # Channel-first worker updates
 
-The first release accepts explicit app mentions only in `work_summary_channels`,
-from active enrolled workers. `channel_updates_enabled` defaults false and must
-remain false until the Slack installation has `app_mentions:read` and subscribes
-to `app_mention`. No channel-history or blanket DM-forwarding scope is required.
+Owner correction: capture ordinary human posts in every public/private channel the
+bot can access. No mention, enrollment or formatting requirement. The existing
+project/channel map supplies context, not an ingestion gate or charging approval.
+Unmapped channels remain unmapped for review. Personal/group DMs stay separate.
+`channel_updates_enabled` defaults false until Slack grants `channels:history` and
+`groups:history` with `message.channels` and `message.groups` subscriptions.
+Channel-list permissions support coverage auditing; bot membership still governs
+delivery. Enabling the flag alone does not prove workspace-wide coverage.
 
-Workers may post their result, next step or blocker in a configured project channel
-and mention Don Pollo. Capture is source-linked, with a short in-thread receipt.
-Five or more words count as a provisional substantive update for two-hour progress
-prompt suppression. This is not AI quality validation, work approval, contract
+Workers post normally. Capture is source-linked and quiet: no per-post receipt,
+reaction or question. Short work-result text or captioned files can suppress a
+redundant private progress prompt. This is a conservative heuristic, not a worker
+formatting rule; ambiguous/chatter posts are also preserved but do not suppress
+prompts. This is not AI quality validation, work approval, contract
 charging, or attendance. Channel traffic never executes timekeeping commands or
 extends the attendance inactivity timer. Files are retained as metadata references;
 their contents are not downloaded, interpreted or automatically reposted.
 
-Only explicit mentions are captured. Ordinary thread replies and later edits or
-deletions are not synchronized in this first increment. To correct an update,
-post a new clearly labeled correction and mention DP again. Originals remain.
-Reusing the same channel/message timestamp cannot create a second receipt. A
-transport failure is logged without blind retries. This is not a full channel
-history mirror or an unattended digest publisher.
+Ordinary thread replies are included. Edits update the current view while retaining
+prior versions for audit; deletions exclude the post from current views and prompt
+suppression. Late retries cannot resurrect deleted content. Editing an old post
+does not count as new work today: its original posting time remains the anchor.
+Bot messages are ignored. No raw private content is automatically forwarded into
+another channel. Reviewed useful summaries remain a separate publication action;
+this is not an unattended digest publisher or historical full-workspace mirror.
 
 DM `work channel updates` lists the user's captured reports; only the primary
 owner can list across users. `work draft` offers the existing exact-version
@@ -26,8 +32,8 @@ owner can list across users. `work draft` offers the existing exact-version
 reposted. No source-channel finding becomes an approved project plan.
 
 Activation acceptance: verify app permission/event subscription, enable the scoped
-flag, then observe one real worker mention in an approved project channel. Verify
-source row/permalink, one threaded receipt, no duplicate private progress prompt,
+flag, then observe one real ordinary post and check actual channel coverage. Verify
+source row/permalink, no channel spam, no duplicate private progress prompt,
 and unchanged attendance. Do not manufacture production hours or test progress.
 
 Related DM repairs: greetings and clock-status questions bypass work intake;

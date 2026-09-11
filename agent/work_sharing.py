@@ -73,7 +73,7 @@ class WorkSharing:
                 conn.execute("""INSERT INTO work_share_delivery(draft_id,channel,status) VALUES (?,?,'preview')
                     ON CONFLICT(draft_id) DO UPDATE SET channel=excluded.channel WHERE status='preview'""", (ident, destination))
                 share_note = (f"\nPrefer posting yourself? Put this update in <#{destination}>. "
-                              + ("Mention Don Pollo to capture it as your update. " if channel_capture_enabled else "")
+                              + ("DP captures channel updates automatically; no mention or special format needed. " if channel_capture_enabled else "")
                               +
                               f"Or have DP share this exact version: `work share {ident}`. "
                               "Keep private details out of the team version.")
