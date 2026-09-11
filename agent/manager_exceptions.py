@@ -25,6 +25,20 @@ async def build_manager_exceptions_payload(
         reference_now=now,
     )
     exceptions: list[dict[str, Any]] = []
+    if getattr(runtime.config.slack, "work_intake_beta_slack_user_ids", []):
+        from .slack_work_intake import SlackWorkIntake
+        from .slack_timekeeping import SlackTimekeeping
+
+        exceptions.extend(SlackWorkIntake(runtime.state_store).pending_exceptions())
+        for report in SlackTimekeeping(runtime.state_store).reports():
+            exceptions.append({
+                "id": report["id"], "severity": "warning", "category": "actual_hours_report",
+                "person": report["user_key"], "user_key": report["user_key"], "session_date": "",
+                "summary": "Actual hours need manager reconciliation", "source": "slack_clock_report",
+                "last_seen_at": report["reported_at"], "occurrence_count": 1,
+                "details": {"original_report": report["text"], "recommended_action":
+                            "Reconcile the worker's actual start/end and breaks in the hours editor before payroll. Preserve the original report; do not substitute compliant-looking times."},
+            })
     for person in work.get("people", []):
         if not isinstance(person, dict):
             continue

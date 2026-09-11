@@ -34,6 +34,11 @@ class OperationalIssueReporter:
         self.admins_provider = admins_provider
         self.timezone_provider = timezone_provider
 
+    def _notification_targets(self, config: AgentConfig) -> list[AdminProfile]:
+        cohort = config.slack.work_intake_beta_slack_user_ids
+        return [admin for admin in self.admins_provider() if admin.slack_user_id
+                and (not cohort or admin.slack_user_id in cohort)]
+
     async def report(
         self,
         *,
@@ -74,7 +79,7 @@ class OperationalIssueReporter:
             now=observed_at,
         ):
             return issue
-        targets = [admin for admin in self.admins_provider() if admin.slack_user_id]
+        targets = self._notification_targets(config)
         if not targets:
             return issue
         message = _issue_message(
@@ -147,7 +152,7 @@ class OperationalIssueReporter:
         issues = self.state_store.list_operational_issues(status="open", limit=1000)
         if not issues:
             return False
-        targets = [admin for admin in self.admins_provider() if admin.slack_user_id]
+        targets = self._notification_targets(config)
         if not targets:
             return False
         signature = _digest_signature(issues)

@@ -47,16 +47,27 @@ def test_production_controls_schedule_daily_pacific_digest_and_meal_minimum() ->
     assert "slack.operational_digest_hour" in changed
 
 
-def test_production_controls_limit_worker_portal_beta_to_erik_and_aj() -> None:
-    payload: dict = {}
+def test_production_controls_do_not_reenroll_old_workers_or_reset_url() -> None:
+    payload: dict = {"slack": {"worker_portal_beta_slack_user_ids": ["CURRENT"],
+                              "manager_queue_url": "http://192.168.40.177:8765/exceptions"}}
 
     changed = apply_controls(payload)
 
-    assert payload["slack"]["worker_portal_beta_slack_user_ids"] == [
-        "U01SWQKDTBM",
-        "U095NMY2U4R",
-    ]
-    assert "slack.worker_portal_beta_slack_user_ids" in changed
+    assert payload["slack"]["worker_portal_beta_slack_user_ids"] == ["CURRENT"]
+    assert "slack.worker_portal_beta_slack_user_ids" not in changed
+    assert "slack.manager_queue_url" not in changed
+
+
+def test_verified_url_is_explicit_and_credentials_rejected():
+    import pytest
+    payload = {}
+    apply_controls(payload, base_url="http://192.168.40.177:8765/")
+    assert payload["slack"]["manager_queue_url"] == "http://192.168.40.177:8765/exceptions"
+    for bad in ["http://user:secret@host", "http://host/?token=secret", "http://host/path", "javascript:alert(1)"]:
+        untouched = {}
+        with pytest.raises(ValueError):
+            apply_controls(untouched, base_url=bad)
+        assert untouched == {}
 
 
 def test_production_controls_configure_management_slack_admins() -> None:

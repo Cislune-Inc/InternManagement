@@ -360,6 +360,17 @@ def _parse_admin_profiles(raw_admins: Any) -> list[AdminProfile]:
     return admins
 
 
+def _parse_work_summary_channels(value: Any) -> dict[str, str]:
+    from .slack_work_intake import PROJECTS
+    import re
+    if not isinstance(value, dict) or any(
+        key not in PROJECTS or not isinstance(channel, str) or not re.fullmatch(r"[CG][A-Z0-9]{8,}", channel)
+        for key, channel in value.items()
+    ):
+        raise ValueError("work_summary_channels must map known project keys to explicit Slack channel IDs")
+    return dict(value)
+
+
 def _parse_slack_config(raw_slack: Any) -> SlackConfig:
     if not isinstance(raw_slack, dict):
         return SlackConfig()
@@ -402,6 +413,15 @@ def _parse_slack_config(raw_slack: Any) -> SlackConfig:
         worker_portal_beta_slack_user_ids=_clean_string_list(
             raw_slack.get("worker_portal_beta_slack_user_ids")
         ),
+        work_intake_beta_slack_user_ids=_clean_string_list(
+            raw_slack.get("work_intake_beta_slack_user_ids")
+        ),
+        clock_handover_pending_slack_user_ids=_clean_string_list(
+            raw_slack.get("clock_handover_pending_slack_user_ids")
+        ),
+        progress_checkins_enabled=bool(raw_slack.get("progress_checkins_enabled", False)),
+        channel_updates_enabled=bool(raw_slack.get("channel_updates_enabled", False)),
+        work_summary_channels=_parse_work_summary_channels(raw_slack.get("work_summary_channels", {})),
         quarantine_uncertain_routes=bool(
             raw_slack.get("quarantine_uncertain_routes", True)
         ),
