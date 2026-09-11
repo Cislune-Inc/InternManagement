@@ -142,6 +142,7 @@ class SlackConfig:
     work_intake_beta_slack_user_ids: list[str] = field(default_factory=list)
     clock_handover_pending_slack_user_ids: list[str] = field(default_factory=list)
     progress_checkins_enabled: bool = False
+    channel_updates_enabled: bool = False
     work_summary_channels: dict[str, str] = field(default_factory=dict)
     quarantine_uncertain_routes: bool = True
     thread_daily_updates: bool = True

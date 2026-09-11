@@ -30,6 +30,8 @@ PROJECTS = {
     "exploration": "Exploration: Gweike, eufyMake, BrightDrop or another proposed idea",
     "mars_to_table": "Mars to Table competition",
     "lunarecycle": "LunaRecycle closeout",
+    "carve_core": "CARVE CORE — workstream; funding allocation needs review",
+    "carve_ex": "CARVE EX — workstream; funding allocation needs review",
 }
 _BOUNDARY = (
     "Your work description does not start or stop your clock. Use `clock in onsite`, `clock out`, or `hours` here in Slack. "
@@ -55,8 +57,9 @@ def _safe(text: Any) -> str:
 
 
 def project_candidates(text: str) -> list[str]:
-    aliases = {"dp": r"don\s+pollo|clickup\s+replacement", "mars_to_table": r"mars\s+to\s+table",
-               "lunarecycle": r"luna\s*recycle"}
+    aliases = {"dp": r"don\s+pollo|clickup\s+replacement", "mars_to_table": r"mars\s+to\s+table|mtt",
+               "lunarecycle": r"luna\s*recycle", "carve_core": r"carve\s+core",
+               "carve_ex": r"carve\s+ex", "proposals": r"proposal|phase\s+(?:ii|2)\s+sequential|p2\s+sequential"}
     return [key for key in PROJECTS if re.search(rf"\b(?:{key}|{aliases.get(key, key)})\b", text, re.I)]
 
 
@@ -161,6 +164,13 @@ class SlackWorkIntake:
         # A reported change of focus is a new pending work record, not another
         # observation silently appended to a previously approved project.
         target = switch_target(content if command == "update" else body)
+        # A clearly named current focus starts its own pending record instead of
+        # staying under an unrelated label. Keep earlier events/approvals intact.
+        if command == "update" and not target and item:
+            candidates = project_candidates(content)
+            current = re.match(r"^(?:i(?:['’]?m| am)\s+)?(?:now\s+)?working on\b", content, re.I)
+            if len(candidates) == 1 and candidates[0] != item['project_key'] and (current or not item['project_key']):
+                target = content
         if target and command not in {"approve", "redirect", "project", "edit", "detail", "next"}:
             body = content if command == "update" else body
             command = "proposal"

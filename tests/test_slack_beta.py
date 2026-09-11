@@ -46,6 +46,16 @@ def event(text, hour=9, user="WORKER"):
     return {"user": user, "text": text, "ts": str(datetime.fromisoformat(f"2026-09-07T{hour:02d}:00:00-07:00").timestamp())}
 
 
+@pytest.mark.parametrize('text', ['Hello', 'Am I clocked in now?', 'Is my timer running?'])
+def test_greeting_and_status_are_not_work_proposals(runtime, text):
+    from agent.slack_beta import handle_message
+    assert asyncio.run(handle_message(runtime, event(text)))
+    with runtime.state_store._connect() as c:
+        assert c.execute('SELECT COUNT(*) FROM sessions').fetchone()[0] == 0
+        table = c.execute("SELECT name FROM sqlite_master WHERE name='work_intake_items'").fetchone()
+        assert not table or c.execute('SELECT COUNT(*) FROM work_intake_items').fetchone()[0] == 0
+
+
 def test_mixed_return_and_work_note_clarifies_without_creating_punch(runtime):
     from agent.slack_beta import handle_message
     assert asyncio.run(handle_message(runtime, event('My break is now done. Planning to work on MTT again now')))

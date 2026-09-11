@@ -117,6 +117,14 @@ async def handle_message(runtime: Any, event: dict[str, Any]) -> bool:
         KioskPins(runtime.state_store).allow_setup(slack_id, authorized_by="slack:" + slack_id, now=now)
         await runtime.slack.post_message(slack_id, "PIN setup is open for your identity for ten minutes. At the Mini, choose your name, select Set / reset PIN and type the same 2–6 digit PIN twice using the keyboard. Four or more digits recommended. Never send your PIN in chat. This is one-time setup; daily check-in needs only the Mini.")
         return True
+    if text.strip().strip('`').lower() == 'kiosk setup':
+        return await handle_message(runtime, {**event, 'text': 'kiosk setup'})
+    if re.fullmatch(r'(?:hi|hello|hey)[!. ]*', text, re.I):
+        await runtime.slack.post_message(slack_id, 'Hi! What are you planning to work on? Name the project or workstream and the next useful result. For your clock, use `hours`.')
+        return True
+    if re.fullmatch(r'(?:am i (?:clocked|logged) in(?: now)?|is my (?:clock|timer) running)[?!. ]*', text, re.I):
+        await runtime.slack.post_message(slack_id, ledger(runtime).snapshot(user, now))
+        return True
     if text.lower().startswith("kiosk "):
         await runtime.slack.post_message(slack_id, "Use `kiosk setup` with no name or PIN to open setup for your own identity. Enter PINs only on the Mini screen, never in chat.")
         return True

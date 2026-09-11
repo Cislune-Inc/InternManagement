@@ -77,6 +77,14 @@ class SlackSocketReceiver:
         web_client = build_slack_web_client(self.bot_token)
         app = AsyncApp(client=web_client)
 
+        @app.event("app_mention")
+        async def handle_project_mention(event: dict[str, Any]) -> None:
+            from .channel_updates import handle
+            try:
+                await handle(self.runtime, web_client, event)
+            except Exception:
+                logger.exception("Project mention processing failed; attendance unchanged.")
+
         @app.action(re.compile(r"^dp_clock_"))
         async def handle_clock_button(ack: Any, body: dict[str, Any]) -> None:
             await ack()

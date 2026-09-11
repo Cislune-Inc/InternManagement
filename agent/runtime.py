@@ -1482,6 +1482,12 @@ class InternManagementRuntime:
                 await self.slack.post_message(slack_user_id, receipt)
                 context = "No controlling contract/accepted plan supplied. Alignment remains unverified."
                 context += "\nCurrent worker-owned work record: " + json.dumps(work_context)
+                if hours_user:
+                    current_clock = ledger(self).current_session(hours_user, observed_at)
+                    if current_clock and current_clock.clocked_in_at:
+                        from .slack_timekeeping import timestamp
+                        elapsed = (observed_at - timestamp(current_clock.clocked_in_at)).total_seconds()
+                        context += "\nWork-block phase: " + ("beginning" if 0 <= elapsed < 1800 else "in progress")
                 if worker and getattr(self, "clickup", None):
                     try:
                         tasks = await asyncio.wait_for(self.clickup.list_assigned_tasks(worker, limit=5), timeout=3)

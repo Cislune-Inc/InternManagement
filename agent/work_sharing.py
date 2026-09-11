@@ -38,7 +38,7 @@ class WorkSharing:
             lines.append("Reference (not verified): " + _safe(url))
         return "\n".join(lines)
 
-    def preview(self, actor: str, channels: dict[str, str] | None = None) -> str:
+    def preview(self, actor: str, channels: dict[str, str] | None = None, *, channel_capture_enabled: bool = False) -> str:
         with self.store._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             item = conn.execute("SELECT * FROM work_intake_items WHERE owner_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1", (actor,)).fetchone()
@@ -72,8 +72,11 @@ class WorkSharing:
             if destination:
                 conn.execute("""INSERT INTO work_share_delivery(draft_id,channel,status) VALUES (?,?,'preview')
                     ON CONFLICT(draft_id) DO UPDATE SET channel=excluded.channel WHERE status='preview'""", (ident, destination))
-                share_note = (f"\nShare this exact version to <#{destination}>: `work share {ident}`. "
-                              "Check the destination and remove confidential/personal content first. Sharing also confirms accuracy.")
+                share_note = (f"\nPrefer posting yourself? Put this update in <#{destination}>. "
+                              + ("Mention Don Pollo to capture it as your update. " if channel_capture_enabled else "")
+                              +
+                              f"Or have DP share this exact version: `work share {ident}`. "
+                              "Keep private details out of the team version.")
             return (f"*Private draft `{ident}` — not sent*\n" + self._render(row)
                     + f"\n\nConfirm accuracy: `work confirm {ident}`. This saves a Codex/owner handoff; it does not post to a channel."
                     + "\nCorrect it with `work update <corrected result>` or add `work next <next step / blocker>`, then request `work draft` again."
@@ -146,7 +149,7 @@ class WorkSharing:
 
 async def handle(runtime: Any, slack_id: str, text: str) -> bool:
     normalized = text.strip().lower()
-    if not (normalized in {"work draft", "work drafts", "work handoffs"} or normalized.startswith(("work confirm ", "work share ", "work publish ", "work send "))):
+    if not (normalized in {"work draft", "work drafts", "work handoffs", "work channel updates"} or normalized.startswith(("work confirm ", "work share ", "work publish ", "work send "))):
         return False
     from .slack_work_intake import SlackWorkIntake
     SlackWorkIntake(runtime.state_store)
@@ -154,8 +157,11 @@ async def handle(runtime: Any, slack_id: str, text: str) -> bool:
     admin = runtime.admin_profile_by_slack_user_id(slack_id)
     owner = bool(admin and admin.discord_user_id == runtime.config.admin_discord_user_id)
     channels = getattr(getattr(runtime.config, "slack", None), "work_summary_channels", {})
-    if normalized == "work draft":
-        response = service.preview(slack_id, channels)
+    if normalized == "work channel updates":
+        from .channel_updates import ChannelUpdates
+        response = ChannelUpdates(runtime.state_store).recent(actor=None if owner else slack_id)
+    elif normalized == "work draft":
+        response = service.preview(slack_id, channels, channel_capture_enabled=getattr(getattr(runtime.config, 'slack', None), 'channel_updates_enabled', False))
     elif normalized.startswith("work share "):
         response = await service.share(slack_id, text.strip().split(maxsplit=2)[2].strip(), channels, runtime.slack)
     elif normalized.startswith("work confirm "):

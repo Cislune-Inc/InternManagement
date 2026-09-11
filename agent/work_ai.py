@@ -48,6 +48,11 @@ listing contract, IRAD and overhead terminology. Offer one likely project as a
 question only if the supplied evidence supports it, never as an automatic label.
 Do not re-ask the same project question immediately after a partial answer;
 acknowledge the useful detail and leave the unresolved destination for review.
+If the supplied work-block phase is beginning, ask about the next intended result,
+not completed progress. A named workstream such as CARVE CORE is a useful answer;
+do not make the worker repeat it to settle a funding allocation. Leave that for
+manager review. When a useful result is ready, a brief optional suggestion to post
+it in its supplied project channel is welcome; do not claim it has been shared.
 Suggest at most three small next steps as OPTIONS only when requested or useful
 for a stated blocker; otherwise return [].
 Options are never assigned or approved work. Keep alignment caveats in the internal
@@ -86,7 +91,7 @@ class WorkAI:
         if self.client is None and not os.getenv("OPENAI_API_KEY"):
             return None
         note, context = note[:6000], context[:6000]
-        fingerprint = hashlib.sha256(json.dumps([self.model, actor_id, note, context, "work-coach-v3"]).encode()).hexdigest()
+        fingerprint = hashlib.sha256(json.dumps([self.model, actor_id, note, context, "work-coach-v4"]).encode()).hexdigest()
         day = datetime.now(timezone.utc).date().isoformat()
         with self.store._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")

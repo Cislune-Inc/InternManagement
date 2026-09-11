@@ -25,6 +25,26 @@ def item_id(response):
     return re.search(r"DP-[0-9a-f]{12}", response)[0]
 
 
+def test_named_workstream_starts_new_record_without_relabeling_history(intake):
+    old = item_id(send(intake, 'work an unnamed activity', event='old'))
+    reply = send(intake, 'work update Im working on PCB design for CARVE CORE', event='core')
+    new = item_id(reply)
+    assert new != old
+    assert 'CARVE CORE' in reply
+    with intake.store._connect() as c:
+        assert c.execute('SELECT project_key FROM work_intake_items WHERE id=?',(old,)).fetchone()[0] == ''
+        assert c.execute('SELECT project_key FROM work_intake_items WHERE id=?',(new,)).fetchone()[0] == 'carve_core'
+        assert c.execute('SELECT status FROM work_intake_items WHERE id=?',(new,)).fetchone()[0] == 'pending'
+
+
+def test_explicit_current_focus_leaves_old_project_and_hypothetical_does_not(intake):
+    old = item_id(send(intake, 'work MTT: prepare slides', event='old'))
+    assert item_id(send(intake, 'work update Tomorrow I might work on Bagworm',event='future')) == old
+    new = item_id(send(intake, 'work update Working on Phase II Sequential',event='current'))
+    assert new != old
+    assert intake.coaching_context('WORKER',new)['project'] == PROJECTS['proposals']
+
+
 def test_preserves_raw_words_and_never_starts_time(intake):
     text = "work GRASP: compare wheel-slip runs and save a plot for George"
     response = send(intake, text)

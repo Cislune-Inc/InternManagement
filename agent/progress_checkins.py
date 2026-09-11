@@ -12,6 +12,8 @@ class ProgressCheckins:
     def __init__(self, store: Any) -> None:
         self.store = store
         SlackWorkIntake(store)
+        from .channel_updates import ChannelUpdates
+        self.channel_updates = ChannelUpdates(store)
         with store._connect() as conn:
             conn.execute("""CREATE TABLE IF NOT EXISTS progress_checkins (
                 actor TEXT NOT NULL, day TEXT NOT NULL, last_prompt TEXT,
@@ -37,6 +39,7 @@ class ProgressCheckins:
         if clock_notice and now - clock_notice < timedelta(minutes=30):
             return None  # Do not stack a work prompt on a break/attendance notice.
         anchors = [timestamp(session.clocked_in_at)]
+        anchors.append(timestamp(self.channel_updates.latest(actor)))
         for segment in session.work_segments:
             if not segment.get("clocked_out_at"):
                 anchors.append(timestamp(segment.get("clocked_in_at")))
