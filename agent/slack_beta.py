@@ -122,6 +122,10 @@ async def handle_message(runtime: Any, event: dict[str, Any]) -> bool:
     if re.fullmatch(r'(?:hi|hello|hey)[!. ]*', text, re.I):
         await runtime.slack.post_message(slack_id, 'Hi! What are you planning to work on? Name the project or workstream and the next useful result. For your clock, use `hours`.')
         return True
+    if re.fullmatch(r'(?:cool|wow|ok(?:ay)?|thanks(?: you)?|thank you|great|nice|got it|sounds good|awesome|👍|👌)[!. ]*', text, re.I):
+        # Acknowledgements are not work evidence or attendance activity. Stay
+        # quiet instead of spending an AI call and asking another question.
+        return True
     if re.fullmatch(r'(?:am i (?:clocked|logged) in(?: now)?|is my (?:clock|timer) running)[?!. ]*', text, re.I):
         await runtime.slack.post_message(slack_id, ledger(runtime).snapshot(user, now))
         return True

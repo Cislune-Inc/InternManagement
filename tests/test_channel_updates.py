@@ -15,6 +15,19 @@ def event(text='The comparison plot is saved and ready for review', **kwargs):
                 text=text, **kwargs)
 
 
+def test_review_preserves_sources_without_deciding_plan_or_hours(tmp_path):
+    store = StateStore(tmp_path / 'state.db')
+    service = ChannelUpdates(store)
+    e = event('We should stop the prototype build and review the alternative <!channel>')
+    assert service.capture(e, '')
+    review = service.review()
+    assert 'possible direction change' in review
+    assert 'mapping needs review' in review
+    assert 'Channel <#C123>' in review and '&lt;!channel&gt;' in review
+    with store._connect() as conn:
+        assert conn.execute('SELECT COUNT(*) FROM sessions').fetchone()[0] == 0
+
+
 def test_capture_is_automatic_idempotent_private_to_actor_and_never_punches(tmp_path):
     store = StateStore(tmp_path/'state.db')
     service = ChannelUpdates(store)

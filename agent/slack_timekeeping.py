@@ -56,7 +56,7 @@ def clock_command(text: str) -> tuple[str, str] | None:
         (r"(?:my\s+)?(?:break|lunch)\s+is\s+(?:now\s+)?(?:done|over|finished)", "back"),
         (r"(?:hours|my hours|time|status)", "hours"),
         (r"(?:clock help|help|clock)", "help"),
-        (r"report hours\s+(.+)", "report"),
+        (r"report hours?(?:\s+(.+))?", "report"),
     ]:
         match = re.fullmatch(pattern, text, re.I | re.S)
         if match:
@@ -195,6 +195,10 @@ class SlackTimekeeping:
                                        (user.user_key, old['session_date'])).fetchone()
                 return old["response"], SessionState(**json.loads(current[0])) if current else None
             if command == "report":
+                if not detail.strip():
+                    return ("What needs correcting? Send `report hours` followed by the date, start/end times, and any break or lunch times. "
+                            "For example: `report hours today 8:30am–5pm, lunch 12–12:30pm; missed clock-out`. "
+                            "I'll save it for manager review; your clock stays unchanged."), None
                 conn.execute("INSERT INTO slack_clock_reports(id,user_key,reported_at,text) VALUES (?,?,?,?)",
                              (key, user.user_key, now.isoformat(), detail))
                 response = "Your time correction is saved for manager review. Hours will update when it is resolved."
@@ -346,11 +350,12 @@ class SlackTimekeeping:
                 session.latest_plan = detail.split(maxsplit=1)[1]
             return f"Clocked in at {now.astimezone(self.zone):%H:%M %Z}. Tell me what you are working on and the next result."
         if command == "out":
+            ended_meal = bool(session.metadata.get("slack_clock_meal_started_at"))
             self._finish_meal(session, now)
             self._finish_rest(session, now, "worker_clock_out")
             if not running:
                 session.stage = "clocked_out"
-                return "Already clocked out."
+                return ("Lunch end recorded. Your work clock remains stopped. " + self._restart_hint(session)) if ended_meal else "Already clocked out."
             self._stop(session, now, "worker_clock_out")
             total = paid_seconds([session], now)
             return f"Clocked out at {now.astimezone(self.zone):%H:%M %Z}. This shift-day records {total / 3600:.2f} hours of work + paid rest. Thanks for today's work."
@@ -433,8 +438,16 @@ class SlackTimekeeping:
                     location = "remote" if session.metadata.get("slack_clock_location") in {"approved_remote", "company_management_remote"} else "onsite"
                     return f"Your rest return is recorded. Use `clock in {location}` to resume."
                 return "Welcome back. " + ("Extra paid pause" if kind == "extra" else "Paid rest") + " recorded; your work clock kept running."
-            return "No active break found. Use `hours` to check your clock or `report hours` to correct it."
+            if running:
+                return "Your work clock is already running; no break is open. Use `hours` for today's totals."
+            return "Your work clock is stopped; no break is open. " + self._restart_hint(session) + " For a missed interval, use `report hours` with the date and times."
         return HELP
+
+    def _restart_hint(self, session: SessionState) -> str:
+        remote = session.metadata.get("slack_clock_location") in {"approved_remote", "company_management_remote"}
+        if self.require_kiosk and not remote:
+            return "To start work again, choose your name and enter your PIN at the shop Mini."
+        return "To start work again, send `clock in " + ("remote" if remote else "onsite") + "`; current approval and hours limits still apply."
 
     @staticmethod
     def _finish_rest(session: SessionState, now: datetime, source: str) -> None:

@@ -12,6 +12,17 @@ def draft(**changes):
     return result
 
 
+def test_unsupported_time_claim_is_not_delivered_or_cached(tmp_path):
+    async def create(**kwargs):
+        return SimpleNamespace(status='completed', output_text=json.dumps(draft(summary='Your hours and note are saved.')))
+    store = StateStore(tmp_path / 'state.sqlite3')
+    ai = WorkAI(store, SimpleNamespace(responses=SimpleNamespace(create=create)))
+    assert asyncio.run(ai.coach('W', 'working on the schematic')) is None
+    assert ai.last_outcome == 'unsupported_time_claim'
+    with store._connect() as conn:
+        assert conn.execute('SELECT COUNT(*) FROM work_ai_cache').fetchone()[0] == 0
+
+
 def test_openai_request_is_structured_bounded_and_cached(tmp_path):
     calls = []
 

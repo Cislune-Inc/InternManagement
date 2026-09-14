@@ -149,7 +149,7 @@ class WorkSharing:
 
 async def handle(runtime: Any, slack_id: str, text: str) -> bool:
     normalized = text.strip().lower()
-    if not (normalized in {"work draft", "work drafts", "work handoffs", "work channel updates"} or normalized.startswith(("work confirm ", "work share ", "work publish ", "work send "))):
+    if not (normalized in {"work draft", "work drafts", "work handoffs", "work channel updates", "work channel review"} or normalized.startswith(("work confirm ", "work share ", "work publish ", "work send "))):
         return False
     from .slack_work_intake import SlackWorkIntake
     SlackWorkIntake(runtime.state_store)
@@ -157,7 +157,10 @@ async def handle(runtime: Any, slack_id: str, text: str) -> bool:
     admin = runtime.admin_profile_by_slack_user_id(slack_id)
     owner = bool(admin and admin.discord_user_id == runtime.config.admin_discord_user_id)
     channels = getattr(getattr(runtime.config, "slack", None), "work_summary_channels", {})
-    if normalized == "work channel updates":
+    if normalized == "work channel review":
+        from .channel_updates import ChannelUpdates
+        response = ChannelUpdates(runtime.state_store).review() if owner else 'Channel-wide review is available to Erik only. Use `work channel updates` for your own reports.'
+    elif normalized == "work channel updates":
         from .channel_updates import ChannelUpdates
         response = ChannelUpdates(runtime.state_store).recent(actor=None if owner else slack_id)
     elif normalized == "work draft":

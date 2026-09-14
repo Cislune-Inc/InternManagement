@@ -25,6 +25,23 @@ def item_id(response):
     return re.search(r"DP-[0-9a-f]{12}", response)[0]
 
 
+@pytest.mark.parametrize('note,project', [
+    ('On a call with engineering for PERDEX looking at new proposals', 'perdex'),
+    ('At Chevy getting the BrightDrop van repaired', 'brightdrop'),
+])
+def test_current_focus_routes_new_work_without_rewriting_history(intake, note, project):
+    old = item_id(send(intake, 'work LunaRecycle: prepare the wrap-up', event='old'))
+    new = item_id(send(intake, 'work update ' + note, event='new'))
+    assert old != new
+    assert intake.coaching_context('WORKER', new)['project'] == PROJECTS[project]
+
+
+@pytest.mark.parametrize('note', ['Tomorrow I am working on PERDEX', 'I am not working on PERDEX', 'Yesterday working on BrightDrop'])
+def test_non_current_focus_does_not_relabel(intake, note):
+    old = item_id(send(intake, 'work LunaRecycle: prepare wrap-up', event='old'))
+    assert item_id(send(intake, 'work update ' + note, event='new')) == old
+
+
 def test_named_workstream_starts_new_record_without_relabeling_history(intake):
     old = item_id(send(intake, 'work an unnamed activity', event='old'))
     reply = send(intake, 'work update Im working on PCB design for CARVE CORE', event='core')

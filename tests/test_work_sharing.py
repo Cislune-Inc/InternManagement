@@ -57,6 +57,20 @@ def test_sharing_transport_is_private_and_publishing_is_disabled(tmp_path):
     assert not asyncio.run(handle(runtime, "WORKER", "clock in onsite"))
 
 
+def test_channel_review_is_owner_only(tmp_path):
+    sent = []
+    async def post(channel, text):
+        sent.append((channel, text))
+    runtime = SimpleNamespace(state_store=StateStore(tmp_path / 'state.db'),
+        config=SimpleNamespace(admin_discord_user_id='OWNER'),
+        admin_profile_by_slack_user_id=lambda actor: SimpleNamespace(discord_user_id=actor),
+        slack=SimpleNamespace(post_message=post))
+    assert asyncio.run(handle(runtime, 'MANAGER', 'work channel review'))
+    assert 'Erik only' in sent[-1][1]
+    assert asyncio.run(handle(runtime, 'OWNER', 'work channel review'))
+    assert 'No channel review candidates' in sent[-1][1]
+
+
 def test_sharing_requires_own_current_preview_and_explicit_route(tmp_path):
     store = StateStore(tmp_path / "state.db")
     intake, service = SlackWorkIntake(store), WorkSharing(store)

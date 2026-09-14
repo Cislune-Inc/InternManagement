@@ -100,6 +100,30 @@ class ChannelUpdates:
             f"{_safe(r['text'])}\n" + (r['permalink'] or f"Channel <#{r['channel']}> · {r['posted_at']}")
             for r in rows)) if rows else 'No channel updates captured yet. Post normally in a channel Don Pollo has access to; no special format is required.'
 
+    def review(self) -> str:
+        """Owner-only bounded triage, not an inferred plan or automatic decision."""
+        with self.store._connect() as conn:
+            rows = conn.execute('SELECT * FROM channel_work_updates WHERE deleted=0 AND meaningful=1 ORDER BY posted_at DESC LIMIT 100').fetchall()
+        items = []
+        for row in rows:
+            reasons = []
+            if not row['project_key']:
+                reasons.append('workstream/channel mapping needs review')
+            if re.search(r'\b(?:blocked|waiting|need help|cannot|can.t)\b', row['text'], re.I):
+                reasons.append('possible blocker: confirm the help or decision needed')
+            if re.search(r'\b(?:stop|instead|switch|switching|abandon|approve|approval|should|could)\b', row['text'], re.I):
+                reasons.append('possible direction change: compare with the accepted plan before deciding')
+            if not reasons:
+                continue
+            source = row['permalink'] or f"Channel <#{row['channel']}> · {row['posted_at']}"
+            items.append(f"{_safe(row['actor'])} · {_safe(PROJECTS.get(row['project_key'], 'Unmapped'))}\n"
+                         + '; '.join(reasons) + '\n' + _safe(row['text'][:700]) + '\n' + source)
+            if len(items) == 10:
+                break
+        return ('Channel review candidates — latest 100 useful captured posts; hints, not confirmed conflicts or approvals. '
+                'Review the linked source and accepted plan with Erik/George. Nothing here changes assignments, hours or charging.\n\n'
+                + '\n\n'.join(items)) if items else 'No channel review candidates in the latest captured posts. This does not establish that all work is aligned or that channel capture is active.'
+
 
 async def handle(runtime: Any, web_client: Any, event: dict[str, Any]) -> None:
     if not getattr(runtime.config.slack, 'channel_updates_enabled', False):

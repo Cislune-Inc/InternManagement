@@ -46,7 +46,7 @@ def event(text, hour=9, user="WORKER"):
     return {"user": user, "text": text, "ts": str(datetime.fromisoformat(f"2026-09-07T{hour:02d}:00:00-07:00").timestamp())}
 
 
-@pytest.mark.parametrize('text', ['Hello', 'Am I clocked in now?', 'Is my timer running?'])
+@pytest.mark.parametrize('text', ['Hello', 'Am I clocked in now?', 'Is my timer running?', 'cool', 'wow!', 'Thanks', '👍', 'report hours', 'report hour'])
 def test_greeting_and_status_are_not_work_proposals(runtime, text):
     from agent.slack_beta import handle_message
     assert asyncio.run(handle_message(runtime, event(text)))

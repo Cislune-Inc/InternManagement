@@ -25,6 +25,28 @@ def command(clock, user, name, now, detail="", event=None):
     return clock.handle(user, name, detail, event_id=event or now.isoformat() + name, now=now)
 
 
+@pytest.mark.parametrize('text', ['report hours', 'report hour', 'REPORT HOURS!'])
+def test_bare_report_prompts_without_creating_empty_correction(clock, user, text):
+    assert clock_command(text) == ('report', '')
+    response, session = command(clock, user, 'report', at(9))
+    assert 'What needs correcting?' in response
+    assert session is None and clock.reports() == []
+    assert 'saved' in command(clock, user, 'report', at(9, 1), 'today start 8am; missed start')[0]
+    assert len(clock.reports()) == 1
+
+
+def test_return_after_out_explains_restart_without_creating_work(clock, user):
+    command(clock, user, 'in', at(9), 'onsite')
+    clock.tick(user, at(14))
+    command(clock, user, 'lunch', at(14, 1))
+    response, _ = command(clock, user, 'out', at(14, 31))
+    assert 'Lunch end recorded' in response and 'remains stopped' in response
+    response, session = command(clock, user, 'back', at(14, 32))
+    assert 'clock is stopped' in response and 'clock in onsite' in response
+    assert session.clocked_out_at and len(session.work_segments) == 1
+    assert paid_seconds([session], at(15)) == 5 * 3600
+
+
 def test_handover_hold_prevents_new_time_not_actual_hours_reports(clock, user):
     pending = SlackTimekeeping(clock.store, handover_pending_user_keys=(user.user_key,))
     for cmd, detail in [("in", "onsite"), ("in", "remote"), ("back", "")]:

@@ -32,6 +32,8 @@ PROJECTS = {
     "lunarecycle": "LunaRecycle closeout",
     "carve_core": "CARVE CORE — workstream; funding allocation needs review",
     "carve_ex": "CARVE EX — workstream; funding allocation needs review",
+    "brightdrop": "BrightDrop fleet — workstream; funding allocation needs review",
+    "perdex": "PERDEX — workstream; funding allocation needs review",
 }
 _BOUNDARY = (
     "Your work description does not start or stop your clock. Use `clock in onsite`, `clock out`, or `hours` here in Slack. "
@@ -59,8 +61,21 @@ def _safe(text: Any) -> str:
 def project_candidates(text: str) -> list[str]:
     aliases = {"dp": r"don\s+pollo|clickup\s+replacement", "mars_to_table": r"mars\s+to\s+table|mtt",
                "lunarecycle": r"luna\s*recycle", "carve_core": r"carve\s+core",
-               "carve_ex": r"carve\s+ex", "proposals": r"proposal|phase\s+(?:ii|2)\s+sequential|p2\s+sequential"}
-    return [key for key in PROJECTS if re.search(rf"\b(?:{key}|{aliases.get(key, key)})\b", text, re.I)]
+               "carve_ex": r"carve\s+ex", "brightdrop": r"bright\s*drop|bd600", "proposals": r"proposals?|phase\s+(?:ii|2)\s+sequential|p2\s+sequential"}
+    matches = [key for key in PROJECTS if re.search(rf"\b(?:{key}|{aliases.get(key, key)})\b", text, re.I)]
+    # Specific workstreams take precedence over the generic activity label;
+    # this is routing only, never contract charging or scope approval.
+    if "perdex" in matches and "proposals" in matches:
+        matches.remove("proposals")
+    return matches
+
+
+def current_focus(text: str) -> bool:
+    if re.search(r"\b(?:yesterday|tomorrow|later|might|could|should|would|not|isn't|wasn't)\b|\?", text, re.I):
+        return False
+    return bool(re.match(
+        r"^(?:i(?:['’]?m| am)\s+)?(?:now\s+)?(?:working on\b|on a call\b|at (?:the )?(?:dealership|chevy|shop)\b)",
+        text.strip(), re.I))
 
 
 def switch_target(text: str) -> str | None:
@@ -168,7 +183,7 @@ class SlackWorkIntake:
         # staying under an unrelated label. Keep earlier events/approvals intact.
         if command == "update" and not target and item:
             candidates = project_candidates(content)
-            current = re.match(r"^(?:i(?:['’]?m| am)\s+)?(?:now\s+)?working on\b", content, re.I)
+            current = current_focus(content)
             if len(candidates) == 1 and candidates[0] != item['project_key'] and (current or not item['project_key']):
                 target = content
         if target and command not in {"approve", "redirect", "project", "edit", "detail", "next"}:

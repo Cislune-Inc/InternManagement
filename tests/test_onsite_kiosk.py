@@ -125,7 +125,7 @@ def test_kiosk_start_required_but_existing_meal_return_and_out_allow_slack(runti
     act("lunch", 3)
     assert "remaining" in act("back", 3.4)[0]
     assert "running again" in act("back", 3.5)[0]
-    assert "No active break" in act("back", 3.5, verified=True)[0]
+    assert "clock is already running" in act("back", 3.5, verified=True)[0]
     assert "Clocked out" in act("out", 4)[0]
 
 
