@@ -95,7 +95,7 @@ def build(runtime, week: str = "", now: datetime | None = None) -> dict:
                     sessions.append(s)
                 if any(e["session_date"] == s.session_date for e in evidence):
                     reason = s.metadata.get("slack_clock_stop_reason")
-                    if reason and reason not in {"manual", "worker_clock_out", "owner_confirmed_end"}:
+                    if reason and reason not in {"manual", "worker_clock_out", "owner_confirmed_end", "owner_confirmed_actual_clock_out"}:
                         issues.append("Clock stop: " + str(reason).replace("_", " ") + "; confirm actual end")
                     for field, label in (("lunch_windows", "Lunch"), ("paid_rest_windows", "Paid rest")):
                         for w in s.metadata.get(field) or []:
@@ -111,7 +111,7 @@ def build(runtime, week: str = "", now: datetime | None = None) -> dict:
                 issues.append("No lunch record for this day; check actual meal timing")
             if seconds >= 3.5 * 3600 and user and user.worker_type != "admin" and not any(e["kind"].startswith("Paid rest") for e in evidence):
                 issues.append("No paid-rest record; check whether a break entry is missing")
-            if seconds > 8 * 3600:
+            if seconds > 8 * 3600 and not (user and user.worker_type == "admin"):
                 issues.append("Over 8 recorded hours; review applicable overtime classification")
             fingerprint = hashlib.sha256(json.dumps({"sources": relevant, "reports": worker_reports, "day": day.isoformat()}, sort_keys=True).encode()).hexdigest()
             draft = saved.get((key, day.isoformat()))
@@ -120,8 +120,8 @@ def build(runtime, week: str = "", now: datetime | None = None) -> dict:
                          "draft": json.loads(draft["body"]) if draft else None, "draft_current": bool(current), "saved_at": draft["saved_at"] if draft else None})
         total = sum(d["seconds"] for d in days)
         workers.append({"user_key": key, "name": user.display_name if user else key, "compensation": user.compensation_plan if user else "needs_review", "mapped": bool(user and user.gusto_entity_uuid), "seconds": total, "hours": round(total / 3600, 4), "days": days, "reports": worker_reports,
-                        "issues": (["Weekly recorded hours exceed 40; review classification"] if total > 144000 else []) + (["No DP hours recorded: check earlier Gusto/cutover records"] if not total else [])})
-    return {"week_start": start.isoformat(), "week_ending": end.isoformat(), "timezone": ZONE.key, "refreshed_at": now.isoformat(), "workers": workers, "gusto_status": "Not yet verified. Connector returned no timesheets; this does not mean zero hours.", "source": "Live DP SQLite sessions and pending actual-hours reports. Closed work intervals are unioned within each Pacific calendar day; overlapping recorded unpaid meals are deducted; paid rests remain included. Open tails are excluded, not assumed to be zero actual work. Draft reconciliation never changes DP or Gusto."}
+                        "issues": (["Weekly recorded hours exceed 40; review classification"] if total > 144000 and not (user and user.worker_type == "admin") else []) + (["No DP hours recorded: check earlier Gusto/cutover records"] if not total else [])})
+    return {"week_start": start.isoformat(), "week_ending": end.isoformat(), "timezone": ZONE.key, "refreshed_at": now.isoformat(), "workers": workers, "gusto_status": "Gusto source hours have not been loaded into this view. Blank does not mean zero hours; enter verified Gusto figures when reconciling.", "source": "Live DP SQLite sessions and pending actual-hours reports. Closed work intervals are unioned within each Pacific calendar day; overlapping recorded unpaid meals are deducted; paid rests remain included. Open tails are excluded, not assumed to be zero actual work. Draft reconciliation never changes DP or Gusto."}
 
 
 def save(runtime, payload: dict) -> dict:
