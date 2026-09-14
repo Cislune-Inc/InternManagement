@@ -125,6 +125,30 @@ rekeyed into planner IDs. Sources are explicitly linked to stable packets.
 
 ## Validation and remaining rollout work
 
+`planning_sync.sync_sources()` provides a bounded, operator-driven refresh over
+channel capture or sent-only excerpts. It requires the host to supply current
+channel grants each time; it does not discover grants, read raw DMs, or start a
+background job. A separate private checkpoint database serializes refreshers and
+pins each stream to its source/destination paths, workspace, channel list, source
+kind and project aliases. Changed configuration requires a reviewed new stream.
+Removing ingestion grants does not erase historical records: fresh viewer grants
+must still control every planning request.
+
+Each call reads at most ten batches of 200 records. Checkpoints commit only after
+all ingestions succeed; interrupted calls replay safely using source versions.
+Returned metadata includes coverage, checked time, counts and whether more captured
+records remain. Missing capture tables remain explicit coverage gaps. This does
+not establish complete Slack history or a successful live Slack connection.
+
+Call with `reconcile=True` to start a bounded sweep from the beginning; if
+`has_more` is true, resume with normal calls until exhausted. Reconciliation is
+necessary for backdated capture records, restored source snapshots and late
+publication receipts that sort before the incremental cursor. Do not restart the
+sweep on every page. Source backups must preserve versions; deleted rows without
+tombstones cannot be reconciled by this adapter. Published-excerpt receipts still
+do not establish current channel edit/deletion state. No automatic refresh cadence
+or source retention policy is enabled by this helper.
+
 Tests exercise authorization/CSRF, projection, hidden dependencies, source
 versions/tombstones, cursor coverage, sent-only excerpts, immutable work references,
 concurrent/stale acceptance, discussion resolution, idempotency, and recap privacy.
