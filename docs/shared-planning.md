@@ -64,6 +64,27 @@ Routes belong to the explicitly configured origin; this app can serve a separate
 authenticated listener behind the existing host's TLS/session layer. Do not mount
 it under a prefix without also adjusting its absolute asset/API paths.
 
+`planning_host.create_dp_planning_app()` now assembles that host boundary. It
+returns `None` unless explicitly enabled and requires an exact HTTPS origin and
+a store whose pinned acceptance owner belongs to the configured Slack workspace.
+Its `grant_snapshot(slack_id)` callback returns one fresh mapping containing
+`projects` and `source_scopes`, or `None` when access cannot be established. Empty
+project access denies sign-in. The callback must apply current server-owned
+project assignments and source membership, with no stale-success fallback.
+
+The existing authenticated DP host can POST the existing worker portal bearer
+to `/planning/session` with the exact Origin. After DP verifies enrollment and
+expiry and the host supplies current grants, this sets a Secure, HttpOnly,
+SameSite=Strict browser-session cookie and returns `/planning` as the next path.
+No new token is issued or its lifetime extended. `/planning/logout` clears the
+cookie via same-origin POST. Tokens in query parameters and shared manager Basic
+credentials are not accepted for this handoff. This assembly does not add a
+worker-facing login link, provision TLS, launch a listener, send Slack links or
+enable access. The production host still needs to wire its existing authenticated
+browser bootstrap, actual fresh grant provider, roster and own-time readers.
+Terminate TLS at the configured trusted host/proxy and disable access logging of
+credentials; never expose the upstream listener directly on an untrusted network.
+
 | Route | Behavior |
 |---|---|
 | `GET /planning` or `/` | Shared-work shell; source records arrive only from the authenticated API |
