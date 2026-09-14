@@ -14,8 +14,8 @@ from .planning_web import create_planning_app
 
 
 def create_dp_planning_app(runtime, store, *, enabled=False, workspace,
-                           allowed_origin, grant_snapshot, people_reader=None,
-                           time_reader=None):
+                           allowed_origin, grant_snapshot=None, people_reader=None,
+                           time_reader=None, policy_reader=None):
     """Return None when disabled; caller owns TLS and listener lifecycle.
 
     grant_snapshot(slack_id) must return one CURRENT server-owned mapping with
@@ -32,8 +32,17 @@ def create_dp_planning_app(runtime, store, *, enabled=False, workspace,
     owner_prefix = f'slack:{workspace}:'
     if not store.owner_ref.startswith(owner_prefix) or not store.owner_ref[len(owner_prefix):]:
         raise ValueError('Configure the verified acceptance owner in this Slack workspace; do not reuse a sandbox store.')
+    if grant_snapshot is None and callable(policy_reader):
+        from .planning_connections import DPPlanningConnections
+        connections = DPPlanningConnections(runtime, workspace=workspace, policy_reader=policy_reader)
+        grant_snapshot = connections.grants
+        if people_reader is None:
+            people_reader = connections.people
     if not callable(grant_snapshot):
         raise ValueError('Supply a fresh server-owned grant snapshot resolver.')
+    if time_reader is None:
+        from .planning_time import dp_time_reader
+        time_reader = dp_time_reader(runtime, workspace=workspace)
 
     async def principal(token):
         from .worker_portal import validate_worker_portal_token

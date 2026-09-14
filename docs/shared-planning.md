@@ -60,6 +60,32 @@ It must be read-only; do not call helpers that normalize or save live sessions.
 Neither work duration estimates nor messages are used to synthesize this summary.
 No callbacks are connected by the review executable.
 
+The DP host factory now supplies `dp_time_reader` by default. It resolves the
+verified Slack identity against the current active roster and opens the existing
+ledger in SQLite read-only mode. It uses DP's existing `paid_seconds` calculation,
+preserving overlap union, recorded lunches, paid rest and legacy unresolved-tail
+handling. It returns only that person's clock state, current-day recorded seconds,
+observation time and unresolved flags. Pending report text and other workers'
+records are excluded. Administrators without an explicit worker-ledger identity
+receive no guessed hours. Neither StateStore nor clock constructors are invoked.
+
+Supply `policy_reader` to the host factory to connect `DPPlanningConnections` for
+current project grants and roster choices. It must read an approved private mapping
+`{project_id: {"members": [slack_id], "channels": [channel_id]}}` on each request.
+This mapping is not an enrollment list or a contract charging rule. The adapter
+uses current DP `slack.can_share_work` to verify each source channel's membership;
+absent capability, API failure or denied membership grants no source scope.
+It never joins channels or posts. A pilot identity is bounded to ten source
+channels. Roster choices include only active DP identities sharing an explicitly
+assigned project with the viewer. No sample policy should be copied into live
+configuration as an implied access approval.
+
+September14 live smoke check: the read-only time adapter ran successfully against
+the Mini ledger and retained unresolved-history flags. This was a read check,
+not enrollment or payroll review.
+The local sandbox on port8877 still has no live time callback. Worker deployment
+still needs the private HTTPS/VPN host and authenticated browser entry point.
+
 Routes belong to the explicitly configured origin; this app can serve a separate
 authenticated listener behind the existing host's TLS/session layer. Do not mount
 it under a prefix without also adjusting its absolute asset/API paths.
@@ -81,7 +107,8 @@ cookie via same-origin POST. Tokens in query parameters and shared manager Basic
 credentials are not accepted for this handoff. This assembly does not add a
 worker-facing login link, provision TLS, launch a listener, send Slack links or
 enable access. The production host still needs to wire its existing authenticated
-browser bootstrap, actual fresh grant provider, roster and own-time readers.
+browser bootstrap and approved assignment policy. The default live callbacks
+provide membership checks, roster projection and own-time reads.
 Terminate TLS at the configured trusted host/proxy and disable access logging of
 credentials; never expose the upstream listener directly on an untrusted network.
 

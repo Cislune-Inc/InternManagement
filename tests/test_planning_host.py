@@ -20,7 +20,7 @@ class PlanningHostTests(unittest.IsolatedAsyncioTestCase):
         self.owner = AdminProfile(name='Owner', discord_user_id=1, slack_user_id='OWNER')
         self.worker = UserProfile(user_key='ledger-worker', display_name='Worker', slack_user_id='WORKER')
         self.runtime = SimpleNamespace(state_store=StateStore(root/'dp.sqlite'),
-            config=SimpleNamespace(slack=SlackConfig(worker_portal_beta_slack_user_ids=['OWNER','WORKER'])),
+            config=SimpleNamespace(timezone='America/Los_Angeles',slack=SlackConfig(worker_portal_beta_slack_user_ids=['OWNER','WORKER'])),
             admin_profile_by_slack_user_id=lambda sid: self.owner if sid == 'OWNER' else None,
             roster_by_slack_id={'WORKER': self.worker})
         self.tokens = {actor.slack_user_id: parse_qs(urlsplit(build_worker_portal_link(self.runtime, actor)).query)['token'][0]
