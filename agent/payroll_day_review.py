@@ -49,5 +49,5 @@ def screen(day, user, zone):
     if seconds and not work:
         messages.append('Duration only: exact start/end and break timing unavailable')
     if not seconds:
-        messages.append('No recorded hours: confirm day off or missing time')
+        return dict(lanes=lanes, source=source, expected_rests=None if admin else 0, recorded_rests=len(rests), clear_rests=len(clean_rests), recorded_meals=len(meals), checks=[], label='No hours recorded', basis='Confirm no work or add known time; missing records are not proof of a day off.')
     return dict(lanes=lanes, source=source, expected_rests=None if admin else expected, recorded_rests=len(rests), clear_rests=len(clean_rests), recorded_meals=len(meals), checks=messages, label='Needs review' if day['issues'] or messages else 'Timing checks clear', basis='CA nonexempt screening only; worker classification, duty-free breaks, waivers and full source coverage still need review.')
