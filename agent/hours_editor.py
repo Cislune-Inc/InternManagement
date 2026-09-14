@@ -298,6 +298,17 @@ def build_request_handler(service: HoursEditorService, *, manager_key: str | Non
             if parsed.path == "/payroll":
                 self._respond_html(service.render_payroll_dashboard_html())
                 return
+            if parsed.path in {"/reconcile", "/api/reconciliation"}:
+                from .payroll_reconciliation import build, render
+                try:
+                    data = build(service.runtime, str((query.get("week") or [""])[0]))
+                    if parsed.path == "/reconcile":
+                        self._respond_html(render(data))
+                    else:
+                        self._respond_json(data)
+                except ValueError as exc:
+                    self._respond_error(HTTPStatus.BAD_REQUEST, str(exc))
+                return
             if parsed.path == "/health":
                 self._respond_html(service.render_system_health_html())
                 return
@@ -355,12 +366,16 @@ def build_request_handler(service: HoursEditorService, *, manager_key: str | Non
                 "/api/routes/resolve",
                 "/api/work-assignment/resolve",
                 "/api/portal/action",
+                "/api/reconciliation/draft",
             }:
                 self._respond_error(HTTPStatus.NOT_FOUND, "Not found.")
                 return
             try:
                 payload = self._read_json_body()
-                if parsed.path == "/api/edit-preview":
+                if parsed.path == "/api/reconciliation/draft":
+                    from .payroll_reconciliation import save
+                    result = save(service.runtime, payload)
+                elif parsed.path == "/api/edit-preview":
                     result = service.preview_edit(payload)
                 elif parsed.path == "/api/portal/action":
                     result = service.apply_worker_portal_action(token, payload)

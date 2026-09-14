@@ -99,6 +99,7 @@ def render_payroll_dashboard_html(payload: dict[str, Any]) -> str:
 </head>
 <body><main>
   <header>
+    <p><a href="/reconcile">Open live worker-by-worker payroll reconciliation →</a></p>
     <h1>Payroll and Project Labor Review</h1>
     <p>Approval-first weekly timecards, compensation-plan separation, project budget rollups, compliance events, and NASA-ready labor detail.</p>
     <nav><a href="/time">Time tracking</a><a href="/work">Work dashboard</a><a href="/payroll">Payroll</a><a href="/exceptions">Manager queue</a><a href="/health">System health</a></nav>
