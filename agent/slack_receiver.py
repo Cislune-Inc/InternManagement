@@ -95,17 +95,17 @@ class SlackSocketReceiver:
                 logger.warning("Clock action handled; App Home refresh failed.")
 
         @app.event("message")
-        async def handle_message(event: dict[str, Any]) -> None:
+        async def handle_message(event: dict[str, Any], body: dict[str, Any]) -> None:
             if str(event.get("channel_type") or "") in {"channel", "group"}:
                 from .channel_updates import handle
                 try:
-                    await handle(self.runtime, web_client, event)
+                    await handle(self.runtime, web_client, {**event, 'team': str(body.get('team_id') or event.get('team') or '')})
                 except Exception:
                     logger.exception("Channel update processing failed; attendance unchanged.")
                 return
             if str(event.get("channel_type") or "") != "im":
                 return
-            if event.get("bot_id") or event.get("subtype"):
+            if event.get("bot_id") or event.get("subtype") not in {None, '', 'file_share'}:
                 return
             try:
                 await self.runtime.handle_slack_direct_message(

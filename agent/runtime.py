@@ -1461,6 +1461,7 @@ class InternManagementRuntime:
             event_id=event_id,
             now=observed_at,
         )
+        saved_item = re.search(r"DP-[0-9a-f]{12}", response) if response.startswith("Saved") else None
         if response.startswith("Saved"):
             from .slack_beta import archive, clock_user, ledger
 
@@ -1496,7 +1497,7 @@ class InternManagementRuntime:
                             for task in tasks[:5]
                         ])
                     except Exception:
-                        context += "\nClickUp unavailable; hours and original note were saved independently."
+                        context += "\nClickUp unavailable; the original work note was saved. No clock result is provided."
                 draft = await WorkAI(self.state_store).coach(slack_user_id, text, context=context)
                 if match and intake.coaching_context(slack_user_id, match[0]) != work_context:
                     return True  # A newer note/switch supersedes this delayed reply.
@@ -1515,6 +1516,11 @@ class InternManagementRuntime:
                     if draft["suggested_next_steps"]:
                         response += "\nPossible next steps:\n" + "\n".join(f"{i}. {_safe(step)}" for i, step in enumerate(draft["suggested_next_steps"][:3], 1))
         await self.slack.post_message(slack_user_id, response)
+        if saved_item and getattr(self.config.slack, 'dm_work_sharing_enabled', False):
+            from .dm_work_updates import DMWorkUpdates
+            shared = await DMWorkUpdates(self.state_store).process(self, slack_user_id, text, event, saved_item[0])
+            if shared:
+                await self.slack.post_message(slack_user_id, shared)
         return True
 
     def build_slack_app_home_view(self, slack_user_id: str) -> dict[str, Any]:
@@ -1551,7 +1557,11 @@ class InternManagementRuntime:
                     "One-time setup: select Set up / reset PIN above, then choose your PIN on the Mini within ten minutes. "
                     "Use `lunch`, `break` and `back` here for breaks within your shift; approved remote workers use `clock in remote`. "
                     "To fix a completed lunch, DM `fix lunch today 11:30am-12:15pm` with your actual times, then confirm the preview. Other corrections use `report hours`. "
-                    "If DP is unavailable, Slack Erik your actual hours—not Gusto Kiosk.\n\n" + COMPANY_HANDOFF
+                    "If DP is unavailable, Slack Erik your actual hours—not Gusto Kiosk.\n\n"
+                    + ("*Work updates:* Prefer the project channel with a result, next step and useful links/photos—no DP mention needed. "
+                       "Useful work notes sent to DP may also be shared there, attributed to you. Time corrections stay private. "
+                       "Start a note with `private` when it is not a team update. Photos are best posted directly in the project channel.\n\n"
+                       if getattr(self.config.slack, 'dm_work_sharing_enabled', False) else "") + COMPANY_HANDOFF
                 )}},
             ]}
         from .worker_portal import build_worker_portal_link, resolve_worker_portal_actor

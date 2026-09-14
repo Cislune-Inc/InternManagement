@@ -84,6 +84,23 @@ class SlackClient:
         members = payload.get("members")
         return members if isinstance(members, list) else []
 
+    async def can_share_work(self, channel_id: str, actor: str) -> bool:
+        """Verify explicit internal project audience; never joins or invites."""
+        import asyncio
+        info = await asyncio.to_thread(self._request, 'GET', '/conversations.info', params={'channel':channel_id})
+        channel = info.get('channel', {})
+        if not channel.get('is_member') or channel.get('is_archived') or channel.get('is_ext_shared') or channel.get('is_shared'):
+            return False
+        cursor = ''
+        for _ in range(10):
+            page = await asyncio.to_thread(self._request, 'GET', '/conversations.members', params={'channel':channel_id,'limit':200,'cursor':cursor})
+            if actor in page.get('members', []):
+                return True
+            cursor = page.get('response_metadata', {}).get('next_cursor', '')
+            if not cursor:
+                break
+        return False
+
     def _post_message_sync(
         self,
         channel_id: str,

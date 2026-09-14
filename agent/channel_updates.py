@@ -23,7 +23,9 @@ class ChannelUpdates:
                 meaningful INTEGER NOT NULL, permalink TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY(channel,message_ts))""")
             columns = {r[1] for r in conn.execute('PRAGMA table_info(channel_work_updates)')}
-            for name, definition in [('source_version', "TEXT NOT NULL DEFAULT '0'"), ('deleted', 'INTEGER NOT NULL DEFAULT 0')]:
+            for name, definition in [('source_version', "TEXT NOT NULL DEFAULT '0'"), ('deleted', 'INTEGER NOT NULL DEFAULT 0'),
+                                     ('workspace_id', "TEXT NOT NULL DEFAULT ''"), ('user_key', "TEXT NOT NULL DEFAULT ''"),
+                                     ('thread_ts', "TEXT NOT NULL DEFAULT ''")]:
                 if name not in columns:
                     conn.execute(f'ALTER TABLE channel_work_updates ADD COLUMN {name} {definition}')
             conn.execute('''CREATE TABLE IF NOT EXISTS channel_work_revisions (
@@ -31,7 +33,7 @@ class ChannelUpdates:
                 payload TEXT NOT NULL, captured_at TEXT NOT NULL,
                 PRIMARY KEY(channel,message_ts,source_version))''')
 
-    def capture(self, event: dict[str, Any], project: str) -> bool:
+    def capture(self, event: dict[str, Any], project: str, *, user_key: str = '') -> bool:
         # Channels, not personal/group DMs. Capture all human posts quietly;
         # mapped project channels help interpretation but do not gate capture.
         if event.get('type') not in {'message', 'app_mention'} or event.get('channel_type') not in {'channel', 'group'}:
@@ -78,6 +80,8 @@ class ChannelUpdates:
             if old:
                 conn.execute('INSERT OR IGNORE INTO channel_work_revisions VALUES (?,?,?,?,?)',
                              (channel,ts,old['source_version'],json.dumps(dict(old)),now.isoformat()))
+                if deleted and actor == 'unknown':
+                    actor = old['actor']
             conn.execute("""INSERT INTO channel_work_updates
                 (channel,message_ts,actor,project_key,text,files_json,posted_at,captured_at,meaningful,source_version,deleted)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(channel,message_ts) DO UPDATE SET
@@ -86,7 +90,28 @@ class ChannelUpdates:
                 meaningful=excluded.meaningful,source_version=excluded.source_version,deleted=excluded.deleted""",
                 (channel, ts, actor, project, text, json.dumps(files), posted.isoformat(),
                  now.isoformat(), int(meaningful), version, int(deleted)))
+            conn.execute('UPDATE channel_work_updates SET workspace_id=?,user_key=?,thread_ts=? WHERE channel=? AND message_ts=?',
+                         (str(event.get('team') or (old['workspace_id'] if old else '')), user_key or (old['user_key'] if old else ''),
+                          str(source.get('thread_ts') or (old['thread_ts'] if old else '')), channel, ts))
             return True
+
+    def records(self, *, channels: list[str], after: str = '', limit: int = 100) -> list[dict[str, Any]]:
+        """Planner adapter: caller MUST supply server-verified source grants.
+
+        Includes tombstones so an authorized consumer can remove deleted inputs.
+        IDs/revisions are observations, never accepted-plan or attendance events.
+        """
+        channels = list(dict.fromkeys(channels))[:100]
+        if not channels:
+            return []
+        with self.store._connect() as conn:
+            rows = conn.execute('SELECT * FROM channel_work_updates WHERE channel IN (' + ','.join('?' for _ in channels)
+                                + ') AND captured_at>=? ORDER BY captured_at,channel,message_ts LIMIT ?',
+                                (*channels, after, max(1,min(limit,500)))).fetchall()
+        return [{**dict(r), 'files':json.loads(r['files_json']),
+                 'person_ref':f"slack:{r['workspace_id']}:{r['actor']}" if r['workspace_id'] else None,
+                 'source_ref':f"slack:{r['workspace_id']}:{r['channel']}:{r['message_ts']}",
+                 'plan_status':'observation'} for r in rows]
 
     def latest(self, actor: str) -> str | None:
         with self.store._connect() as conn:
@@ -128,11 +153,17 @@ class ChannelUpdates:
 async def handle(runtime: Any, web_client: Any, event: dict[str, Any]) -> None:
     if not getattr(runtime.config.slack, 'channel_updates_enabled', False):
         return
-    actor, channel = str(event.get('user') or ''), str(event.get('channel') or '')
+    source = event.get('message') or event.get('previous_message') or event
+    actor, channel = str(source.get('user') or ''), str(event.get('channel') or '')
     routes = getattr(runtime.config.slack, 'work_summary_channels', {})
     projects = [key for key, destination in routes.items() if destination == channel]
+    if len(projects) != 1:
+        from .slack_work_intake import project_candidates
+        candidates = project_candidates(str(source.get('text') or ''))
+        projects = [key for key in candidates if not projects or key in projects]
     service = ChannelUpdates(runtime.state_store)
-    if not service.capture(event, projects[0] if len(projects) == 1 else ''):
+    person = getattr(runtime, 'roster_by_slack_id', {}).get(actor)
+    if not service.capture(event, projects[0] if len(projects) == 1 else '', user_key=person.user_key if person else ''):
         return
     # Capture-before-send gives duplicate suppression even after transport errors.
     # Never replay messages through the DM handler: clock commands stay private.

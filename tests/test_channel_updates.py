@@ -28,6 +28,17 @@ def test_review_preserves_sources_without_deciding_plan_or_hours(tmp_path):
         assert conn.execute('SELECT COUNT(*) FROM sessions').fetchone()[0] == 0
 
 
+def test_planner_records_require_channel_grants_and_keep_person_source_refs(tmp_path):
+    service=ChannelUpdates(StateStore(tmp_path/'state.db'))
+    e=event(team='T123',thread_ts='123.45')
+    service.capture(e,'bagworm',user_key='worker')
+    assert service.records(channels=[]) == []
+    assert service.records(channels=['OTHER']) == []
+    row=service.records(channels=['C123'])[0]
+    assert row['person_ref']=='slack:T123:WORKER' and row['user_key']=='worker'
+    assert row['thread_ts']=='123.45' and row['plan_status']=='observation'
+
+
 def test_capture_is_automatic_idempotent_private_to_actor_and_never_punches(tmp_path):
     store = StateStore(tmp_path/'state.db')
     service = ChannelUpdates(store)

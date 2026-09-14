@@ -421,6 +421,7 @@ def _parse_slack_config(raw_slack: Any) -> SlackConfig:
         ),
         progress_checkins_enabled=bool(raw_slack.get("progress_checkins_enabled", False)),
         channel_updates_enabled=bool(raw_slack.get("channel_updates_enabled", False)),
+        dm_work_sharing_enabled=bool(raw_slack.get("dm_work_sharing_enabled", False)),
         work_summary_channels=_parse_work_summary_channels(raw_slack.get("work_summary_channels", {})),
         quarantine_uncertain_routes=bool(
             raw_slack.get("quarantine_uncertain_routes", True)

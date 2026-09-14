@@ -23,6 +23,17 @@ def test_unsupported_time_claim_is_not_delivered_or_cached(tmp_path):
         assert conn.execute('SELECT COUNT(*) FROM work_ai_cache').fetchone()[0] == 0
 
 
+def test_channel_extract_is_literal_and_uses_shared_budget(tmp_path):
+    async def create(**kwargs):
+        assert kwargs['store'] is False
+        return SimpleNamespace(status='completed',output_text=json.dumps({
+            'shareable':True,'project_suggestion':'bagworm','excerpts':['Invented test success']}))
+    ai = WorkAI(StateStore(tmp_path/'state.db'),SimpleNamespace(responses=SimpleNamespace(create=create)))
+    assert asyncio.run(ai.coach('W','Bagworm specimen still needs inspection',channel_only=True)) is None
+    with ai.store._connect() as conn:
+        assert conn.execute('SELECT calls FROM work_ai_budget').fetchone()[0] == 1
+
+
 def test_openai_request_is_structured_bounded_and_cached(tmp_path):
     calls = []
 
