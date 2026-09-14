@@ -210,3 +210,31 @@ verify one real worker cycle. Publishing recaps and automated agendas remains th
 existing DP sharing workflow with its own authorization. Resource calendars,
 probabilistic forecasts, image interpretation, automated source polling, and
 automatic reallocation are not implemented by this increment.
+
+## Trusted owner-machine pilot
+
+`python -m agent.planning_owner_pilot --host VERIFIED_MINI_ADDRESS --owner OWNER_SLACK_ID
+--workspace WORKSPACE_ID --channel BAGWORM_CHANNEL --snapshot PRIVATE_SEED
+--database PRIVATE_PLANNER_DB --port 8879` runs only on loopback on the owner's
+trusted Mac. Supply these CLI flags on one line. This is a distinct owner-only
+transport, not the worker HTTPS service. Every process/user with access to this
+Mac's loopback can access the pilot; never run it on a shared kiosk. The operator
+explicitly selects the owner, and each data/mutation request verifies the saved
+SSH host key, the current DP primary-owner identity and Slack workspace. SSH uses
+the existing trusted administrator account; it is not worker authentication.
+
+Source access is rechecked using current Slack membership on each request. The
+pilot reads captured Bagworm sources and a bounded recent-20-message history
+snapshot. The latter excludes bot posts and does not cover older history, replies
+or deletion reconciliation. These limits are displayed on source cards. Failure
+uses no cached permission fallback. Source code is evaluated through SSH stdin;
+no production checkout files, credentials, enrollment, clocks or service are
+modified. Secrets remain on the Mini. Sources and owner review revisions remain
+in the private local planner database; they are not automatically shared plans.
+
+The owner's existing ledger mapping is used if present. A primary administrator
+without a worker-ledger mapping receives unavailable time, never synthetic hours.
+Worker testing still requires a selected worker and the separate authenticated
+HTTPS entry point. Keep proposed source-backed changes pending until Erik accepts
+specific fields. Test acceptance on a disposable database copy rather than
+altering real project proposals for QA.

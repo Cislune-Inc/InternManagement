@@ -20,7 +20,7 @@ ASSETS=Path(__file__).with_name('portfolio_assets')
 PRINCIPAL_KEY=getattr(web,'RequestKey',web.AppKey)('planning_principal',Principal)
 
 
-def create_planning_app(store, *, authenticate, allowed_origin, sandbox=False, time_reader=None, people_reader=None):
+def create_planning_app(store, *, authenticate, allowed_origin, sandbox=False, time_reader=None, people_reader=None, mode_label=None):
     if not callable(authenticate):
         raise ValueError('A server-owned identity resolver is required.')
     # Host and origin must be explicitly configured, never derived from forwarded headers.
@@ -80,6 +80,7 @@ def create_planning_app(store, *, authenticate, allowed_origin, sandbox=False, t
         actor=request[PRINCIPAL_KEY]
         result=store.view(actor)
         result.update(csrf=csrf(actor),sandbox=sandbox,time={'connected':False})
+        result['mode_label']=mode_label
         result['people']=await people(actor)
         if time_reader:
             summary=time_reader(actor)
