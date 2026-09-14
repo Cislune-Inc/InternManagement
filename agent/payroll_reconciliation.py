@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 from .models import SessionState
 from .slack_timekeeping import paid_seconds, timestamp
+from .payroll_day_review import screen
 
 ZONE = ZoneInfo("America/Los_Angeles")
 
@@ -173,6 +174,7 @@ def build(runtime, week: str = "", now: datetime | None = None) -> dict:
                          "draft": json.loads(draft["body"]) if draft else None, "draft_current": bool(current), "saved_at": draft["saved_at"] if draft else None,
                          "gusto":gusto_day, "clock_events":clock_events})
             days[-1]["case"] = choices(days[-1], gusto_day, case)
+            days[-1]["screen"] = screen(days[-1], user, ZONE)
         total = sum(d["seconds"] for d in days)
         workers.append({"user_key": key, "name": user.display_name if user else key, "compensation": user.compensation_plan if user else "needs_review", "mapped": bool(user and user.gusto_entity_uuid), "seconds": total, "hours": round(total / 3600, 4), "days": days, "reports": worker_reports, "gusto":gusto_worker,
                         "issues": (["Weekly recorded hours exceed 40; review classification"] if total > 144000 and not (user and user.worker_type == "admin") else []) + (["No DP hours recorded: check earlier Gusto/cutover records"] if not total else [])})
@@ -206,9 +208,17 @@ def save(runtime, payload: dict) -> dict:
     if choice and choice not in {c["id"] for c in row["case"]["options"]}:
         raise ValueError("Reconciliation choice changed; refresh the source")
     body["choice"] = choice
+    for field in ("rest_review", "meal_review"):
+        value = str(payload.get(field) or "")
+        if value not in {"", "recorded", "correction", "missed", "unsure"}:
+            raise ValueError("Choose a valid break review option")
+        body[field] = value
     if not body["note"]:
         raise ValueError("Add the source/evidence and what you resolved.")
     body["status"] = "draft"  # This is not approval, a punch correction, or a payroll transaction.
+    body["break_notes"] = str(payload.get("break_notes") or "").strip()[:4000]
+    if "correction" in (body["rest_review"], body["meal_review"]) and not body["break_notes"]:
+        raise ValueError("Add the actual break times or witness context for the correction")
     with _connect(runtime) as conn:
         conn.execute("INSERT INTO drafts(week,user_key,day,fingerprint,body,saved_at) VALUES(?,?,?,?,?,?)", (data["week_ending"], worker["user_key"], row["day"], row["fingerprint"], json.dumps(body), datetime.now(timezone.utc).isoformat()))
     return {"saved": True, "message": "Reconciliation draft saved. DP punches and Gusto are unchanged."}

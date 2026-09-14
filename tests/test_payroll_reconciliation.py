@@ -98,3 +98,18 @@ def test_observed_gusto_and_week_drafts(tmp_path):
     path.write_text(json.dumps(source))
     with pytest.raises(ValueError, match="coverage"):
         build(r,"2026-09-13",NOW)
+
+
+def test_day_screen_timing_and_missing_evidence(tmp_path):
+    r = runtime(tmp_path)
+    put(r, lunch_windows=[{"started_at":"2026-09-08T19:00:00+00:00","ended_at":"2026-09-08T19:30:00+00:00"}], paid_rest_windows=[{"started_at":"2026-09-08T17:00:00+00:00","ended_at":"2026-09-08T17:10:00+00:00"}])
+    d = build(r,"2026-09-13",NOW)["workers"][0]["days"][1]
+    assert d["screen"]["expected_rests"] == 2
+    assert d["screen"]["clear_rests"] == 1
+    assert d["screen"]["lanes"][0]["a"] == 480
+    assert d["screen"]["label"] == "Needs review"
+    body = dict(week="2026-09-13", user_key="test-worker", day=d["day"], fingerprint=d["fingerprint"], note="Review", rest_review="correction")
+    with pytest.raises(ValueError, match="actual break"):
+        save(r,body)
+    assert save(r,dict(body,break_notes="Owner witnessed second rest at 2pm for 10 minutes"))["saved"]
+    assert build(r,"2026-09-13",NOW)["workers"][0]["days"][1]["draft"]["rest_review"] == "correction"
