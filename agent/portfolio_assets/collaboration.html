@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cislune · Shared work</title><link rel="stylesheet" href="/planning-assets/collaboration.css">
+<script defer src="/planning-assets/schedule.js"></script><script defer src="/planning-assets/collaboration.js"></script></head>
+<body><header><div><small>CISLUNE / DON POLLO</small><h1>One conversation. A clearer next step.</h1><p>Connect the work, evidence and decisions.</p></div><div id="identity"></div></header>
+<div id="environment" class="notice"></div>
+<main><div class="toolbar"><label>Project<select id="project" aria-label="Project"></select></label><button id="refresh">Refresh shared state</button><span id="revision"></span></div>
+<p id="message" role="status" aria-live="polite"></p><div id="metrics" class="metrics"></div>
+<nav aria-label="Shared work views"><button data-view="next">Next work</button><button data-view="plan">Plan & dependencies</button><button data-view="updates">Updates</button><button data-view="review">Review changes</button><button data-view="recap">My recap</button><button data-view="meeting">Meeting prep</button></nav>
+<section id="content" aria-live="polite"></section>
+<footer>Recorded time, work evidence and accepted plans remain distinct. Source permissions apply to every view. Nothing here sends a Slack message or changes a clock.</footer></main>
+<dialog id="proposal-dialog"><form id="proposal-form"><h2>Propose a change</h2><p id="proposal-context" class="muted"></p><div id="proposal-fields"></div><label>Why this change?<textarea name="reason" required maxlength="4000"></textarea></label><label>Supporting update (optional)<select name="evidence" id="proposal-evidence"></select></label><p id="proposal-error" role="alert"></p><div class="actions"><button type="button" id="cancel-proposal">Cancel</button><button class="primary" type="submit">Save proposal</button></div></form></dialog>
+</body></html>
