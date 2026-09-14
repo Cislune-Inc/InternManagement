@@ -74,3 +74,27 @@ def test_historical_open_not_carried_and_script_safe(tmp_path):
     assert "\\r\\n" in page
     with pytest.raises(ValueError):
         period("2026-09-14", NOW)
+
+
+def test_observed_gusto_and_week_drafts(tmp_path):
+    r = runtime(tmp_path)
+    put(r, slack_clock_stop_reason="worker_clock_out", compliance_events=[{"event_type":"meal_due", "recorded_at":"2026-09-08T20:00:00+00:00"}])
+    path = tmp_path / "dashboard/payroll/2026-09-13/gusto-observed.json"
+    path.parent.mkdir(parents=True)
+    source = {"week_ending":"2026-09-13", "workers":{"test-worker":{"days":{f"2026-09-{n:02}":{"minutes":480 if n==8 else 0} for n in range(7,14)},"week_minutes":480}}, "worker_cases":{"test-worker":{"title":"Coverage", "evidence":"Check coverage", "options":[{"id":"confirm","label":"Confirm"}]}}}
+    path.write_text(json.dumps(source))
+    w = build(r, "2026-09-13", NOW)["workers"][0]
+    assert any("Earlier automatic stop" in i for i in w["days"][1]["issues"])
+    assert any("Both Gusto" in i for i in w["days"][1]["issues"])
+    body = dict(week="2026-09-13", user_key="test-worker", day="week", fingerprint=w["week_review"]["fingerprint"], note="Owner confirms coverage", choice="confirm")
+    assert save(r, body)["saved"]
+    with pytest.raises(ValueError, match="cannot allocate"):
+        save(r, dict(body, target_hours=10))
+    source["workers"]["test-worker"]["days"]["2026-09-08"]["minutes"] = 481
+    source["workers"]["test-worker"]["week_minutes"] = 481
+    path.write_text(json.dumps(source))
+    assert not build(r,"2026-09-13",NOW)["workers"][0]["week_review"]["draft_current"]
+    source["workers"]["test-worker"]["days"]["2026-08-01"] = source["workers"]["test-worker"]["days"].pop("2026-09-07")
+    path.write_text(json.dumps(source))
+    with pytest.raises(ValueError, match="coverage"):
+        build(r,"2026-09-13",NOW)
