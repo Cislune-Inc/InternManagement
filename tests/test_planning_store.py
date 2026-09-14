@@ -182,6 +182,30 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual(len(self.store.view(self.owner)['review_recaps']),1)
         self.assertEqual(self.store.view(self.owner)['revision'],1)
 
+    def test_restricted_evidence_cannot_leak_through_proposal_or_accepted_fields(self):
+        self.store.ingest_source(source())
+        p=self.proposal(patch={'title':'Private evidence-derived result'},reason='Private evidence explanation',
+                        evidence=[{'source_ref':source()['source_ref'],'version':'1'}])['id']
+        outsider=Principal('slack:T:OTHER',frozenset({'p'}))
+        self.assertEqual(self.store.view(outsider)['proposals'],[])
+        with self.assertRaises(PlanningError):self.store.discuss(outsider,request_id='hidden-comment',proposal_id=p,kind='note',body='Trying guessed ID')
+        self.decide(p)
+        state=self.store.view(outsider)
+        self.assertNotIn('Private evidence',json.dumps(state))
+        self.assertTrue(any(t['id'].startswith('restricted-') for t in state['plan']['tasks']))
+        with self.assertRaises(PlanningError):self.proposal(actor=outsider,request_id='hidden-patch',base_revision=2,patch={'title':'Guess'})
+        validate_plan(state['plan'])
+
+    def test_restricted_project_milestone_does_not_leave_orphaned_packets(self):
+        self.store.ingest_source(source())
+        p=self.proposal(entity='project',target='p',patch={'milestone':'Private milestone'},
+                        evidence=[{'source_ref':source()['source_ref'],'version':'1'}])['id']
+        self.decide(p)
+        outsider=Principal('slack:T:OTHER',frozenset({'p','q'}))
+        state=self.store.view(outsider)
+        self.assertNotIn('Private milestone',json.dumps(state))
+        validate_plan(state['plan'])
+
 
 class AdapterTests(unittest.TestCase):
     def test_readonly_capture_cursor_edits_and_no_clock_mutation(self):

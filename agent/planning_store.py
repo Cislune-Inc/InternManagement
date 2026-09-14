@@ -198,6 +198,10 @@ class PlanningStore:
         if actor.person_ref != self.owner_ref:
             raise PlanningError('Only the designated owner can accept or reject plan changes.', 403)
 
+    @staticmethod
+    def _visible(row,actor):
+        return set(row.get('required_source_scopes',[]))<=actor.source_scopes
+
     def _mutate(self, actor, request_id, operation, payload, action):
         identifier(request_id)
         fingerprint = hashlib.sha256(encode(payload).encode()).hexdigest()
@@ -230,6 +234,9 @@ class PlanningStore:
             if revision != base_revision:
                 raise PlanningError('The plan changed. Refresh and review your proposal against the new revision.', 409)
             self._check_evidence(db,actor,project,evidence)
+            project_row=next((r for r in plan['projects'] if r['id']==project),None)
+            if not project_row or not self._visible(project_row,actor):
+                raise PlanningError('Project details require their original source access.',403)
             rows = plan['projects' if entity == 'project' else 'tasks']
             row = next((r for r in rows if r['id'] == target), None)
             if entity=='task_create':
@@ -240,8 +247,11 @@ class PlanningStore:
                 rows.append(row)
             if row is None or (row['id'] if entity == 'project' else row['project']) != project:
                 raise PlanningError('Packet or project not found.', 404)
+            if not self._visible(row,actor):
+                raise PlanningError('Packet details require their original source access.',403)
             if entity != 'project' and 'deps' in patch:
-                visible_ids = {t['id'] for t in plan['tasks'] if t['project'] in actor.projects}
+                allowed_projects={p['id'] for p in plan['projects'] if p['id'] in actor.projects and self._visible(p,actor)}
+                visible_ids = {t['id'] for t in plan['tasks'] if t['project'] in allowed_projects and self._visible(t,actor)}
                 if not isinstance(patch['deps'], list) or any(d not in visible_ids for d in patch['deps']):
                     raise PlanningError('A dependency requires access to its project.', 403)
             before = {} if entity=='task_create' else {k: row.get(k) for k in patch}
@@ -271,6 +281,16 @@ class PlanningStore:
         if not row:
             raise PlanningError('Proposal not found.', 404)
         self._allow(actor, row['project'])
+        with self.connect() as db:
+            _,plan=self._plan(db)
+            project_row=next((p for p in plan['projects'] if p['id']==row['project']),None)
+            task_row=next((t for t in plan['tasks'] if t['id']==row['target']),None)
+            if not project_row or not self._visible(project_row,actor) or (task_row and not self._visible(task_row,actor)):
+                raise PlanningError('This proposal follows its current plan audience.',403)
+            for e in json.loads(row['evidence']):
+                source=db.execute('SELECT scope FROM planning_sources WHERE source_ref=?',(e['source_ref'],)).fetchone()
+                if not source or source['scope'] not in actor.source_scopes:
+                    raise PlanningError('This proposal follows its original evidence audience.',403)
         return row
 
     def discuss(self, actor, *, request_id, proposal_id, kind, body):
@@ -334,6 +354,10 @@ class PlanningStore:
                 else:
                     target = next(r for r in rows if r['id'] == p['target'])
                 target.update(json.loads(p['patch']))
+                inherited=set(target.get('required_source_scopes',[]))
+                for e in json.loads(p['evidence']):
+                    inherited.add(db.execute('SELECT scope FROM planning_sources WHERE source_ref=?',(e['source_ref'],)).fetchone()[0])
+                target['required_source_scopes']=sorted(inherited)
                 # Acceptance applies to these changed fields, not unrelated imported assignments.
                 target.setdefault('accepted_fields', {}).update({k:revision+1 for k in json.loads(p['patch'])})
                 validate_plan(plan)
@@ -384,6 +408,8 @@ class PlanningStore:
             if not task or not source:
                 raise PlanningError('Packet or evidence not found.', 404)
             self._allow(actor, task['project'])
+            if not self._visible(task,actor):
+                raise PlanningError('This packet requires its original source access.',403)
             if source['scope'] not in actor.source_scopes or source['project'] != task['project'] or source['deleted']:
                 raise PlanningError('This source cannot be linked to this packet.', 403)
         with self.connect() as db:
@@ -405,7 +431,7 @@ class PlanningStore:
             revision, plan = self._plan(db)
             if revision != plan_revision:
                 raise PlanningError('The plan changed. Review the latest next step before saving.', 409)
-            if not any(t['id'] == packet_id and t['project'] == project for t in plan['tasks']):
+            if not any(t['id'] == packet_id and t['project'] == project and self._visible(t,actor) for t in plan['tasks']):
                 raise PlanningError('Packet not found.', 404)
             rid = uuid4().hex
             db.execute('INSERT INTO planning_recaps VALUES (?,?,?,?,?,?,?)',
@@ -416,11 +442,13 @@ class PlanningStore:
     def view(self, actor):
         """Project grants and source scopes are re-evaluated on EVERY read."""
         with self.connect() as db:
+            db.execute('BEGIN')
             revision, plan = self._plan(db)
             plan['projects'] = [{k:v for k,v in p.items() if k in PROJECT_FIELDS|{'id','category','plan_state','accepted_fields','source'}}
-                                for p in plan['projects'] if p['id'] in actor.projects]
+                                for p in plan['projects'] if p['id'] in actor.projects and self._visible(p,actor)]
+            visible_projects={p['id'] for p in plan['projects']}
             visible = [{k:v for k,v in t.items() if k in TASK_FIELDS|{'id','project','plan_state','accepted_fields','source'}}
-                       for t in plan['tasks'] if t['project'] in actor.projects]
+                       for t in plan['tasks'] if t['project'] in visible_projects and self._visible(t,actor)]
             visible_ids = {t['id'] for t in visible}
             hidden = set(d for t in visible for d in t['deps'] if d not in visible_ids)
             aliases = {d:'restricted-'+hashlib.sha256(d.encode()).hexdigest()[:16] for d in hidden}
@@ -439,6 +467,11 @@ class PlanningStore:
             proposals = []
             for row in db.execute('SELECT * FROM planning_proposals ORDER BY created_at DESC'):
                 if row['project'] not in actor.projects:
+                    continue
+                evidence_scopes=[db.execute('SELECT scope FROM planning_sources WHERE source_ref=?',(e['source_ref'],)).fetchone() for e in json.loads(row['evidence'])]
+                if row['project'] not in visible_projects or any(not r or r[0] not in actor.source_scopes for r in evidence_scopes):
+                    continue
+                if row['entity']!='project' and row['entity']!='task_create' and row['target'] not in visible_ids:
                     continue
                 p = dict(row)
                 p['patch'], p['before'] = json.loads(p.pop('patch')), json.loads(p.pop('before_json'))

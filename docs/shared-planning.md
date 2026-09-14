@@ -86,6 +86,10 @@ The source-version table preserves provenance; normal views show only the curren
 source projection and tombstones. Hidden prerequisites appear as opaque unresolved
 gates instead of leaking titles or becoming falsely ready. Acceptance of changed
 fields does not approve unrelated imported assignments or historical estimates.
+Proposals, discussion and resulting entities inherit the cited evidence audience;
+acceptance does not declassify source-derived content. A reader without those
+source grants receives an unresolved prerequisite instead. A separately reviewed,
+sanitized audience migration is needed to widen that scope.
 
 ## Read adapters — current DP interface
 
