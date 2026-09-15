@@ -32,6 +32,7 @@ from .time_tracking_dashboard import (
 from .time_utils import resolve_timezone
 from .work_dashboard import build_work_dashboard_payload, render_work_dashboard_html
 from .worker_portal import WorkerPortalService
+from .portfolio import load_portfolio, render_portfolio
 
 
 class HoursEditorService:
@@ -73,6 +74,12 @@ class HoursEditorService:
 
     def render_work_dashboard_html(self) -> str:
         return render_work_dashboard_html(self.build_work_dashboard_payload())
+
+    def build_portfolio_payload(self) -> dict[str, Any]:
+        return load_portfolio(self._storage_root())
+
+    def render_portfolio_html(self) -> str:
+        return render_portfolio(self.build_portfolio_payload())
 
     def build_payroll_dashboard_payload(self) -> dict[str, Any]:
         return build_payroll_dashboard_payload(self._storage_root())
@@ -294,6 +301,15 @@ def build_request_handler(service: HoursEditorService, *, manager_key: str | Non
                 return
             if parsed.path == "/work":
                 self._respond_html(service.render_work_dashboard_html())
+                return
+            if parsed.path in {"/portfolio", "/api/portfolio-data"}:
+                try:
+                    if parsed.path == "/portfolio":
+                        self._respond_html(service.render_portfolio_html())
+                    else:
+                        self._respond_json(service.build_portfolio_payload())
+                except (OSError, ValueError):
+                    self._respond_error(HTTPStatus.SERVICE_UNAVAILABLE, "Portfolio snapshot unavailable; timekeeping is independent.")
                 return
             if parsed.path == "/payroll":
                 self._respond_html(service.render_payroll_dashboard_html())

@@ -16,6 +16,10 @@ def server():
     class Service:
         def render_dashboard_html(self):
             return "manager-control"
+        def render_portfolio_html(self):
+            return "portfolio-manager-only"
+        def build_portfolio_payload(self):
+            return {"schema_version": 1, "tasks": []}
         def build_worker_portal_payload(self, token):
             if token != "worker-signed-test-token":
                 raise ValueError("Denied")
@@ -31,7 +35,7 @@ def server():
     http.server_close()
 
 
-@pytest.mark.parametrize("path", ["/", "/time", "/work", "/payroll", "/health", "/exceptions",
+@pytest.mark.parametrize("path", ["/", "/time", "/work", "/portfolio", "/api/portfolio-data", "/payroll", "/health", "/exceptions",
     "/api/dashboard-data", "/api/work-dashboard-data", "/api/payroll-data", "/api/health", "/api/exceptions", "/payroll/files/private.csv"])
 def test_every_manager_read_denies_anonymous_local_kiosk(server, path):
     response = requests.get(server + path, timeout=2)
@@ -74,3 +78,11 @@ def test_missing_invalid_credentials_fail_closed_and_headers_stay_local(tmp_path
         assert local_headers(url) == {}
     (tmp_path / "secrets").chmod(0o755)
     assert load_key() is None
+
+
+def test_portfolio_requires_manager_auth_and_has_no_write_route(server):
+    headers = {"Authorization": auth_header(KEY)}
+    assert requests.get(server + "/portfolio", headers=headers, timeout=2).text == "portfolio-manager-only"
+    assert requests.get(server + "/api/portfolio-data", headers=headers, timeout=2).json()["tasks"] == []
+    assert requests.get(server + "/portfolio?token=worker-signed-test-token", timeout=2).status_code == 401
+    assert requests.post(server + "/api/portfolio-data", headers=headers, json={}, timeout=2).status_code == 404
