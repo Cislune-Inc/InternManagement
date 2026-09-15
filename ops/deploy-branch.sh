@@ -28,6 +28,29 @@ cleanup() {
 trap cleanup EXIT
 
 branch="${1:-}"
+[[ $# -eq 0 ]] || shift
+controls_args=()
+restart_args=()
+primary_admin_only=0
+enrollment_args=()
+defer_before=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --base-url)
+      [[ $# -ge 2 ]] || exit 2
+      controls_args=(--base-url "$2")
+      shift 2 ;;
+    --primary-admin-only) primary_admin_only=1; shift ;;
+    --primary-admin-slack-id)
+      [[ $# -ge 2 ]] || exit 2
+      enrollment_args=(--primary-admin-slack-id "$2"); shift 2 ;;
+    --enable-disabled) restart_args=(--enable-disabled); shift ;;
+    --defer-primary-legacy-before)
+      [[ $# -ge 2 ]] || exit 2
+      defer_before="$2"; shift 2 ;;
+    *) echo "Unknown deployment option." >&2; exit 2 ;;
+  esac
+done
 
 if [[ ! "${branch}" =~ '^agent/[A-Za-z0-9._/-]+$' ]]; then
   echo "Usage: ops/deploy-branch.sh agent/<reviewed-branch>" >&2
@@ -90,12 +113,26 @@ else
 fi
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python -m compileall -q agent
-.venv/bin/python ops/apply_production_controls.py --apply
-PYTHONPATH=. .venv/bin/python ops/apply_production_roster_controls.py --apply
-.venv/bin/python ops/infer_compensation_plans.py --apply-confident
+PYTHONPATH=. .venv/bin/python ops/protect_manager.py --apply
+.venv/bin/python ops/apply_production_controls.py --apply "${controls_args[@]}"
+if [[ "${primary_admin_only}" == "1" ]]; then
+  PYTHONPATH=. .venv/bin/python ops/enable_slack_clock_beta.py --primary-admin-only --apply "${enrollment_args[@]}"
+fi
+state_db="$(.venv/bin/python -c 'import json; print(json.load(open("bootstrap.local.json"))["state_db_path"])')"
+if [[ -n "${defer_before}" ]]; then
+  [[ "${primary_admin_only}" == "1" ]] || { echo "Historical deferral requires an explicit primary-admin pilot." >&2; exit 2; }
+  PYTHONPATH=. .venv/bin/python ops/defer_legacy_shifts.py --state-db "${state_db}" \
+    --primary-admin --before-date "${defer_before}" --apply
+fi
+if [[ "${primary_admin_only}" == "1" ]]; then
+  PYTHONPATH=. .venv/bin/python ops/slack_beta_preflight.py --state-db "${state_db}" --primary-admin-only
+fi
+# Compensation classification is a reviewed roster decision, not a deployment
+# inference. Do not run either the legacy roster-default writer (which also
+# re-adds workers) or compensation inference during a code deployment.
 .venv/bin/python ops/deploy_maintenance.py start --minutes 15
 maintenance_started=1
-ops/restart-services.sh
+ops/restart-services.sh "${restart_args[@]}"
 .venv/bin/python ops/deploy_maintenance.py stop
 maintenance_started=0
 

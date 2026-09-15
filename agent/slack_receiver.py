@@ -3,12 +3,49 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from typing import Any
 
 from .ssl_compat import build_ssl_context
 
 
 logger = logging.getLogger(__name__)
+
+CLOCK_ACTIONS = {
+    "dp_clock_in": ("Kiosk instructions", "clock in onsite"),
+    "dp_clock_out": ("Clock out", "clock out"),
+    "dp_clock_hours": ("My hours", "hours"),
+    "dp_clock_lunch": ("Start lunch", "lunch"),
+    "dp_clock_back": ("Back to work", "back"),
+    "dp_clock_rest": ("Paid rest", "break"),
+    "dp_clock_work_status": ("Current work", "work status"),
+    "dp_clock_work_draft": ("Preview update", "work draft"),
+    "dp_clock_handoffs": ("Confirmed handoffs", "work handoffs"),
+    "dp_clock_pin_setup": ("Set up / reset PIN", "kiosk setup"),
+    "dp_clock_fix_lunch": ("Correct lunch", "fix lunch"),
+    "dp_clock_report": ("Report an issue", "report hours"),
+    "dp_clock_cancel_lunch": ("Cancel lunch correction", "cancel lunch"),
+}
+
+
+async def handle_clock_action(runtime: Any, discord_client: Any, body: dict[str, Any]) -> None:
+    actions = body.get("actions") or []
+    action = actions[0] if actions else {}
+    selection = CLOCK_ACTIONS.get(str(action.get("action_id") or ""))
+    value = str(action.get("value") or "")
+    if action.get("action_id") == "dp_clock_confirm_day" and re.fullmatch(r"\d{4}-\d{2}-\d{2} [0-9a-f]{8}", value):
+        selection = ("Confirm day", "confirm day " + value)
+    elif action.get("action_id") == "dp_clock_confirm_lunch" and re.fullmatch(r"[0-9a-f]{8}", value):
+        selection = ("Confirm lunch", "confirm lunch " + value)
+    elif action.get("action_id") == "dp_clock_confirm_stop" and re.fullmatch(r"\d{4}-\d{2}-\d{2} [0-9a-f]{8}", value):
+        selection = ("Confirm finish", "confirm stop " + value)
+    if not selection:
+        return
+    await runtime.handle_slack_direct_message(discord_client, {
+        "user": str((body.get("user") or {}).get("id") or ""),
+        "text": selection[1],
+        "event_ts": str(action.get("action_ts") or ""),
+    })
 
 
 def build_slack_web_client(bot_token: str) -> Any:
@@ -50,11 +87,35 @@ class SlackSocketReceiver:
         web_client = build_slack_web_client(self.bot_token)
         app = AsyncApp(client=web_client)
 
+        @app.event("app_mention")
+        async def handle_project_mention(event: dict[str, Any]) -> None:
+            from .channel_updates import handle
+            try:
+                await handle(self.runtime, web_client, event)
+            except Exception:
+                logger.exception("Project mention processing failed; attendance unchanged.")
+
+        @app.action(re.compile(r"^dp_clock_"))
+        async def handle_clock_button(ack: Any, body: dict[str, Any]) -> None:
+            await ack()
+            await handle_clock_action(self.runtime, self.discord_client, body)
+            try:
+                await publish_app_home(self.runtime, web_client, str((body.get("user") or {}).get("id") or ""))
+            except Exception:
+                logger.warning("Clock action handled; App Home refresh failed.")
+
         @app.event("message")
-        async def handle_message(event: dict[str, Any]) -> None:
+        async def handle_message(event: dict[str, Any], body: dict[str, Any]) -> None:
+            if str(event.get("channel_type") or "") in {"channel", "group"}:
+                from .channel_updates import handle
+                try:
+                    await handle(self.runtime, web_client, {**event, 'team': str(body.get('team_id') or event.get('team') or '')})
+                except Exception:
+                    logger.exception("Channel update processing failed; attendance unchanged.")
+                return
             if str(event.get("channel_type") or "") != "im":
                 return
-            if event.get("bot_id") or event.get("subtype"):
+            if event.get("bot_id") or event.get("subtype") not in {None, '', 'file_share'}:
                 return
             try:
                 await self.runtime.handle_slack_direct_message(
