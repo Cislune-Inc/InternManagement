@@ -1543,7 +1543,7 @@ class InternManagementRuntime:
                 {"type": "header", "text": {"type": "plain_text", "text": "Don Pollo · Hours & work"}},
                 {"type": "actions", "elements": buttons[:5]},
                 {"type": "section", "text": {"type": "mrkdwn", "text": clock_status}},
-                {"type": "actions", "elements": buttons[5:]},
+                *[{"type": "actions", "elements": buttons[i:i+5]} for i in range(5, len(buttons), 5)],
                 {"type": "section", "text": {"type": "mrkdwn", "text": (
                     "This is Don Pollo Project Updates, connected to the shop Mini time clock. "
                     "Already set up? Use My hours to check your recorded time. "

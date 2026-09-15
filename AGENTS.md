@@ -9,6 +9,15 @@
 
 ## Safety invariants
 
+- September 14 latest owner-approved DP-only revision supersedes the older paid-rest
+  return gates and automatic meal-deadline pause below for the Slack beta. Paid
+  rests keep time running without a required return action. Meal reminders occur
+  before the deadline and once overdue; missing meals remain reviewable, never an
+  invented deduction or prerequisite fictional meal for login. Keep actual lunch
+  start/return, the lunch minimum, overtime/remote gates, and truthful corrections.
+  Kiosk checkout queues one private daily review; worker confirmation is not payroll
+  approval. Gusto overlap reconciliation is historical migration work only.
+
 - Worker-facing messages should be brief, friendly and directive: state the
   action, timing and next step. Do not append repetitive legal disclaimers,
   suggestions about fictional compliance, or actual-hours reporting boilerplate

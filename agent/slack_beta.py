@@ -66,7 +66,8 @@ def ledger(runtime: Any) -> SlackTimekeeping:
                     if (user := clock_user(runtime, actor)) is not None)
     return SlackTimekeeping(runtime.state_store, timezone_name=runtime.config.timezone,
                            daily_limit_hours=runtime.config.labor.overtime_limit_hours,
-                           require_kiosk=True, allow_slack_break_returns=True, handover_pending_user_keys=pending)
+                           require_kiosk=True, allow_slack_break_returns=True, simplified_flow=True,
+                           handover_pending_user_keys=pending)
 
 
 async def archive(runtime: Any, user: Any, session: Any, now: datetime) -> None:

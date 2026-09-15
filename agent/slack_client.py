@@ -116,6 +116,10 @@ class SlackClient:
         }
         if thread_ts:
             payload["thread_ts"] = thread_ts
+        if channel_id.startswith(("U", "D")):
+            from .clock_buttons import blocks
+            if clock_blocks := blocks(message):
+                payload["blocks"] = clock_blocks
         return self._request(
             "POST",
             "/chat.postMessage",

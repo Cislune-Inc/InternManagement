@@ -30,6 +30,22 @@ async def build_manager_exceptions_payload(
         from .slack_timekeeping import SlackTimekeeping
 
         exceptions.extend(SlackWorkIntake(runtime.state_store).pending_exceptions())
+        with runtime.state_store._connect() as conn:
+            review_rows = conn.execute("SELECT user_key,session_date,payload FROM sessions WHERE json_extract(payload, '$.metadata.slack_clock_daily_review.status') IN ('pending','needs_correction') ORDER BY session_date DESC LIMIT 100").fetchall()
+        for row in review_rows:
+            session_data = json.loads(row['payload'])
+            review = session_data['metadata']['slack_clock_daily_review']
+            if not session_data.get('clocked_out_at'):
+                continue
+            exceptions.append({
+                'id': f"daily-clock-review:{row['user_key']}:{row['session_date']}",
+                'severity': 'warning' if review['status'] == 'needs_correction' else 'info',
+                'category': 'daily_clock_review', 'person': row['user_key'],
+                'user_key': row['user_key'], 'session_date': row['session_date'],
+                'summary': 'Daily hours/lunch correction needed' if review['status'] == 'needs_correction' else 'Daily hours/lunch review not confirmed',
+                'source': 'slack_daily_review', 'last_seen_at': review['at'], 'occurrence_count': 1,
+                'details': {'recommended_action': 'Review this day and any existing worker report together; no paid-rest timestamp reconstruction. DP is the clock; Gusto is the payroll destination.'},
+            })
         for report in SlackTimekeeping(runtime.state_store).reports():
             exceptions.append({
                 "id": report["id"], "severity": "warning", "category": "actual_hours_report",

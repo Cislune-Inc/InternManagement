@@ -15,13 +15,16 @@ CLOCK_ACTIONS = {
     "dp_clock_in": ("Kiosk instructions", "clock in onsite"),
     "dp_clock_out": ("Clock out", "clock out"),
     "dp_clock_hours": ("My hours", "hours"),
-    "dp_clock_lunch": ("Lunch", "lunch"),
-    "dp_clock_back": ("Back", "back"),
+    "dp_clock_lunch": ("Start lunch", "lunch"),
+    "dp_clock_back": ("Back to work", "back"),
     "dp_clock_rest": ("Paid rest", "break"),
     "dp_clock_work_status": ("Current work", "work status"),
     "dp_clock_work_draft": ("Preview update", "work draft"),
     "dp_clock_handoffs": ("Confirmed handoffs", "work handoffs"),
     "dp_clock_pin_setup": ("Set up / reset PIN", "kiosk setup"),
+    "dp_clock_fix_lunch": ("Correct lunch", "fix lunch"),
+    "dp_clock_report": ("Report an issue", "report hours"),
+    "dp_clock_cancel_lunch": ("Cancel lunch correction", "cancel lunch"),
 }
 
 
@@ -29,6 +32,13 @@ async def handle_clock_action(runtime: Any, discord_client: Any, body: dict[str,
     actions = body.get("actions") or []
     action = actions[0] if actions else {}
     selection = CLOCK_ACTIONS.get(str(action.get("action_id") or ""))
+    value = str(action.get("value") or "")
+    if action.get("action_id") == "dp_clock_confirm_day" and re.fullmatch(r"\d{4}-\d{2}-\d{2} [0-9a-f]{8}", value):
+        selection = ("Confirm day", "confirm day " + value)
+    elif action.get("action_id") == "dp_clock_confirm_lunch" and re.fullmatch(r"[0-9a-f]{8}", value):
+        selection = ("Confirm lunch", "confirm lunch " + value)
+    elif action.get("action_id") == "dp_clock_confirm_stop" and re.fullmatch(r"\d{4}-\d{2}-\d{2} [0-9a-f]{8}", value):
+        selection = ("Confirm finish", "confirm stop " + value)
     if not selection:
         return
     await runtime.handle_slack_direct_message(discord_client, {

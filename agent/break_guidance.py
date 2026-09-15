@@ -20,6 +20,18 @@ def summary(session, user, now, zone, *, meal_due=False):
     from .slack_timekeeping import timestamp, paid_seconds
     if not session.clocked_in_at:
         return ""
+    if session.metadata.get("slack_clock_simplified_flow"):
+        text = "\nPaid rests stay on the clock; no logout or return login needed."
+        if user.meal_tracking_required and meal_due and not session.metadata.get("slack_clock_meal_started_at"):
+            text += "\nLunch needs attention. Send `lunch` as you leave, or `fix lunch` with the times if already taken."
+        review = session.metadata.get("slack_clock_daily_review") or {}
+        if session.clocked_out_at and review.get("status") in {"pending", "needs_correction"}:
+            from .slack_timekeeping import SlackTimekeeping
+            if (user.meal_tracking_required and meal_due) or any(e.get('confirmation') == 'stop_instruction_not_proof_of_stopped_work' for e in session.metadata.get('compliance_events', [])):
+                text += "\nDaily review: resolve the time/lunch item using `fix lunch` or `report hours`."
+            else:
+                text += f"\nDaily review pending. Check your hours and lunch; reply `confirm day {session.session_date} {SlackTimekeeping._review_token(session)}` if correct."
+        return text
     full = completed_rests(session)
     all_rests = session.metadata.get("paid_rest_windows", [])
     parts = []

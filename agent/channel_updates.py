@@ -168,6 +168,19 @@ async def handle(runtime: Any, web_client: Any, event: dict[str, Any]) -> None:
     # Capture-before-send gives duplicate suppression even after transport errors.
     # Never replay messages through the DM handler: clock commands stay private.
     source_ts = str(event.get('deleted_ts') or (event.get('message') or {}).get('ts') or event.get('ts') or '')
+    # A fresh useful channel post is an activity signal, never a clock start or
+    # proof of hours. Old imports and edits must not keep unattended clocks alive.
+    if person and person.active and actor in getattr(runtime.config.slack, 'work_intake_beta_slack_user_ids', []) and event.get('subtype') in {None, '', 'file_share', 'thread_broadcast'}:
+        posted = datetime.fromtimestamp(float(source_ts), timezone.utc)
+        age = (datetime.now(timezone.utc) - posted).total_seconds()
+        with runtime.state_store._connect() as conn:
+            row = conn.execute('SELECT meaningful FROM channel_work_updates WHERE channel=? AND message_ts=?', (channel, source_ts)).fetchone()
+        with runtime.state_store._connect() as conn:
+            active = conn.execute("SELECT 1 FROM sessions WHERE user_key=? AND json_extract(payload, '$.clocked_in_at') IS NOT NULL AND json_extract(payload, '$.clocked_out_at') IS NULL AND json_extract(payload, '$.metadata.slack_clock_beta')=1", (person.user_key,)).fetchone()
+        if active and row and row[0] and 0 <= age <= 900:
+            from .slack_beta import ledger
+            async with runtime._user_session_lock(person.user_key):
+                ledger(runtime).record_activity(person, str(source.get('text') or ''), posted)
     try:
         link = await web_client.chat_getPermalink(channel=channel, message_ts=source_ts)
         with runtime.state_store._connect() as conn:
