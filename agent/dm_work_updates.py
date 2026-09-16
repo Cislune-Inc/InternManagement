@@ -145,10 +145,10 @@ class DMWorkUpdates:
                 if len(set(excerpt)) < 5:
                     continue
                 candidates = conn.execute('''SELECT message_ts,text FROM channel_work_updates
-                    WHERE channel=? AND actor=? AND deleted=0 AND meaningful=1
+                    WHERE channel=? AND actor=? AND project_key=? AND deleted=0 AND meaningful=1
                     AND CAST(message_ts AS REAL)>=? AND CAST(message_ts AS REAL)<=?
                     ORDER BY LENGTH(text) DESC LIMIT 30''',
-                    (record['channel'],record['actor'],float(record['message_ts'])-86400,float(record['message_ts'])+86400)).fetchall()
+                    (record['channel'],record['actor'],record['project_key'],float(record['message_ts'])-86400,float(record['message_ts'])+86400)).fetchall()
                 for candidate in candidates:
                     words = re.findall(r'[a-z0-9]+', html.unescape(candidate['text']).lower())
                     if len(words) > len(excerpt) and any(words[i:i+len(excerpt)] == excerpt for i in range(len(words)-len(excerpt)+1)):

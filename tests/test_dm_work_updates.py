@@ -138,6 +138,10 @@ def test_historical_excerpt_prefers_fuller_human_same_audience(setup):
     assert record['preferred_source']=={'channel':'C123','message_ts':e['ts']}
     assert record['count_as_separate_progress'] is False
     assert 'private-ts' not in str(record)
+    newer=str(float(e['ts'])+.5)
+    ChannelUpdates(setup[0]).capture({**e,'subtype':'message_changed','event_ts':newer,
+        'message':{**e,'edited':{'ts':newer},'text':e['text'].replace('removed','not removed')}},'bagworm')
+    assert 'preferred_source' not in service.published_records(channels=['C123'])[0]
     ChannelUpdates(setup[0]).capture({**e,'subtype':'message_deleted',
         'deleted_ts':e['ts'],'event_ts':str(float(e['ts'])+1)},'bagworm')
     assert 'preferred_source' not in service.published_records(channels=['C123'])[0]
