@@ -1506,6 +1506,11 @@ class InternManagementRuntime:
                     fallback = response.partition("\n")[2].replace("\n" + _BOUNDARY, "")
                     if fallback:
                         await self.slack.post_message(slack_user_id, fallback)
+                    if saved_item and getattr(self.config.slack, 'dm_work_sharing_enabled', False):
+                        from .dm_work_updates import DMWorkUpdates
+                        reminder = await DMWorkUpdates(self.state_store).process(self, slack_user_id, text, event, saved_item[0])
+                        if reminder:
+                            await self.slack.post_message(slack_user_id, reminder)
                     return True
                 if draft:
                     if match:

@@ -1,8 +1,6 @@
-"""Owner-enabled, bounded DM work excerpts to explicit project destinations.
+"""Bounded private channel encouragement; never automatically forwards a DM.
 
-Never forwards conversation history, clock records, private file bytes or AI prose.
-The model selects literal excerpts from one current work note; uncertain results
-stay private. A durable attempt claim prevents blind retries after delivery errors.
+Retains the old published-record projection for historical planner consumers.
 """
 from __future__ import annotations
 
@@ -13,8 +11,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .slack_work_intake import PROJECTS, _safe, project_candidates
-from .work_ai import WorkAI
-from .work_evidence import source_references
 
 
 def private_note(text: str) -> bool:
@@ -47,7 +43,7 @@ class DMWorkUpdates:
                 AND deleted=0 AND posted_at>=? ORDER BY posted_at DESC LIMIT 30''',
                 (actor, channel, (now-timedelta(days=1)).isoformat())).fetchall()
         words = normalized(text)
-        return bool(words) and any(len(words & normalized(r['text'])) / max(1, len(words | normalized(r['text']))) >= .8 for r in rows)
+        return bool(words) and any(len(words & normalized(r['text'])) / max(1, len(words)) >= .8 for r in rows)
 
     async def process(self, runtime: Any, actor: str, text: str, event: dict[str, Any], item_id: str, *, ai: Any = None) -> str:
         """Return a private delivery receipt, or empty when not eligible."""
@@ -100,32 +96,16 @@ class DMWorkUpdates:
             if not await runtime.slack.can_share_work(destination, actor):
                 self.finish(ident, 'audience_unverified')
                 return ''
-            prepared = await (ai or WorkAI(self.store)).coach(actor, note, context=f'Current routing label: {project}.', channel_only=True)
-            if not prepared or not prepared.get('shareable') or prepared.get('project_suggestion') != project:
-                self.finish(ident, 'held')
-                return ''
-            excerpts = prepared.get('excerpts', [])
-            if not excerpts or any(not isinstance(s,str) or s not in note or private_note(s) or 'http' in s.lower() for s in excerpts):
-                self.finish(ident, 'held')
-                return ''
             with self.store._connect() as conn:
                 current = conn.execute('SELECT revision,project_key FROM work_intake_items WHERE id=?', (item_id,)).fetchone()
             if not current or current['revision'] != item['revision'] or current['project_key'] != project or self.duplicate_in_channel(actor,destination,note,now):
                 self.finish(ident, 'superseded')
                 return ''
-            # Explicitly attributed worker report, never model-written approvals.
-            message = f"*{_safe(PROJECTS[project])} · work update from <@{actor}>*\n" + '\n'.join('> ' + _safe(s) for s in excerpts)
-            refs = [r['url'] for r in source_references(note) if r['source'] != 'chatgpt'][:3]
-            if refs:
-                message += '\n' + '\n'.join(refs)
-            message += '\n_Shared by Don Pollo from a work update; plans remain proposals._'
-            self.finish(ident, 'attempting', {'text':message, 'project_key':project, 'source_item':item_id, 'source_revision':item['revision']})
-            result = await runtime.slack.post_message(destination, message)
-            if not isinstance(result,dict) or not result.get('ts'):
-                return ''  # Attempt is uncertain; never retry automatically.
-            with self.store._connect() as conn:
-                conn.execute("UPDATE dm_work_updates SET status='sent',message_ts=? WHERE id=?", (result['ts'],ident))
-            return f"Shared your work update in <#{destination}>. Prefer posting there directly with links/photos; DP can pick it up without a mention."
+            # Claim before returning the private reminder: no uncertain-delivery
+            # retry and no new planner-visible publication record.
+            self.finish(ident, 'reminded', {'project_key':project})
+            return (f"For the {_safe(PROJECTS[project])} team, post this update in <#{destination}> "
+                    "with any useful links/photos. DP picks it up there—no mention or duplicate DM needed.")
         except Exception:
             # Fixed state only; never log private note or credential. No blind send retry.
             with self.store._connect() as conn:
@@ -148,7 +128,29 @@ class DMWorkUpdates:
             rows=conn.execute("SELECT actor,channel,message_ts,payload FROM dm_work_updates WHERE status='sent' AND channel IN ("
                               + ','.join('?' for _ in channels) + ') ORDER BY created_at DESC LIMIT ?',
                               (*channels,max(1,min(limit,500)))).fetchall()
-        return [{'actor':r['actor'],'channel':r['channel'],'message_ts':r['message_ts'],
+        records = [{'actor':r['actor'],'channel':r['channel'],'message_ts':r['message_ts'],
                  'text':json.loads(r['payload']).get('text',''),
                  'project_key':json.loads(r['payload']).get('project_key',''),
                  'plan_status':'observation','source_kind':'dp_published_work_excerpt'} for r in rows]
+        # Additive provenance hint, not deletion of the old source. Consumers
+        # group this excerpt with the fuller same-author human post, not a second
+        # accomplishment. Only sources inside the same verified channel qualify.
+        from .channel_updates import ChannelUpdates
+        ChannelUpdates(self.store)
+        with self.store._connect() as conn:
+            for record in records:
+                excerpt = normalized(' '.join(line[2:] for line in record['text'].splitlines() if line.startswith('> ')))
+                if len(excerpt) < 5:
+                    continue
+                candidates = conn.execute('''SELECT message_ts,text FROM channel_work_updates
+                    WHERE channel=? AND actor=? AND deleted=0 AND meaningful=1
+                    AND CAST(message_ts AS REAL)>=? AND CAST(message_ts AS REAL)<=?
+                    ORDER BY LENGTH(text) DESC LIMIT 30''',
+                    (record['channel'],record['actor'],float(record['message_ts'])-86400,float(record['message_ts'])+86400)).fetchall()
+                for candidate in candidates:
+                    words = normalized(candidate['text'])
+                    if len(words) > len(excerpt) and len(words & excerpt)/len(excerpt) >= .9:
+                        record['preferred_source'] = {'channel':record['channel'],'message_ts':candidate['message_ts']}
+                        record['count_as_separate_progress'] = False
+                        break
+        return records

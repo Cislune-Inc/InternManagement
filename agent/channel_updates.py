@@ -188,5 +188,7 @@ async def handle(runtime: Any, web_client: Any, event: dict[str, Any]) -> None:
                          (str(link.get('permalink') or ''), channel, source_ts))
     except Exception:
         logger.warning('Channel work saved; permalink lookup unavailable.')
-    # No receipt/reaction/question for every post. Reviewed useful summaries are
-    # separate; raw channel content never automatically crosses into another room.
+    # Selective source-thread work questions; private timekeeping never enters
+    # this path. Ordinary replies are already captured with source attribution.
+    from .channel_followups import ChannelFollowups
+    await ChannelFollowups(runtime.state_store).process(runtime, web_client, event)

@@ -38,17 +38,15 @@ def run(setup, text='Bagworm specimen removed cleanly; ready for inspection', ts
     return result,ts
 
 
-def test_literal_current_note_shared_once_with_author_not_hours(setup):
+def test_current_note_gets_private_link_once_and_never_publishes(setup):
     result,ts = run(setup)
-    assert 'Shared' in result
-    assert setup[2][0][0] == 'C123' and '<@WORKER>' in setup[2][0][1]
-    run(setup,ts=ts)
-    assert len(setup[2]) == 1
+    assert '<#C123>' in result and 'post this update' in result
+    assert run(setup,ts=ts)[0] == ''
+    assert not setup[2]
     service=DMWorkUpdates(setup[0])
     assert service.published_records(channels=[]) == []
     assert service.published_records(channels=['OTHER']) == []
-    published=service.published_records(channels=['C123'])[0]
-    assert published['actor']=='WORKER' and 'source_ts' not in published
+    assert service.published_records(channels=['C123']) == []
     with setup[0]._connect() as conn:
         assert conn.execute('SELECT COUNT(*) FROM sessions').fetchone()[0] == 0
 
@@ -73,7 +71,7 @@ def test_unverified_audience_and_hallucinated_excerpt_fail_closed(setup):
     assert not setup[2]
 
 
-def test_nonliteral_excerpt_never_shared(setup):
+def test_obsolete_excerpt_ai_is_never_used_to_publish(setup):
     async def invented(*args,**kwargs):
         return {'shareable':True,'project_suggestion':'bagworm','excerpts':['All tests passed perfectly']}
     setup[4].coach=invented
@@ -88,9 +86,9 @@ def test_transport_timeout_claim_is_not_retried(setup):
     setup[3].slack.post_message=uncertain
     _,ts=run(setup)
     run(setup,ts=ts)
-    assert len(setup[2]) == 1
+    assert len(setup[2]) == 0  # No channel transport, even when configured.
     with setup[0]._connect() as conn:
-        assert conn.execute('SELECT status FROM dm_work_updates').fetchone()[0] == 'attempting'
+        assert conn.execute('SELECT status FROM dm_work_updates').fetchone()[0] == 'reminded'
 
 
 def test_channel_first_duplicate_suppresses_mirror(setup):
@@ -98,5 +96,48 @@ def test_channel_first_duplicate_suppresses_mirror(setup):
     note='Bagworm specimen removed cleanly; ready for inspection'
     ChannelUpdates(setup[0]).capture({'type':'message','channel_type':'channel','channel':'C123',
         'user':'WORKER','text':note,'ts':str((datetime.now(timezone.utc)-timedelta(minutes=1)).timestamp())},'bagworm')
-    run(setup,note)
+    assert run(setup,note)[0] == ''
     assert not setup[2]
+
+
+def test_fuller_human_post_suppresses_subset_dm_reminder(setup):
+    from agent.channel_updates import ChannelUpdates
+    note='Bagworm specimen removed cleanly ready for inspection'
+    ChannelUpdates(setup[0]).capture({'type':'message','channel_type':'channel','channel':'C123',
+        'user':'WORKER','text':note+' We also found a hydraulic constraint and need a peer review before the next test.',
+        'ts':str((datetime.now(timezone.utc)-timedelta(minutes=1)).timestamp())},'bagworm')
+    assert run(setup,note)[0] == ''
+
+
+def test_reminder_is_bounded_and_ai_independent(setup):
+    async def unavailable(*args,**kwargs): raise AssertionError('No AI required for a channel link')
+    setup[4].coach=unavailable
+    assert run(setup)[0]
+    assert run(setup,'Bagworm testing changed the mold setup for tomorrow')[0] == ''
+    assert not setup[2]
+
+
+def test_historical_excerpt_prefers_fuller_human_same_audience(setup):
+    import json
+    from agent.channel_updates import ChannelUpdates
+    service=DMWorkUpdates(setup[0]);now=datetime.now(timezone.utc)
+    ts=str((now-timedelta(minutes=2)).timestamp())
+    note='Bagworm specimen removed cleanly ready for inspection'
+    with setup[0]._connect() as c:
+        c.execute('INSERT INTO dm_work_updates VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+            ('old','WORKER','item',1,'private-ts','C123','fp','sent',now.isoformat(),
+             json.dumps({'text':'> '+note,'project_key':'bagworm'}),ts))
+    # A different channel must not reveal a matching source or suppress this one.
+    e={'type':'message','channel_type':'channel','channel':'OTHER','user':'WORKER',
+       'text':note+' Next test requires a new mold and peer inspection.',
+       'ts':str((now-timedelta(minutes=1)).timestamp())}
+    ChannelUpdates(setup[0]).capture(e,'bagworm')
+    assert 'preferred_source' not in service.published_records(channels=['C123'])[0]
+    e['channel']='C123';ChannelUpdates(setup[0]).capture(e,'bagworm')
+    record=service.published_records(channels=['C123'])[0]
+    assert record['preferred_source']=={'channel':'C123','message_ts':e['ts']}
+    assert record['count_as_separate_progress'] is False
+    assert 'private-ts' not in str(record)
+    ChannelUpdates(setup[0]).capture({**e,'subtype':'message_deleted',
+        'deleted_ts':e['ts'],'event_ts':str(float(e['ts'])+1)},'bagworm')
+    assert 'preferred_source' not in service.published_records(channels=['C123'])[0]

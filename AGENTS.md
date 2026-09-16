@@ -9,6 +9,12 @@
 
 ## Safety invariants
 
+- September16: channel-first work updates supersede automatic DM excerpt mirroring.
+  Private contextual reminders link to the project channel; ordinary source posts
+  and replies feed planning with provenance. Necessary work questions stay in the
+  original source thread. Hours questions stay person-only in DM. Preserve current
+  audience checks, original clock ledger and owner-only plan acceptance.
+
 - September 14 latest owner-approved DP-only revision supersedes the older paid-rest
   return gates and automatic meal-deadline pause below for the Slack beta. Paid
   rests keep time running without a required return action. Meal reminders occur
