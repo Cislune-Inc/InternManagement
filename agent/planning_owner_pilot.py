@@ -12,7 +12,7 @@ from .planning_web import create_planning_app
 
 def remote_program(options):
     # Ship code through stdin for read-only evaluation, not a production checkout edit.
-    names=('planning_store','planning_adapter','planning_time')
+    names=('planning_source_groups','planning_store','planning_adapter','planning_time')
     modules={name:Path(__file__).with_name(name+'.py').read_text() for name in names}
     return '''import sys,types,json,asyncio,os
 from agent.config import load_bootstrap,parse_agent_config,parse_roster_bytes

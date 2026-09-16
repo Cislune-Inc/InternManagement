@@ -239,7 +239,7 @@ class AdapterTests(unittest.TestCase):
             path=Path(directory)/'dp.sqlite'
             with database(path) as db:
                 db.execute('CREATE TABLE dm_work_updates(actor,channel,message_ts,payload,status,raw_dm,created_at)')
-                for status,ch,ts in [('sent','C','1789400000.000001'),('held','C','1789400000.000002'),('sent','D','1789400000.000003')]:
+                for status,ch,ts in [('sent','C','1789400000.000001'),('held','C','1789400000.000002'),('reminded','C','1789400000.000004'),('sent','D','1789400000.000003')]:
                     db.execute('INSERT INTO dm_work_updates VALUES (?,?,?,?,?,?,?)',('U',ch,ts,json.dumps({'text':status+' published result','project_key':'dp'}),status,'secret original DM','private original timestamp'))
             result=read_published_excerpts(path,workspace='T',channels=['C'],project_map={'dp':'don-pollo'})
             self.assertEqual(len(result['events']),1)

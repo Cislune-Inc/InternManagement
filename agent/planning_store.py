@@ -17,6 +17,8 @@ import re
 import sqlite3
 from uuid import uuid4
 
+from .planning_source_groups import group_visible_sources
+
 
 class PlanningError(ValueError):
     def __init__(self, message: str, status: int = 400):
@@ -498,6 +500,7 @@ class PlanningStore:
                     source = json.loads(row['payload'])
                     source['packets'] = [r[0] for r in db.execute('SELECT packet_id FROM planning_links WHERE source_ref=?', (row['source_ref'],)) if r[0] in visible_ids]
                     sources.append(source)
+            group_visible_sources(sources)
             recaps = [];review_recaps=[]
             for row in db.execute('SELECT * FROM planning_recaps ORDER BY created_at DESC'):
                 if row['project'] in actor.projects and (row['author'] == actor.person_ref or actor.person_ref==self.owner_ref):

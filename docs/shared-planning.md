@@ -238,3 +238,22 @@ Worker testing still requires a selected worker and the separate authenticated
 HTTPS entry point. Keep proposed source-backed changes pending until Erik accepts
 specific fields. Test acceptance on a disposable database copy rather than
 altering real project proposals for QA.
+
+### Channel-first source grouping (September 16)
+
+The published-excerpt adapter remains sent-only; private `reminded` records are
+not planner evidence. On each authorized store view, historical bot excerpts are
+grouped with fuller human posts only within the same source scope, author and
+project, within one day, and with at least five distinct quoted words matching
+contiguously after normalization. Both source IDs and original texts remain.
+`preferred_source` is a planner source reference; `count_as_separate_progress=false`
+marks the excerpt, and `progress_group` identifies the fuller source. These are
+view-only hints, recomputed from visible current revisions, not persisted receipt
+versions or proof of completed work. Edits, tombstones and lost grants remove the
+match. Missing source coverage means grouping may be incomplete. The UI links to
+the fuller post. Plan approval and time records are unaffected.
+
+The owner pilot checkout is now `/Users/erikfranks/Developer/cislune-pm`, outside
+iCloud Documents. Its private state remains under ignored `storage/portfolio`;
+the original Documents checkout is retained as migration recovery, not the active
+service checkout. Do not put private runtime files into Git.
