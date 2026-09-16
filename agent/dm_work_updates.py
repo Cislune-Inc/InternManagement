@@ -5,6 +5,7 @@ Retains the old published-record projection for historical planner consumers.
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import re
 from datetime import datetime, timedelta, timezone
@@ -139,8 +140,9 @@ class DMWorkUpdates:
         ChannelUpdates(self.store)
         with self.store._connect() as conn:
             for record in records:
-                excerpt = normalized(' '.join(line[2:] for line in record['text'].splitlines() if line.startswith('> ')))
-                if len(excerpt) < 5:
+                excerpt = re.findall(r'[a-z0-9]+', html.unescape(' '.join(
+                    line[2:] for line in record['text'].splitlines() if line.startswith('> '))).lower())
+                if len(set(excerpt)) < 5:
                     continue
                 candidates = conn.execute('''SELECT message_ts,text FROM channel_work_updates
                     WHERE channel=? AND actor=? AND deleted=0 AND meaningful=1
@@ -148,8 +150,8 @@ class DMWorkUpdates:
                     ORDER BY LENGTH(text) DESC LIMIT 30''',
                     (record['channel'],record['actor'],float(record['message_ts'])-86400,float(record['message_ts'])+86400)).fetchall()
                 for candidate in candidates:
-                    words = normalized(candidate['text'])
-                    if len(words) > len(excerpt) and len(words & excerpt)/len(excerpt) >= .9:
+                    words = re.findall(r'[a-z0-9]+', html.unescape(candidate['text']).lower())
+                    if len(words) > len(excerpt) and any(words[i:i+len(excerpt)] == excerpt for i in range(len(words)-len(excerpt)+1)):
                         record['preferred_source'] = {'channel':record['channel'],'message_ts':candidate['message_ts']}
                         record['count_as_separate_progress'] = False
                         break

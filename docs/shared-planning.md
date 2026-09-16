@@ -14,7 +14,8 @@ current source grants. No schema changes to this table in this revision.
 are PRIVATE and MUST NOT enter the published-excerpt adapter. Existing `sent`
 history remains intact. `DMWorkUpdates.published_records` adds `preferred_source`
 and `count_as_separate_progress=false` when a fuller same-author human post within
-one day and the SAME channel covers at least90% of the quoted excerpt's tokens.
+one day and the SAME channel contains the exact contiguous normalized quoted words
+(at least five distinct words). Loose token overlap must not group contradictions.
 This is a duplicate grouping hint, not verification of the accomplishment.
 Consumers reading SQLite directly need the equivalent projection; a refresh must
 re-evaluate it after edits/deletes. Preserve both source identities and prefer the
