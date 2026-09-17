@@ -78,23 +78,25 @@ def main():
     for name in ('host','owner','workspace','channel'):p.add_argument('--'+name,required=True)
     p.add_argument('--snapshot',type=Path,required=True);p.add_argument('--database',type=Path,required=True)
     p.add_argument('--port',type=int,default=8879)
+    p.add_argument('--review-project',action='append',choices=('bagworm','grasp','pce-v2'),help='Explicit owner-only review project; does not grant new source access.')
     args=p.parse_args()
     bridge=OwnerBridge(args.host,{k:getattr(args,k) for k in ('owner','workspace','channel')})
     first=bridge.read()
     store=PlanningStore(args.database,owner_ref=first['owner_ref'])
     plan=json.loads(args.snapshot.read_text())
-    if any(p['id']!='bagworm' for p in plan['projects']):raise ValueError('This pilot is limited to Bagworm')
+    projects=frozenset(args.review_project or ['bagworm'])
+    if any(p['id'] not in projects for p in plan['projects']):raise ValueError('Snapshot includes an unconfigured review project')
     store.initialize(plan)
     current_time=ContextVar('owner_time',default=None)
     async def authenticate(request):
         if request.path.startswith('/planning-assets/') or request.path in ('/','/planning'):
-            return Principal(first['owner_ref'],frozenset({'bagworm'}))
+            return Principal(first['owner_ref'],projects)
         current=await asyncio.to_thread(bridge.read)
         if current['owner_ref']!=store.owner_ref:raise ValueError('Owner identity changed')
         for source in current['sources']:
             if source['project']=='bagworm':store.ingest_source(source)
         current_time.set(current['time'])
-        return Principal(current['owner_ref'],frozenset({'bagworm'}),frozenset(current['scopes']+['person:'+store.owner_ref]))
+        return Principal(current['owner_ref'],projects,frozenset(current['scopes']+['person:'+store.owner_ref]))
     # A per-request time callback avoids one request receiving another's snapshot.
     # This listener has exactly one explicitly verified owner identity.
     app=create_planning_app(store,authenticate=authenticate,allowed_origin=f'http://127.0.0.1:{args.port}',
