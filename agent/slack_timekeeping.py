@@ -689,15 +689,9 @@ class SlackTimekeeping:
                 if worked >= rest_due * 3600 and not session.metadata.get(reminder_key) and not session.metadata.get("slack_clock_rest_started_at"):
                     notices.append("At a safe stopping point, take your 10-minute duty-free paid rest. " + ("Your clock stays running; no logout or return message needed." if self.simplified_flow else "Reply `break` as it begins."))
                     session.metadata[reminder_key] = now.isoformat()
-                last = timestamp(session.last_user_message_at) or timestamp(session.clocked_in_at)
-                if last and now - last >= timedelta(hours=4):
-                    warning = timestamp(session.metadata.get("slack_clock_inactivity_warning_at"))
-                    if not warning:
-                        notices.append("Still working? It has been four hours since your last message. Send a quick update in the next 15 minutes to keep your clock running.")
-                        session.metadata["slack_clock_inactivity_warning_at"] = now.isoformat()
-                    elif now - warning >= timedelta(minutes=15):
-                        self._stop(session, now, "inactivity_unconfirmed")
-                        notices.append("Your clock stopped after the unanswered four-hour check. Stop work and check in again before continuing." + (" This finish time is unconfirmed: send `report hours` with when you finished or the work that continued." if self.simplified_flow else ""))
+                # Work updates help coordination; they are not proof of
+                # attendance. Never pressure someone to message merely to keep
+                # a valid shift open, or stop their clock for silence.
             if self.simplified_flow and session.clocked_out_at and session.metadata.get("slack_clock_stop_reason") != "worker_clock_out":
                 token = self._review_token(session)
                 question = f"Did work finish at {timestamp(session.clocked_out_at).astimezone(self.zone):%H:%M %Z}? Confirm with `confirm stop {session.session_date} {token}`, or use `report hours` with your actual finish or missing interval."

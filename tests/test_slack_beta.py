@@ -124,8 +124,8 @@ def test_conversational_switch_keeps_useful_fallback_when_ai_times_out(runtime, 
     monkeypatch.setenv("OPENAI_API_KEY", "test-only-not-a-key")
     monkeypatch.setattr(WorkAI, "coach", unavailable)
     asyncio.run(runtime.handle_slack_direct_message(None, event("Switching to work on Mars to Table")))
-    assert runtime.test_sent[0] == ("WORKER", "Saved your update for Mars to Table competition.")
-    assert "What do you want to have ready" in runtime.test_sent[1][1]
+    assert len(runtime.test_sent) == 1
+    assert "What do you want to have ready" in runtime.test_sent[0][1]
     assert "AI assistance is unavailable" not in str(runtime.test_sent)
     assert "does not start or stop" not in str(runtime.test_sent)
     assert "Mars to Table" in captured[0]
@@ -145,7 +145,7 @@ def test_delayed_ai_reply_is_suppressed_after_newer_work_note(runtime, monkeypat
     monkeypatch.setenv("OPENAI_API_KEY", "test-only-not-a-key")
     monkeypatch.setattr(WorkAI, "coach", delayed)
     asyncio.run(runtime.handle_slack_direct_message(None, event("Switching to Mars to Table")))
-    assert len(runtime.test_sent) == 1
+    assert not runtime.test_sent
     assert "Stale question" not in str(runtime.test_sent)
 
 

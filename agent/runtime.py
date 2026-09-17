@@ -1474,13 +1474,11 @@ class InternManagementRuntime:
                 from .work_ai import WorkAI
                 from .slack_work_intake import _safe
 
-                # Acknowledge the durable original before any optional network
-                # request. If enrichment fails, the worker already has a receipt.
+                # Keep a normal work note to one useful reply. The durable
+                # original is already written; a receipt, coaching paragraph,
+                # and sharing reminder became a distracting cascade.
                 match = re.search(r"DP-[0-9a-f]{12}", response)
                 work_context = intake.coaching_context(slack_user_id, match[0]) if match else {}
-                receipt = ("Saved your update for " + _safe(work_context["project"]) + "."
-                           if work_context and work_context["project"] != "Project unconfirmed" else "Saved your update.")
-                await self.slack.post_message(slack_user_id, receipt)
                 context = "No controlling contract/accepted plan supplied. Alignment remains unverified."
                 context += "\nCurrent worker-owned work record: " + json.dumps(work_context)
                 if hours_user:
@@ -1506,11 +1504,6 @@ class InternManagementRuntime:
                     fallback = response.partition("\n")[2].replace("\n" + _BOUNDARY, "")
                     if fallback:
                         await self.slack.post_message(slack_user_id, fallback)
-                    if saved_item and getattr(self.config.slack, 'dm_work_sharing_enabled', False):
-                        from .dm_work_updates import DMWorkUpdates
-                        reminder = await DMWorkUpdates(self.state_store).process(self, slack_user_id, text, event, saved_item[0])
-                        if reminder:
-                            await self.slack.post_message(slack_user_id, reminder)
                     return True
                 if draft:
                     if match:
@@ -1521,11 +1514,6 @@ class InternManagementRuntime:
                     if draft["suggested_next_steps"]:
                         response += "\nPossible next steps:\n" + "\n".join(f"{i}. {_safe(step)}" for i, step in enumerate(draft["suggested_next_steps"][:3], 1))
         await self.slack.post_message(slack_user_id, response)
-        if saved_item and getattr(self.config.slack, 'dm_work_sharing_enabled', False):
-            from .dm_work_updates import DMWorkUpdates
-            shared = await DMWorkUpdates(self.state_store).process(self, slack_user_id, text, event, saved_item[0])
-            if shared:
-                await self.slack.post_message(slack_user_id, shared)
         return True
 
     def build_slack_app_home_view(self, slack_user_id: str) -> dict[str, Any]:

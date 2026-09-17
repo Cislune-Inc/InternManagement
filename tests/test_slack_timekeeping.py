@@ -168,15 +168,17 @@ def test_advance_remote_approval_is_scoped_and_expires(clock, user):
     assert session.metadata["slack_clock_stop_reason"] == "remote_approval_expired"
 
 
-def test_inactivity_has_four_hour_ceiling_and_warning(clock, user):
+def test_inactivity_never_controls_a_clocked_in_shift(clock, user):
     user.meal_tracking_required = False
     command(clock, user, "in", at(9), "onsite")
     assert not any("four hours" in text for text in clock.tick(user, at(12, 59))[0])
-    notices, session = clock.tick(user, at(13))
-    assert any("four hours" in text for text in notices)
+    notices, session = clock.tick(user, at(13, 30))
+    assert not any("last message" in text.lower() for text in notices)
+    session = session or clock.store.get_session(user.user_key, "2026-09-08")
     assert not session.clocked_out_at
-    clock.record_activity(user, "Test saved and fixture still needs adjustment", at(13, 10))
-    assert clock.tick(user, at(13, 20))[1] is None
+    _, session = clock.tick(user, at(16, 30))
+    session = session or clock.store.get_session(user.user_key, "2026-09-08")
+    assert not session.clocked_out_at
 
 
 def test_notifications_are_durable_and_retryable(clock, user):

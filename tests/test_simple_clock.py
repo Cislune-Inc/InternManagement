@@ -79,20 +79,14 @@ def test_late_notice_suppressed_after_worker_response(clock, user):
     assert not any(n['text'].startswith(('Plan lunch', 'Still working?', 'At a safe')) for n in clock.pending_notices(user.user_key))
 
 
-def test_inactivity_stop_is_explicitly_unconfirmed(clock, user):
+def test_inactivity_does_not_stop_a_simplified_clock(clock, user):
     clock = simple(clock)
     command(clock, user, 'in', at(9), 'onsite')
     clock.tick(user, at(13))
     notices, session = clock.tick(user, at(13, 15))
-    assert any('finish time is unconfirmed' in n for n in notices)
-    assert session.metadata['compliance_events'][-1]['confirmation'] == 'stop_instruction_not_proof_of_stopped_work'
-    message = next(n for n in notices if 'confirm stop' in n)
-    detail = re.search(r'confirm stop ([^`]+)', message)[1]
-    assert blocks(message)[1]['elements'][0]['value'] == detail
-    response, confirmed = command(clock, user, 'confirm_stop', at(13, 16), detail)
-    assert 'finish time is confirmed' in response
-    assert confirmed.metadata['compliance_events'][-1]['confirmation'] == 'worker_confirmed_stop'
-    assert paid_seconds([confirmed], at(15)) == 4.25*3600
+    assert not any('finish time is unconfirmed' in n for n in notices)
+    session = session or clock.store.get_session(user.user_key, '2026-09-07')
+    assert not session.clocked_out_at
 
 
 def test_buttons_for_meal_and_correction_preview():
