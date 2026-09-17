@@ -78,7 +78,7 @@ def main():
     for name in ('host','owner','workspace','channel'):p.add_argument('--'+name,required=True)
     p.add_argument('--snapshot',type=Path,required=True);p.add_argument('--database',type=Path,required=True)
     p.add_argument('--port',type=int,default=8879)
-    p.add_argument('--review-project',action='append',choices=('bagworm','grasp','pce-v2'),help='Explicit owner-only review project; does not grant new source access.')
+    p.add_argument('--review-project',action='append',choices=('bagworm','grasp','pce-v2','cita','cisort'),help='Explicit owner-only review project; does not grant new source access.')
     args=p.parse_args()
     bridge=OwnerBridge(args.host,{k:getattr(args,k) for k in ('owner','workspace','channel')})
     first=bridge.read()
