@@ -14,6 +14,7 @@ import requests
 from dotenv import load_dotenv
 
 from .persistence import atomic_write_json
+from .manager_auth import local_headers
 from .runtime import InternManagementRuntime
 
 _DEFAULT_DASHBOARD_URL = "http://127.0.0.1:8765/api/health"
@@ -30,6 +31,7 @@ async def run_integration_checks(
     request: Callable[..., requests.Response] = requests.request,
 ) -> dict[str, Any]:
     reference = now or datetime.now(timezone.utc)
+    slack_only = bool(getattr(getattr(getattr(runtime, "config", None), "slack", None), "work_intake_beta_slack_user_ids", []))
     checks = [
         _check_database(runtime),
         _check_bot_lock(runtime),
@@ -39,6 +41,7 @@ async def run_integration_checks(
             "dashboard",
             "GET",
             dashboard_url,
+            headers=local_headers(dashboard_url),
             request=request,
         ),
         _http_check(
@@ -47,7 +50,7 @@ async def run_integration_checks(
             "https://discord.com/api/v10/users/@me",
             headers={"Authorization": f"Bot {os.environ.get('DISCORD_BOT_TOKEN', '')}"},
             request=request,
-            enabled=bool(os.environ.get("DISCORD_BOT_TOKEN")),
+            enabled=bool(os.environ.get("DISCORD_BOT_TOKEN")) and not slack_only,
         ),
         _http_check(
             "slack",
@@ -94,6 +97,8 @@ async def run_integration_checks(
             runtime.operations.resolve("integration_health", name)
             continue
         if check["status"] in {"disabled", "maintenance"}:
+            if slack_only and name == "discord" and check["status"] == "disabled":
+                runtime.operations.resolve("integration_health", "discord")
             continue
         await runtime.operations.report(
             category="integration_health",

@@ -10,7 +10,7 @@
     <string>-m</string>
     <string>agent.hours_editor</string>
     <string>--host</string>
-    <string>0.0.0.0</string>
+    <string>127.0.0.1</string>
     <string>--port</string>
     <string>8765</string>
   </array>

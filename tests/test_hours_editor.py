@@ -2,6 +2,7 @@ import asyncio
 import csv
 import json
 import threading
+import sys
 from datetime import datetime
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -16,6 +17,20 @@ from agent.models import AgentConfig, BootstrapConfig, ClickUpConfig, PromptConf
 from agent.runtime import InternManagementRuntime
 from agent.state_store import StateStore
 from agent.time_tracking_dashboard import build_time_tracking_dashboard_payload
+
+TEST_MANAGER_KEY = "isolated-test-manager-credential"
+
+
+@pytest.fixture(autouse=True)
+def authenticated_editor_client(monkeypatch):
+    client = requests.Session()
+    client.auth = ("manager", TEST_MANAGER_KEY)
+    handler = build_request_handler
+    monkeypatch.setattr(sys.modules[__name__], "requests", client)
+    monkeypatch.setattr(sys.modules[__name__], "build_request_handler",
+                        lambda service: handler(service, manager_key=TEST_MANAGER_KEY))
+    yield
+    client.close()
 
 
 def _build_editor_runtime(tmp_path: Path, user: UserProfile) -> InternManagementRuntime:

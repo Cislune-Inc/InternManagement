@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import sys
+from pathlib import Path
 from typing import Any
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from agent.manager_auth import local_headers
 
 
 def summarize_health(payload: dict[str, Any]) -> dict[str, Any]:
@@ -37,7 +41,8 @@ def summarize_health(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def main() -> int:
-    with urlopen("http://127.0.0.1:8765/api/health", timeout=10) as response:
+    url = "http://127.0.0.1:8765/api/health"
+    with urlopen(Request(url, headers=local_headers(url)), timeout=10) as response:
         payload = json.load(response)
     print(json.dumps(summarize_health(payload), indent=2, sort_keys=True))
     return 0
