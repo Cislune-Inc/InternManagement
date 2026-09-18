@@ -4,6 +4,7 @@ import csv
 import json
 import os
 import re
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -222,6 +223,23 @@ def parse_user_profile(row: dict[str, Any], source: str = "roster") -> UserProfi
         or ["monday", "tuesday", "wednesday", "thursday", "friday"],
         typical_start_time=str(row.get("typical_start_time") or "09:00").strip(),
         typical_end_time=str(row.get("typical_end_time") or "17:00").strip(),
+        alternative_workweek_effective_date=_parse_optional_iso_date(
+            row.get("alternative_workweek_effective_date"),
+            source,
+        ),
+        alternative_workweek_daily_limit_hours=_parse_optional_positive_float(
+            row.get("alternative_workweek_daily_limit_hours"),
+            source,
+        ),
+        alternative_workweek_regular_workdays=_parse_semicolon_list(
+            row.get("alternative_workweek_regular_workdays")
+        ),
+        alternative_workweek_typical_start_time=_clean_optional(
+            row.get("alternative_workweek_typical_start_time")
+        ),
+        alternative_workweek_typical_end_time=_clean_optional(
+            row.get("alternative_workweek_typical_end_time")
+        ),
         planned_time_off=_parse_semicolon_list(row.get("planned_time_off")),
         interests=_parse_semicolon_list(row.get("interests")),
         skills=_parse_semicolon_list(row.get("skills")),
@@ -302,6 +320,30 @@ def _parse_optional_nonnegative_float(value: Any, source: str) -> float | None:
     if parsed < 0:
         raise ValueError(f"labor_cost_rate cannot be negative in {source}.")
     return parsed
+
+
+def _parse_optional_positive_float(value: Any, source: str) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    parsed = float(text)
+    if parsed <= 0:
+        raise ValueError(
+            f"alternative_workweek_daily_limit_hours must be positive in {source}."
+        )
+    return parsed
+
+
+def _parse_optional_iso_date(value: Any, source: str) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text).isoformat()
+    except ValueError as exc:
+        raise ValueError(
+            f"alternative_workweek_effective_date must be YYYY-MM-DD in {source}."
+        ) from exc
 
 
 def _validate_roster_headers(filename: str, fieldnames: list[str] | None) -> None:

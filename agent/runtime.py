@@ -816,6 +816,8 @@ class InternManagementRuntime:
         return localize_datetime(base_moment, self.resolve_user_timezone_name(user))
 
     def is_user_scheduled_to_work(self, user: UserProfile, now: datetime) -> bool:
+        from .work_schedule import regular_workdays
+
         local_now = localize_datetime(now, self.resolve_user_timezone_name(user))
         local_date = local_now.date()
         for item in user.planned_time_off:
@@ -845,7 +847,7 @@ class InternManagementRuntime:
         }
         configured_days = {
             weekday_names[str(item).strip().lower()]
-            for item in user.regular_workdays
+            for item in regular_workdays(user, local_date)
             if str(item).strip().lower() in weekday_names
         }
         fallback_days = set(self.config.schedule.workdays) if self.config else {0, 1, 2, 3, 4}
@@ -3171,7 +3173,8 @@ class InternManagementRuntime:
             return False
         self._refresh_session_time_summary(session, now)
         worked_seconds = int(session.time_summary.get("clocked_in_total_seconds") or 0)
-        limit_seconds = round(self.config.labor.overtime_limit_hours * 60 * 60)
+        limit_hours = self._daily_limit_hours(user, now)
+        limit_seconds = round(limit_hours * 60 * 60)
         warning_seconds = max(
             0,
             limit_seconds - self.config.labor.overtime_warning_minutes * 60,
@@ -3294,7 +3297,8 @@ class InternManagementRuntime:
             return ""
         self._refresh_session_time_summary(session, now)
         paid_seconds = int(session.time_summary.get("clocked_in_total_seconds") or 0)
-        limit_seconds = round(self.config.labor.overtime_limit_hours * 60 * 60)
+        limit_hours = self._daily_limit_hours(user, now)
+        limit_seconds = round(limit_hours * 60 * 60)
         remaining_seconds = max(0, limit_seconds - paid_seconds)
         projected_clock_out = now + timedelta(seconds=remaining_seconds)
         projected_label = projected_clock_out.strftime("%I:%M %p").lstrip("0")
@@ -3304,8 +3308,18 @@ class InternManagementRuntime:
                 "Please clock out now unless additional time has been approved."
             )
         return (
-            f"To stay below {self.config.labor.overtime_limit_hours:g} recorded hours, "
+            f"To stay below {limit_hours:g} recorded hours, "
             f"plan to clock out by about {projected_label} unless additional time is approved."
+        )
+
+    def _daily_limit_hours(self, user: UserProfile, now: datetime) -> float:
+        from .work_schedule import daily_limit_hours
+
+        local_now = localize_datetime(now, self.resolve_user_timezone_name(user))
+        return daily_limit_hours(
+            user,
+            local_now,
+            default_hours=self.config.labor.overtime_limit_hours,
         )
 
     def _append_compliance_event(

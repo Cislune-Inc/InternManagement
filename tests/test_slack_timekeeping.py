@@ -158,6 +158,38 @@ def test_daily_and_weekly_limits_preserve_overtime_already_worked(clock, user):
     assert "limit is reached" in command(clock, user, "in", at(9, day=12), "onsite")[0]
 
 
+def test_alternative_workweek_limit_is_future_dated_and_scheduled_day_only(tmp_path):
+    user = UserProfile(
+        user_key="mac",
+        display_name="Mac",
+        slack_user_id="MAC",
+        meal_tracking_required=False,
+        alternative_workweek_effective_date="2026-10-19",
+        alternative_workweek_daily_limit_hours=10,
+        alternative_workweek_regular_workdays=["monday", "tuesday", "wednesday", "thursday"],
+    )
+
+    before = SlackTimekeeping(StateStore(tmp_path / "before.sqlite3"))
+    before_start = datetime.fromisoformat("2026-10-12T08:00:00-07:00")
+    command(before, user, "in", before_start, "onsite")
+    notices, session = before.tick(user, before_start + timedelta(hours=8, minutes=1))
+    assert notices and session.metadata["slack_clock_stop_reason"] == "hours_limit"
+
+    monday = SlackTimekeeping(StateStore(tmp_path / "monday.sqlite3"))
+    monday_start = datetime.fromisoformat("2026-10-19T08:00:00-07:00")
+    command(monday, user, "in", monday_start, "onsite")
+    notices, session = monday.tick(user, monday_start + timedelta(hours=8, minutes=1))
+    assert not session.clocked_out_at
+    notices, session = monday.tick(user, monday_start + timedelta(hours=10, minutes=1))
+    assert notices and session.metadata["slack_clock_stop_reason"] == "hours_limit"
+
+    friday = SlackTimekeeping(StateStore(tmp_path / "friday.sqlite3"))
+    friday_start = datetime.fromisoformat("2026-10-23T08:00:00-07:00")
+    command(friday, user, "in", friday_start, "onsite")
+    notices, session = friday.tick(user, friday_start + timedelta(hours=8, minutes=1))
+    assert notices and session.metadata["slack_clock_stop_reason"] == "hours_limit"
+
+
 def test_advance_remote_approval_is_scoped_and_expires(clock, user):
     assert "needs Erik" in command(clock, user, "in", at(9), "remote")[0]
     with pytest.raises(ValueError, match="24 hours"):

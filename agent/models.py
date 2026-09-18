@@ -231,6 +231,11 @@ class UserProfile:
     )
     typical_start_time: str = "09:00"
     typical_end_time: str = "17:00"
+    alternative_workweek_effective_date: str | None = None
+    alternative_workweek_daily_limit_hours: float | None = None
+    alternative_workweek_regular_workdays: list[str] = field(default_factory=list)
+    alternative_workweek_typical_start_time: str | None = None
+    alternative_workweek_typical_end_time: str | None = None
     planned_time_off: list[str] = field(default_factory=list)
     interests: list[str] = field(default_factory=list)
     skills: list[str] = field(default_factory=list)
