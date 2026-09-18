@@ -238,8 +238,17 @@ class PayrollExporter:
         meal_seconds = int(session.time_summary.get("unpaid_lunch_deducted_seconds") or 0)
         task_seconds = int(session.time_summary.get("task_tracked_total_seconds") or 0)
         hourly_payroll_seconds = paid_seconds if _is_hourly_payroll_worker(user) else 0
-        regular_seconds = min(paid_seconds, 8 * 60 * 60)
-        overtime_seconds = min(max(0, paid_seconds - regular_seconds), 4 * 60 * 60)
+        from .work_schedule import daily_limit_hours
+
+        local_zone = resolve_timezone(self.runtime.resolve_user_timezone_name(user))
+        local_day = date.fromisoformat(session.session_date)
+        local_reference = datetime.combine(local_day, datetime.min.time(), tzinfo=local_zone)
+        regular_limit_seconds = round(
+            daily_limit_hours(user, local_reference, default_hours=8.0) * 60 * 60
+        )
+        regular_seconds = min(paid_seconds, regular_limit_seconds)
+        overtime_band_seconds = max(0, 12 * 60 * 60 - regular_limit_seconds)
+        overtime_seconds = min(max(0, paid_seconds - regular_seconds), overtime_band_seconds)
         double_overtime_seconds = max(0, paid_seconds - regular_seconds - overtime_seconds)
         starts, ends = _segment_boundaries(session)
         warnings: list[str] = []

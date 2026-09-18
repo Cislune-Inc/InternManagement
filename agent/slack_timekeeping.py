@@ -279,6 +279,19 @@ class SlackTimekeeping:
         week = day - timedelta(days=day.weekday())
         return paid_seconds(sessions, now, day), paid_seconds(sessions, now, week)
 
+    def daily_limit_seconds(self, user: UserProfile, now: datetime) -> int:
+        from .work_schedule import daily_limit_hours
+
+        local_now = now.astimezone(self.zone)
+        return round(
+            daily_limit_hours(
+                user,
+                local_now,
+                default_hours=self.daily_limit / 3600,
+            )
+            * 3600
+        )
+
     def snapshot(self, user: UserProfile, now: datetime) -> str:
         """Read current clock/totals without starting a session or saving receipts."""
         from .break_guidance import summary
@@ -355,9 +368,10 @@ class SlackTimekeeping:
                     session.metadata.pop("slack_clock_return_kind", None)
         running = bool(session.clocked_in_at and not session.clocked_out_at)
         daily, weekly = self.totals(sessions, now)
+        daily_limit = self.daily_limit_seconds(user, now)
         overtime_authorized = self._authorized(conn, user.user_key, "overtime", now)
         over_limit = user.worker_type != "admin" and not overtime_authorized and (
-            daily >= self.daily_limit or weekly >= self.weekly_limit or self._seventh_day(sessions, now)
+            daily >= daily_limit or weekly >= self.weekly_limit or self._seventh_day(sessions, now)
         )
         if command == "hours":
             from .break_guidance import summary
@@ -639,10 +653,11 @@ class SlackTimekeeping:
                 return self._save_notices(conn, user, session, [ready[0]] if ready else [], now, ready)
             notices: list[str] = []
             daily, weekly = self.totals(sessions, now)
+            daily_limit = self.daily_limit_seconds(user, now)
             worked = paid_seconds([session], now)
             reason = ""
             overtime_authorized = self._authorized(conn, user.user_key, "overtime", now)
-            if user.worker_type != "admin" and not overtime_authorized and (daily >= self.daily_limit or weekly >= self.weekly_limit or self._seventh_day(sessions, now)):
+            if user.worker_type != "admin" and not overtime_authorized and (daily >= daily_limit or weekly >= self.weekly_limit or self._seventh_day(sessions, now)):
                 reason = "hours_limit"
             elif session.metadata.get("slack_clock_location") == "approved_remote" and not self._authorized(conn, user.user_key, "remote", now):
                 reason = "remote_approval_expired"
@@ -679,7 +694,7 @@ class SlackTimekeeping:
                     deadline = "five" if expected == 1 else "ten"
                     notices.append(f"Your meal is due before {deadline} hours of work. Plan to stop now and reply `lunch` when your duty-free meal actually begins.")
                     session.metadata[meal_warning_key] = now.isoformat()
-                if user.worker_type != "admin" and min(self.daily_limit - daily, self.weekly_limit - weekly) <= 1800 and not session.metadata.get("slack_clock_hours_warning_at"):
+                if user.worker_type != "admin" and min(daily_limit - daily, self.weekly_limit - weekly) <= 1800 and not session.metadata.get("slack_clock_hours_warning_at"):
                     notices.append("You are within 30 minutes of your daily or weekly hours limit. Wrap up and clock out; additional work needs Erik's authorization.")
                     session.metadata["slack_clock_hours_warning_at"] = now.isoformat()
                 from .break_guidance import completed_rests, next_rest_hours

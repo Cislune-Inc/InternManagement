@@ -218,6 +218,37 @@ def test_parse_roster_csv_worker_context_fields() -> None:
     assert roster[0].skills == ["CAD", "Python"]
 
 
+def test_parse_roster_csv_future_dates_alternative_workweek() -> None:
+    roster = parse_roster_bytes(
+        "roster.csv",
+        (
+            "user_key,display_name,slack_user_id,active,alternative_workweek_effective_date,"
+            "alternative_workweek_daily_limit_hours,alternative_workweek_regular_workdays,"
+            "alternative_workweek_typical_start_time,alternative_workweek_typical_end_time\n"
+            "mac,Mac,U123,true,2026-10-19,10,monday;tuesday;wednesday;thursday,08:00,18:30\n"
+        ).encode(),
+    )
+
+    assert roster[0].alternative_workweek_effective_date == "2026-10-19"
+    assert roster[0].alternative_workweek_daily_limit_hours == 10
+    assert roster[0].alternative_workweek_regular_workdays == [
+        "monday", "tuesday", "wednesday", "thursday"
+    ]
+    assert roster[0].alternative_workweek_typical_start_time == "08:00"
+    assert roster[0].alternative_workweek_typical_end_time == "18:30"
+
+
+def test_parse_roster_csv_rejects_invalid_alternative_workweek_date() -> None:
+    with pytest.raises(ValueError, match="alternative_workweek_effective_date"):
+        parse_roster_bytes(
+            "roster.csv",
+            (
+                "user_key,display_name,slack_user_id,alternative_workweek_effective_date\n"
+                "mac,Mac,U123,10/19/2026\n"
+            ).encode(),
+        )
+
+
 def test_parse_roster_csv_accepts_utf8_bom_header() -> None:
     roster = parse_roster_bytes(
         "roster.csv",
